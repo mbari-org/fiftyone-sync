@@ -2280,9 +2280,6 @@ def sync_project_to_fiftyone(
                             embeddings_config.get("force_embeddings", False)
                         ),
                         force_umap=bool(embeddings_config.get("force_umap", False)),
-                        force_similarity=bool(
-                            embeddings_config.get("force_similarity", False)
-                        ),
                         batch_size=batch_size,
                         project_name=vss_project,
                         service_url=embeddings_config.get("service_url")

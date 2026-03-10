@@ -296,7 +296,6 @@ def compute_embeddings_and_viz(
     umap_seed: int = 51,
     force_embeddings: bool = False,
     force_umap: bool = False,
-    force_similarity: bool = False,
     batch_size: Optional[int] = None,
     project_name: Optional[str] = None,
     service_url: Optional[str] = None,
@@ -318,7 +317,6 @@ def compute_embeddings_and_viz(
         umap_seed: Random seed for UMAP
         force_embeddings: If True, recompute embeddings even if they exist
         force_umap: If True, recompute UMAP even if it exists
-        force_similarity: If True, recompute similarity index even if it exists
         batch_size: Batch size for embed service requests (default 32)
         project_name: Project key for embed service URL path (usually project ID; required when using service)
         service_url: Base URL for embed service (default FASTVSS_API_URL or http://localhost:8000)
