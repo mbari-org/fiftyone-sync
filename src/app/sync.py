@@ -1260,7 +1260,7 @@ def _apply_loc_to_sample(
     if verified is not None and bool(verified):
         sample.tags.append("verified")
     if label_s is not None and "Unknown" not in label_s:
-        sample.append(label_s)
+        sample.tags.append(label_s)
     if cluster is not None and "Unknown" not in cluster:
         sample.tags.append(cluster)
     if api_url and project_id is not None:
