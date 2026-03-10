@@ -34,10 +34,9 @@ class DatabaseEntry:
 
 @dataclass
 class VssProjectConfig:
-    """VSS project configuration with service URL and S3 settings."""
+    """VSS project configuration with S3 settings. Embedding service URL is global (embeddings.service_url)."""
 
     vss_project: str
-    vss_service: str | None = None
     s3_bucket: str | None = None
     s3_prefix: str | None = None
 
@@ -140,11 +139,6 @@ class DatabaseUriConfig:
                         raise ValueError(
                             f"project {key!r} vss_projects[{vss_key!r}] 'vss_project' must be a string, got {type(vss_proj_name).__name__}"
                         )
-                    vss_service = vss_config.get("vss_service")
-                    if vss_service is not None and not isinstance(vss_service, str):
-                        raise ValueError(
-                            f"project {key!r} vss_projects[{vss_key!r}] 'vss_service' must be a string if present, got {type(vss_service).__name__}"
-                        )
                     vss_s3_bucket = vss_config.get("s3_bucket")
                     if vss_s3_bucket is not None and not isinstance(vss_s3_bucket, str):
                         raise ValueError(
@@ -157,9 +151,6 @@ class DatabaseUriConfig:
                         )
                     vss_projects_dict[str(vss_key)] = VssProjectConfig(
                         vss_project=vss_proj_name,
-                        vss_service=(vss_service.strip() or None)
-                        if (vss_service and isinstance(vss_service, str))
-                        else None,
                         s3_bucket=(vss_s3_bucket.strip() or None)
                         if (vss_s3_bucket and isinstance(vss_s3_bucket, str))
                         else None,

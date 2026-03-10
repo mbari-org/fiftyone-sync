@@ -43,19 +43,17 @@ projects:
 
 
 def test_new_nested_vss_projects():
-    """Test new nested vss_projects format."""
+    """Test new nested vss_projects format (no per-project vss_service; use global embeddings.service_url)."""
     yaml_content = """
 projects:
   902004-Planktivore:
     vss_projects:
       high-mag:
         vss_project: "902004-Planktivore-HighMag"
-        vss_service: "https://cortex.shore.mbari.org/vss"
         s3_bucket: "902004-planktivore-highmag"
         s3_prefix: "fiftyone/raw"
       low-mag:
         vss_project: "902004-Planktivore-LowMag"
-        vss_service: "https://cortex.shore.mbari.org/vss"
         s3_bucket: "902004-planktivore-lowmag"
         s3_prefix: "fiftyone/raw"
     databases:
@@ -75,11 +73,10 @@ projects:
     assert "high-mag" in proj.vss_projects
     assert "low-mag" in proj.vss_projects
 
-    # Check high-mag config
+    # Check high-mag config (no vss_service; global embeddings.service_url used)
     high_mag = proj.vss_projects["high-mag"]
     assert isinstance(high_mag, VssProjectConfig)
     assert high_mag.vss_project == "902004-Planktivore-HighMag"
-    assert high_mag.vss_service == "https://cortex.shore.mbari.org/vss"
     assert high_mag.s3_bucket == "902004-planktivore-highmag"
     assert high_mag.s3_prefix == "fiftyone/raw"
 
@@ -87,7 +84,6 @@ projects:
     low_mag = proj.vss_projects["low-mag"]
     assert isinstance(low_mag, VssProjectConfig)
     assert low_mag.vss_project == "902004-Planktivore-LowMag"
-    assert low_mag.vss_service == "https://cortex.shore.mbari.org/vss"
     assert low_mag.s3_bucket == "902004-planktivore-lowmag"
     assert low_mag.s3_prefix == "fiftyone/raw"
 
@@ -108,7 +104,6 @@ projects:
     vss_projects:
       config-a:
         vss_project: "modern-vss-a"
-        vss_service: "https://example.com/vss"
       config-b:
         vss_project: "modern-vss-b"
     databases:
@@ -139,14 +134,13 @@ def test_database_manager_functions():
         get_vss_projects_list,
     )
 
-    # Create a test config
+    # Create a test config (no per-project vss_service)
     yaml_content = """
 projects:
   TestProject:
     vss_projects:
       high-mag:
         vss_project: "Test-HighMag"
-        vss_service: "https://example.com/vss"
         s3_bucket: "test-highmag"
         s3_prefix: "fiftyone"
       low-mag:
@@ -170,7 +164,7 @@ projects:
         os.environ["FIFTYONE_SYNC_CONFIG_PATH"] = temp_path
 
         # Force reload config
-        import database_manager
+        from src.app import database_manager
 
         database_manager._config = None
         database_manager._yaml_config = None
@@ -183,13 +177,11 @@ projects:
 
         high_mag_item = [v for v in vss_list if v["key"] == "high-mag"][0]
         assert high_mag_item["name"] == "Test-HighMag"
-        assert high_mag_item["vss_service"] == "https://example.com/vss"
 
-        # Test get_vss_project_config with specific key
+        # Test get_vss_project_config with specific key (no vss_service; global embeddings.service_url)
         high_mag_config = get_vss_project_config("TestProject", "high-mag")
         assert high_mag_config is not None
         assert high_mag_config["vss_project"] == "Test-HighMag"
-        assert high_mag_config["vss_service"] == "https://example.com/vss"
         assert high_mag_config["s3_bucket"] == "test-highmag"
         assert high_mag_config["s3_prefix"] == "fiftyone"
 
@@ -230,7 +222,7 @@ projects:
         os.environ["FIFTYONE_SYNC_CONFIG_PATH"] = temp_path
 
         # Force reload config
-        import database_manager
+        from src.app import database_manager
 
         database_manager._config = None
         database_manager._yaml_config = None

@@ -154,7 +154,7 @@ LAUNCHER_TEMPLATE = r"""
       var isEnterprise = false;
       var versionId = '';
       var vssProjectKey = '';
-      var vssProjectsData = [];  // full list from /vss-projects: [{key, name, vss_service}]
+      var vssProjectsData = [];  // full list from /vss-projects: [{key, name}]; embedding service URL is global
       function getToken() {
         return tokenInput ? tokenInput.value.trim() : '';
       }

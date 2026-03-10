@@ -10,12 +10,10 @@ projects:
   902004-Planktivore:
     high-mag:
       vss_project: "902004-Planktivore-HighMag"
-      vss_service: "https://cortex.shore.mbari.org/vss"
       s3_bucket: "902004-planktivore-highmag"
       s3_prefix: "fiftyone/raw"
     low-mag:
       vss_project: "902004-Planktivore-LowMag"
-      vss_service: "https://cortex.shore.mbari.org/vss"
       s3_bucket: "902004-planktivore-lowmag"
       s3_prefix: "fiftyone/raw"
 """
@@ -27,12 +25,10 @@ projects:
     vss_projects:
       high-mag:
         vss_project: "902004-Planktivore-HighMag"
-        vss_service: "https://cortex.shore.mbari.org/vss"
         s3_bucket: "902004-planktivore-highmag"
         s3_prefix: "fiftyone/raw"
       low-mag:
         vss_project: "902004-Planktivore-LowMag"
-        vss_service: "https://cortex.shore.mbari.org/vss"
         s3_bucket: "902004-planktivore-lowmag"
         s3_prefix: "fiftyone/raw"
 """
@@ -52,6 +48,5 @@ print(f"  databases    : {proj.databases}")
 for key, v in proj.vss_projects.items():
     print(f"  [{key}]")
     print(f"    vss_project : {v.vss_project}")
-    print(f"    vss_service : {v.vss_service}")
     print(f"    s3_bucket   : {v.s3_bucket}")
     print(f"    s3_prefix   : {v.s3_prefix}")

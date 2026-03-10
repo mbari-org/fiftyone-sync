@@ -1,0 +1,34 @@
+# Batch sizes (fallbacks in code: media_id 200, localization 5000, embeddings 32)
+media_id_batch_size: 500
+localization_batch_size: 10000
+
+# When true (enterprise): enable S3 upload and do not set fo.config.database_uri/database_name
+# (FiftyOne uses its own config). When false: S3 upload disabled, sync sets database per project/port.
+# In enterprise mode, the FiftyOne app URL will be constructed without port (e.g., https://mbari.fiftyone.ai)
+# and the dataset link will be in the format: https://mbari.fiftyone.ai/datasets/{project-name}-v{version-id}-{port}/samples
+is_enterprise: true
+
+embeddings:
+  embeddings_field: "embeddings"
+  brain_key: "umap_viz"
+  umap_seed: 51
+  force_embeddings: false
+  batch_size: 512
+  force_umap: false
+  service_url: "https://cortex.shore.mbari.org/vss/"
+
+# Per-project VSS and S3 configuration.
+# In enterprise mode, FiftyOne manages its own database — no databases: entry is needed.
+# Each project entry requires:
+#   vss_projects: (dict of named VSS configs, each with vss_project, s3_bucket, s3_prefix)
+projects:
+  "902004-Planktivore":
+    vss_projects:
+      high-mag:
+        vss_project: "902004-Planktivore-HighMag"
+        s3_bucket: "902004-planktivore-highmag"
+        s3_prefix: "fiftyone/raw"
+      low-mag:
+        vss_project: "902004-Planktivore-LowMag"
+        s3_bucket: "902004-planktivore-lowmag"
+        s3_prefix: "fiftyone/raw"

@@ -432,7 +432,7 @@ async def get_vss_projects(
     """
     Return list of available VSS projects for the given Tator project. Used by the launcher
     template to populate the VSS project dropdown. Token must be sent via Authorization header.
-    Returns list of dicts with 'key', 'name' (vss_project), and 'vss_service'.
+    Returns list of dicts with 'key' and 'name' (vss_project). Embedding service URL is global (embeddings.service_url).
     """
     import tator
     from src.app.database_manager import get_vss_projects_list

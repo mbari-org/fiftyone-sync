@@ -1,7 +1,7 @@
 # Example: per-project MongoDB URI and FiftyOne app port mapping.
 # Set FIFTYONE_SYNC_CONFIG_PATH to this file path.
 #
-vi# Single MongoDB for project ObjectDetection (legacy single VSS project):
+# Single MongoDB for project ObjectDetection (legacy single VSS project):
 projects:
   ObjectDetection:
     vss_project: "testproject"
@@ -9,17 +9,16 @@ projects:
       - uri: "mongodb://localhost:27017"
         port: 5151
 #
-# Multi-VSS project example (e.g., high-mag and low-mag configurations):
+# Multi-VSS project example (e.g., high-mag and low-mag configurations).
+# Embedding service URL is global: set embeddings.service_url in config.
 #  902004-Planktivore:
 #    vss_projects:
 #      high-mag:
 #        vss_project: "902004-Planktivore-HighMag"
-#        vss_service: "https://cortex.shore.mbari.org/vss"
 #        s3_bucket: "902004-planktivore-highmag"
 #        s3_prefix: "fiftyone/raw"
 #      low-mag:
 #        vss_project: "902004-Planktivore-LowMag"
-#        vss_service: "https://cortex.shore.mbari.org/vss"
 #        s3_bucket: "902004-planktivore-lowmag"
 #        s3_prefix: "fiftyone/raw"
 #    databases:

@@ -122,7 +122,8 @@ def get_vss_project(project_name: str, port: int) -> str | None:
 def get_vss_projects_list(project_name: str) -> list[dict[str, str]]:
     """Return list of available VSS projects for a Tator project.
     Returns list of dicts with 'key' and 'name' (vss_project value).
-    For legacy single vss_project, returns [{'key': 'default', 'name': vss_project}]."""
+    For legacy single vss_project, returns [{'key': 'default', 'name': vss_project}].
+    Embedding service URL is global (embeddings.service_url), not per-project."""
     _load_config()
     if not _yaml_config:
         path = os.environ.get("FIFTYONE_SYNC_CONFIG_PATH", "").strip()
@@ -147,7 +148,6 @@ def get_vss_projects_list(project_name: str) -> list[dict[str, str]]:
                 {
                     "key": key,
                     "name": vss_config.vss_project,
-                    "vss_service": vss_config.vss_service or "",
                 }
             )
     # Legacy single vss_project (backward compatibility)
@@ -156,7 +156,6 @@ def get_vss_projects_list(project_name: str) -> list[dict[str, str]]:
             {
                 "key": "default",
                 "name": proj.vss_project,
-                "vss_service": "",
             }
         )
     return result
@@ -166,7 +165,7 @@ def get_vss_project_config(
     project_name: str, vss_project_key: str | None = None
 ) -> dict[str, str | None] | None:
     """Return VSS project configuration for a specific key.
-    Returns dict with vss_project, vss_service, s3_bucket, s3_prefix.
+    Returns dict with vss_project, s3_bucket, s3_prefix. Embedding service URL is global (embeddings.service_url).
     If vss_project_key is None, returns first/only VSS project or legacy config."""
     _load_config()
     if not _yaml_config or not project_name or not project_name.strip():
@@ -182,7 +181,6 @@ def get_vss_project_config(
             if vss_config:
                 return {
                     "vss_project": vss_config.vss_project,
-                    "vss_service": vss_config.vss_service,
                     "s3_bucket": vss_config.s3_bucket,
                     "s3_prefix": vss_config.s3_prefix,
                 }
@@ -192,7 +190,6 @@ def get_vss_project_config(
                 vss_config = next(iter(proj.vss_projects.values()))
                 return {
                     "vss_project": vss_config.vss_project,
-                    "vss_service": vss_config.vss_service,
                     "s3_bucket": vss_config.s3_bucket,
                     "s3_prefix": vss_config.s3_prefix,
                 }
@@ -201,7 +198,6 @@ def get_vss_project_config(
     if proj.vss_project:
         return {
             "vss_project": proj.vss_project,
-            "vss_service": None,
             "s3_bucket": proj.s3_bucket,
             "s3_prefix": proj.s3_prefix,
         }
