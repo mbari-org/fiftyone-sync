@@ -8,11 +8,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     libjpeg-dev zlib1g-dev \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-COPY services/fiftyone-sync/requirements.txt .
+COPY . .
+
 RUN pip install --no-cache-dir -r requirements.txt
 RUN rm requirements.txt
-
-COPY . .
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8001
