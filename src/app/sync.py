@@ -1237,6 +1237,27 @@ def _to_datetime_modified_at(val: Any) -> datetime | None:
     return None
 
 
+def _get_tator_modified_at_datetime(sample: fo.Sample) -> tuple[datetime | None, bool]:
+    """Get tator_modified_at from sample as datetime. If the stored value is not a valid
+    datetime (e.g. string or number from MongoDB), convert via _to_datetime_modified_at
+    and update the sample. Returns (datetime or None, True if sample was updated).
+    """
+    val = None
+    if TATOR_MODIFIED_AT_FIELD in sample:
+        val = sample[TATOR_MODIFIED_AT_FIELD]
+    if val is None:
+        val = getattr(sample, TATOR_MODIFIED_AT_FIELD, None)
+    if val is None:
+        return None, False
+    if isinstance(val, datetime):
+        return val, False
+    dt = _to_datetime_modified_at(val)
+    if dt is not None:
+        sample[TATOR_MODIFIED_AT_FIELD] = dt
+        return dt, True
+    return None, False
+
+
 def _apply_loc_to_sample(
     sample: fo.Sample,
     loc: dict,
@@ -1379,10 +1400,13 @@ def reconcile_dataset_with_tator(
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
+    samples_to_fix_storage: list[fo.Sample] = []
     for eid, sample in eid_to_sample.items():
         loc = loc_index[eid]
         modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
-        tator_modified_at = getattr(sample, TATOR_MODIFIED_AT_FIELD, None)
+        tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
+        if was_fixed:
+            samples_to_fix_storage.append(sample)
         mod_ts = _normalize_modified_at(modified_at)
         last_ts = _normalize_modified_at(tator_modified_at)
 
@@ -1395,6 +1419,10 @@ def reconcile_dataset_with_tator(
             )
             samples_to_update.append((sample, loc))
             updated += 1
+
+    # Persist samples whose tator_modified_at was normalized from non-datetime
+    for sample in samples_to_fix_storage:
+        sample.save()
 
     # Apply current localization data to changed samples and save
     if samples_to_update:
@@ -1824,13 +1852,14 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        modified_at = (
-            sample[TATOR_MODIFIED_AT_FIELD]
-            if TATOR_MODIFIED_AT_FIELD in sample
-            else (
+        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(sample, TATOR_MODIFIED_AT_FIELD):
+            modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
+            if was_fixed:
+                sample.save()
+        else:
+            modified_at = (
                 sample["modified_datetime"] if "modified_datetime" in sample else None
             )
-        )
         created_at = (
             sample["created_datetime"] if "created_datetime" in sample else None
         )
