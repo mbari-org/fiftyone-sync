@@ -114,7 +114,9 @@ async def queue_embedding_job(
                             while True:
                                 remaining = max(1.0, deadline - time.monotonic())
                                 try:
-                                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                                    raw = await asyncio.wait_for(
+                                        ws.recv(), timeout=remaining
+                                    )
                                 except asyncio.TimeoutError:
                                     async with _queue_lock:
                                         _queue_results[job_id] = {
@@ -156,7 +158,9 @@ async def queue_embedding_job(
                                         _job_map.pop(job_id, None)
                                     return
                     except Exception as e:
-                        logger.warning("Fast-VSS WebSocket failed for job %s: %s", job_id, e)
+                        logger.warning(
+                            "Fast-VSS WebSocket failed for job %s: %s", job_id, e
+                        )
                         async with _queue_lock:
                             _queue_results[job_id] = {
                                 "status": "failed",

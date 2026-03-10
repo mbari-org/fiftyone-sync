@@ -1,7 +1,7 @@
 # FiftyOne Sync Service
 
 Backend service to sync data between Tator and Voxel51 for quickly editing localizations
-and downstream model iteration. 
+and downstream model iteration.
 
 See https://docs.mbari.org/internal/ai/videos/voxel51demo.gif for demo of the community Voxel51 tool.
 

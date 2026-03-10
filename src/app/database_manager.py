@@ -306,5 +306,3 @@ def get_port_for_project(project_id: int, project_name: str | None = None) -> in
             if pname == name:
                 return port
     return 5151 + (project_id - 1)
-
-

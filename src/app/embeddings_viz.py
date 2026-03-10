@@ -366,7 +366,7 @@ def compute_embeddings_and_viz(
             "UMAP/similarity skipped: no samples have embeddings (need at least 1). Embeddings may be missing or failed."
         )
         return
- 
+
     brain_run_exists = has_brain_run(dataset, brain_key)
     if brain_run_exists and not force_umap:
         logger.info(

@@ -1207,8 +1207,8 @@ def _normalize_modified_at(val: Any) -> float | None:
     return None
 
 
-def _to_datetime_modified_at(val: Any) -> datetime | None:
-    """Convert modified_at from loc (epoch seconds, datetime, or string) to a datetime for storage."""
+def _to_datetime(val: Any) -> datetime | None:
+    """Convert to a datetime for storage."""
     if val is None:
         return None
     if isinstance(val, datetime):
@@ -1229,9 +1229,7 @@ def _to_datetime_modified_at(val: Any) -> datetime | None:
             "%Y-%m-%dT%H:%M:%S",
         ):
             try:
-                return datetime.strptime(
-                    val.replace("Z", "+00:00")[:26], fmt
-                )
+                return datetime.strptime(val.replace("Z", "+00:00")[:26], fmt)
             except (ValueError, TypeError):
                 continue
     return None
@@ -1251,7 +1249,7 @@ def _get_tator_modified_at_datetime(sample: fo.Sample) -> tuple[datetime | None,
         return None, False
     if isinstance(val, datetime):
         return val, False
-    dt = _to_datetime_modified_at(val)
+    dt = _to_datetime(val)
     if dt is not None:
         sample[TATOR_MODIFIED_AT_FIELD] = dt
         return dt, True
@@ -1289,7 +1287,7 @@ def _apply_loc_to_sample(
         if tator_url:
             sample["annotation"] = tator_url
     modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
-    dt = _to_datetime_modified_at(modified_at)
+    dt = _to_datetime(modified_at)
     if dt is not None:
         sample[TATOR_MODIFIED_AT_FIELD] = dt
 
@@ -1403,7 +1401,9 @@ def reconcile_dataset_with_tator(
     samples_to_fix_storage: list[fo.Sample] = []
     for eid, sample in eid_to_sample.items():
         loc = loc_index[eid]
-        modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
+        modified_at = _to_datetime(
+            loc.get("modified_datetime") or loc.get("created_datetime")
+        )
         tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
         if was_fixed:
             samples_to_fix_storage.append(sample)
@@ -1627,7 +1627,7 @@ def build_fiftyone_dataset_from_crops(
                 modified_at = loc.get("modified_datetime") or loc.get(
                     "created_datetime"
                 )
-                dt = _to_datetime_modified_at(modified_at)
+                dt = _to_datetime(modified_at)
                 if dt is not None:
                     sample[TATOR_MODIFIED_AT_FIELD] = dt
             samples.append(sample)
@@ -1852,14 +1852,12 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(sample, TATOR_MODIFIED_AT_FIELD):
-            modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
-            if was_fixed:
-                sample.save()
-        else:
-            modified_at = (
-                sample["modified_datetime"] if "modified_datetime" in sample else None
-            )
+        # If the sample[TATOR_MODIFIED_AT_FIELD] is a float, convert it to a datetime
+        modified_at = (
+            sample["modified_datetime"] if "modified_datetime" in sample else None
+        )
+        if isinstance(modified_at, float):
+            modified_at = datetime.fromtimestamp(modified_at)
         created_at = (
             sample["created_datetime"] if "created_datetime" in sample else None
         )
@@ -2279,11 +2277,16 @@ def sync_project_to_fiftyone(
                 "brain_key": embeddings_config.get("brain_key", "umap_viz"),
                 "similarity_brain_key": embeddings_config.get("similarity_brain_key")
                 or "",
-                "similarity_metric": embeddings_config.get("similarity_metric", "cosine"),
+                "similarity_metric": embeddings_config.get(
+                    "similarity_metric", "cosine"
+                ),
             }
             try:
                 from src.app.embedding_service import is_embedding_service_available
-                from src.app.embeddings_viz import compute_embeddings_and_viz, has_embeddings
+                from src.app.embeddings_viz import (
+                    compute_embeddings_and_viz,
+                    has_embeddings,
+                )
 
                 embeddings_field = model_info["embeddings_field"]
                 # When bypass was used (cached JSONL), skip embedding computation if embeddings already exist in MongoDB
