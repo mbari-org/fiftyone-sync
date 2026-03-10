@@ -15,6 +15,10 @@ embeddings:
   force_embeddings: false
   batch_size: 512
   force_umap: false
+  # Similarity search (fob.compute_similarity): set similarity_brain_key to enable
+  similarity_brain_key: "similarity_cosine"
+  similarity_metric: "cosine"
+  force_similarity: false
   service_url: "https://cortex.shore.mbari.org/vss/"
 
 # Per-project VSS and S3 configuration.

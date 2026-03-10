@@ -2248,6 +2248,9 @@ def sync_project_to_fiftyone(
                     "embeddings_field", "embeddings"
                 ),
                 "brain_key": embeddings_config.get("brain_key", "umap_viz"),
+                "similarity_brain_key": embeddings_config.get("similarity_brain_key")
+                or "",
+                "similarity_metric": embeddings_config.get("similarity_metric", "cosine"),
             }
             try:
                 from src.app.embedding_service import is_embedding_service_available
@@ -2267,7 +2270,7 @@ def sync_project_to_fiftyone(
                 else:
                     batch_size = embeddings_config.get("batch_size", 32)
                     logger.info(
-                        f"Computing embeddings with batch size {batch_size} and UMAP for dataset '{dataset_name}'..."
+                        f"Computing embeddings with batch size {batch_size}, UMAP, and similarity for dataset '{dataset_name}'..."
                     )
                     compute_embeddings_and_viz(
                         dataset,
@@ -2277,13 +2280,16 @@ def sync_project_to_fiftyone(
                             embeddings_config.get("force_embeddings", False)
                         ),
                         force_umap=bool(embeddings_config.get("force_umap", False)),
+                        force_similarity=bool(
+                            embeddings_config.get("force_similarity", False)
+                        ),
                         batch_size=batch_size,
                         project_name=vss_project,
                         service_url=embeddings_config.get("service_url")
                         or os.environ.get("FASTVSS_API_URL"),
                     )
                     logger.info(
-                        f"Embeddings and UMAP completed for dataset '{dataset_name}'"
+                        f"Embeddings, UMAP, and similarity completed for dataset '{dataset_name}'"
                     )
             except ImportError as e:
                 logger.info(f"Skipping embeddings/UMAP (missing deps): {e}")
