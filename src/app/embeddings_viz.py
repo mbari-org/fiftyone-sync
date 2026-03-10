@@ -391,24 +391,14 @@ def compute_embeddings_and_viz(
             seed=umap_seed,
         )
         logger.info(f"Visualization stored with brain key: {brain_key}")
-   
-        similarity_metric = (model_info.get("similarity_metric") or "cosine").strip() or "cosine"
-        sim_run_exists = has_brain_run(dataset, brain_key)
-        if sim_run_exists and not force_similarity:
-            logger.info(
-                f"Similarity index already cached with brain key '{brain_key}' - skipping (use force_similarity to recompute)"
-            )
-        else:
-            if sim_run_exists and force_similarity:
-                logger.info("Force recomputing similarity (deleting existing brain run)")
-                dataset.delete_brain_run(brain_key)
-            logger.info(
-                f"Computing similarity index ({n_with_emb} samples, metric={similarity_metric!r})..."
-            )
-            fob.compute_similarity(
-                view_with_emb,
-                embeddings=embeddings_field,
-                metric=similarity_metric,
-                brain_key=brain_key,
-            )
-            logger.info(f"Similarity stored with brain key: {brain_key}")
+
+        logger.info(
+            f"Computing similarity index ({n_with_emb} samples, metric=cosine)..."
+        )
+        fob.compute_similarity(
+            view_with_emb,
+            embeddings=embeddings_field,
+            metric="cosine",
+            brain_key=brain_key,
+        )
+        logger.info(f"Similarity stored with brain key: {brain_key}")
