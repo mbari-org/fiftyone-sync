@@ -1188,10 +1188,7 @@ def _normalize_modified_at(val: Any) -> float | None:
     if isinstance(val, date) and not isinstance(val, datetime):
         return datetime.combine(val, datetime.min.time()).timestamp()
     if isinstance(val, str):
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            pass
+        # Try datetime-like formats first to avoid ValueError from float(val) on "2026-03-10 00:58:37.574000"
         for fmt in (
             "%Y-%m-%d %H:%M:%S.%f",
             "%Y-%m-%d %H:%M:%S",
@@ -1204,6 +1201,10 @@ def _normalize_modified_at(val: Any) -> float | None:
                 ).timestamp()
             except (ValueError, TypeError):
                 continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            pass
     return None
 
 
@@ -1218,10 +1219,7 @@ def _to_datetime(val: Any) -> datetime | None:
     if isinstance(val, date) and not isinstance(val, datetime):
         return datetime.combine(val, datetime.min.time())
     if isinstance(val, str):
-        try:
-            return datetime.fromtimestamp(float(val))
-        except (TypeError, ValueError):
-            pass
+        # Try datetime-like formats first so "2026-03-10 00:58:37.574000" parses instead of raising from float(val)
         for fmt in (
             "%Y-%m-%d %H:%M:%S.%f",
             "%Y-%m-%d %H:%M:%S",
@@ -1232,6 +1230,10 @@ def _to_datetime(val: Any) -> datetime | None:
                 return datetime.strptime(val.replace("Z", "+00:00")[:26], fmt)
             except (ValueError, TypeError):
                 continue
+        try:
+            return datetime.fromtimestamp(float(val))
+        except (TypeError, ValueError):
+            pass
     return None
 
 
@@ -1852,12 +1854,17 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        # If the sample[TATOR_MODIFIED_AT_FIELD] is a float, convert it to a datetime
-        modified_at = (
-            sample["modified_datetime"] if "modified_datetime" in sample else None
-        )
-        if isinstance(modified_at, float):
-            modified_at = datetime.fromtimestamp(modified_at)
+        # Prefer tator_modified_at (normalize to datetime if stored as string/float)
+        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(sample, TATOR_MODIFIED_AT_FIELD):
+            modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
+            if was_fixed:
+                sample.save()
+        else:
+            modified_at = (
+                sample["modified_datetime"] if "modified_datetime" in sample else None
+            )
+            if isinstance(modified_at, float):
+                modified_at = datetime.fromtimestamp(modified_at)
         created_at = (
             sample["created_datetime"] if "created_datetime" in sample else None
         )
