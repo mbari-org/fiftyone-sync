@@ -49,7 +49,7 @@ jobs:
           export RELEASE_VERSION=${{steps.release-status.outputs.tag}}
           docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
           docker buildx create --name mybuilder --platform linux/amd64,linux/arm64 --use
-          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64 -t mbari/fiftyone-sync:$RELEASE_VERSION -t mbari/fiftyone-sync:latest --build-arg IMAGE_URI=mbari/fiftyone-sync:$RELEASE_VERSION -f docker/Dockerfile ..
+          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64 -t mbari/fiftyone-sync:$RELEASE_VERSION --build-arg IMAGE_URI=mbari/fiftyone-sync:$RELEASE_VERSION .
 
   push_readme_to_dockerhub:
     runs-on: ubuntu-latest
