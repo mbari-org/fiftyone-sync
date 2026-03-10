@@ -1855,7 +1855,9 @@ def sync_edits_to_tator(
             continue
 
         # Prefer tator_modified_at (normalize to datetime if stored as string/float)
-        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(sample, TATOR_MODIFIED_AT_FIELD):
+        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(
+            sample, TATOR_MODIFIED_AT_FIELD
+        ):
             modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
             if was_fixed:
                 sample.save()
