@@ -38,7 +38,6 @@ from src.app.database_uri_config import database_name_from_uri
 from src.app.embedding_service import (
     FASTVSS_BASE_URL,
     get_or_poll_embedding_result,
-    init_disk_cache,
     queue_embedding_job,
 )
 from src.app.launcher_template import LAUNCHER_TEMPLATE
@@ -205,7 +204,6 @@ async def post_embed(
     Submit a batch of images for embedding. Forwards to Fast-VSS POST /embeddings/{project}/.
     Returns UUID to fetch results via GET /embed/{uuid}.
     """
-    init_disk_cache()
     image_bytes_list: list[bytes] = []
     local_filepaths: list[str] = []
     for f in files:

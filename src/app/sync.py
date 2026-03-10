@@ -1207,6 +1207,36 @@ def _normalize_modified_at(val: Any) -> float | None:
     return None
 
 
+def _to_datetime_modified_at(val: Any) -> datetime | None:
+    """Convert modified_at from loc (epoch seconds, datetime, or string) to a datetime for storage."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(float(val))
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return datetime.combine(val, datetime.min.time())
+    if isinstance(val, str):
+        try:
+            return datetime.fromtimestamp(float(val))
+        except (TypeError, ValueError):
+            pass
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                return datetime.strptime(
+                    val.replace("Z", "+00:00")[:26], fmt
+                )
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
 def _apply_loc_to_sample(
     sample: fo.Sample,
     loc: dict,
@@ -1238,8 +1268,9 @@ def _apply_loc_to_sample(
         if tator_url:
             sample["annotation"] = tator_url
     modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
-    if modified_at is not None:
-        sample[TATOR_MODIFIED_AT_FIELD] = modified_at
+    dt = _to_datetime_modified_at(modified_at)
+    if dt is not None:
+        sample[TATOR_MODIFIED_AT_FIELD] = dt
 
 
 def _create_sample_from_loc(
@@ -1568,8 +1599,9 @@ def build_fiftyone_dataset_from_crops(
                 modified_at = loc.get("modified_datetime") or loc.get(
                     "created_datetime"
                 )
-                if modified_at is not None:
-                    sample[TATOR_MODIFIED_AT_FIELD] = modified_at
+                dt = _to_datetime_modified_at(modified_at)
+                if dt is not None:
+                    sample[TATOR_MODIFIED_AT_FIELD] = dt
             samples.append(sample)
         if max_samples and len(samples) >= max_samples:
             break

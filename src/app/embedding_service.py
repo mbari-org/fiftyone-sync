@@ -31,93 +31,7 @@ _queue_lock = asyncio.Lock()
 
 # Align with Fast-VSS WS_MAX_WAIT (max time to wait for job result over WebSocket)
 _WS_MAX_WAIT = 300
-_WS_CONNECT_TIMEOUT = 10
-
-
-def _ws_base_url() -> str | None:
-    """Derive WebSocket base URL from FASTVSS_BASE_URL (http -> ws, https -> wss)."""
-    if not FASTVSS_BASE_URL:
-        return None
-    if FASTVSS_BASE_URL.startswith("https://"):
-        return "wss://" + FASTVSS_BASE_URL[8:]
-    if FASTVSS_BASE_URL.startswith("http://"):
-        return "ws://" + FASTVSS_BASE_URL[7:]
-    return "ws://" + FASTVSS_BASE_URL
-
-
-async def _websocket_wait_job(job_id: str, fastvss_job_id: str, project: str) -> None:
-    """Connect to Fast-VSS /ws/predict/job/{job_id}/{project} and update _queue_results when done/failed."""
-    ws_base = _ws_base_url()
-    if not ws_base:
-        return
-    url = f"{ws_base}/ws/predict/job/{fastvss_job_id}/{project}"
-    logger.info(f"Connecting to WebSocket URL: {url}")
-    try:
-        async with websockets.connect(
-            url,
-            open_timeout=_WS_CONNECT_TIMEOUT,
-            close_timeout=5,
-            max_size=10 * 1024 * 1024,  # 10MB max message size (default is 1MB)
-        ) as ws:
-            deadline = time.monotonic() + _WS_MAX_WAIT
-            while True:
-                remaining = max(1.0, deadline - time.monotonic())
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    async with _queue_lock:
-                        _queue_results[job_id] = {
-                            "status": "failed",
-                            "embeddings": None,
-                            "error": "WebSocket wait timed out",
-                        }
-                        _job_map.pop(job_id, None)
-                    return
-                msg = json.loads(raw)
-                status = msg.get("status")
-                if status == "done":
-                    result = msg.get("result")
-                    emb = result if result is not None else msg
-                    async with _queue_lock:
-                        _queue_results[job_id] = {
-                            "status": "completed",
-                            "embeddings": emb,
-                            "error": None,
-                        }
-                        _job_map.pop(job_id, None)
-                    return
-                if status == "failed":
-                    async with _queue_lock:
-                        _queue_results[job_id] = {
-                            "status": "failed",
-                            "embeddings": None,
-                            "error": msg.get("message", "Job failed"),
-                        }
-                        _job_map.pop(job_id, None)
-                    return
-                if status == "error":
-                    async with _queue_lock:
-                        _queue_results[job_id] = {
-                            "status": "failed",
-                            "embeddings": None,
-                            "error": msg.get("message", str(msg)),
-                        }
-                        _job_map.pop(job_id, None)
-                    return
-    except Exception as e:
-        logger.warning("Fast-VSS WebSocket failed for job %s: %s", job_id, e)
-        async with _queue_lock:
-            _queue_results[job_id] = {
-                "status": "failed",
-                "embeddings": None,
-                "error": str(e),
-            }
-            _job_map.pop(job_id, None)
-
-
-def init_disk_cache() -> None:
-    """No-op; Fast-VSS handles caching."""
-    pass
+_WS_CONNECT_TIMEOUT = 30
 
 
 def is_embedding_service_available() -> bool:
@@ -177,9 +91,81 @@ async def queue_embedding_job(
                     "error": None,
                     "fastvss_job_id": fastvss_job_id,
                 }
-                asyncio.create_task(
-                    _websocket_wait_job(job_id, str(fastvss_job_id), project)
-                )
+
+                async def wait_job() -> None:
+                    if not FASTVSS_BASE_URL:
+                        return
+                    if FASTVSS_BASE_URL.startswith("https://"):
+                        ws_base = "wss://" + FASTVSS_BASE_URL[8:]
+                    elif FASTVSS_BASE_URL.startswith("http://"):
+                        ws_base = "ws://" + FASTVSS_BASE_URL[7:]
+                    else:
+                        ws_base = "ws://" + FASTVSS_BASE_URL
+                    url = f"{ws_base}/ws/predict/job/{str(fastvss_job_id)}/{project}"
+                    logger.info("Connecting to WebSocket URL: %s", url)
+                    try:
+                        async with websockets.connect(
+                            url,
+                            open_timeout=_WS_CONNECT_TIMEOUT,
+                            close_timeout=5,
+                            max_size=10 * 1024 * 1024,
+                        ) as ws:
+                            deadline = time.monotonic() + _WS_MAX_WAIT
+                            while True:
+                                remaining = max(1.0, deadline - time.monotonic())
+                                try:
+                                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                                except asyncio.TimeoutError:
+                                    async with _queue_lock:
+                                        _queue_results[job_id] = {
+                                            "status": "failed",
+                                            "embeddings": None,
+                                            "error": "WebSocket wait timed out",
+                                        }
+                                        _job_map.pop(job_id, None)
+                                    return
+                                msg = json.loads(raw)
+                                status = msg.get("status")
+                                if status == "done":
+                                    result = msg.get("result")
+                                    emb = result if result is not None else msg
+                                    async with _queue_lock:
+                                        _queue_results[job_id] = {
+                                            "status": "completed",
+                                            "embeddings": emb,
+                                            "error": None,
+                                        }
+                                        _job_map.pop(job_id, None)
+                                    return
+                                if status == "failed":
+                                    async with _queue_lock:
+                                        _queue_results[job_id] = {
+                                            "status": "failed",
+                                            "embeddings": None,
+                                            "error": msg.get("message", "Job failed"),
+                                        }
+                                        _job_map.pop(job_id, None)
+                                    return
+                                if status == "error":
+                                    async with _queue_lock:
+                                        _queue_results[job_id] = {
+                                            "status": "failed",
+                                            "embeddings": None,
+                                            "error": msg.get("message", str(msg)),
+                                        }
+                                        _job_map.pop(job_id, None)
+                                    return
+                    except Exception as e:
+                        logger.warning("Fast-VSS WebSocket failed for job %s: %s", job_id, e)
+                        async with _queue_lock:
+                            _queue_results[job_id] = {
+                                "status": "failed",
+                                "embeddings": None,
+                                "error": str(e),
+                            }
+                            _job_map.pop(job_id, None)
+
+                asyncio.create_task(wait_job())
             else:
                 # Sync response with embeddings
                 emb = data.get("embeddings") or data
