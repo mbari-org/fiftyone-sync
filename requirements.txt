@@ -1,0 +1,47 @@
+# FiftyOne sync service for Tator dashboard integration
+# Optionally use a venv: python -m venv .venv && source .venv/bin/activate
+
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# HTTP client for Fast-VSS embedding API
+httpx>=0.27.0
+
+# WebSocket client for Fast-VSS job status (/ws/predict/job/{job_id}/{project})
+websockets>=12.0
+
+# Tator API client
+tator>=1.4.0
+requests>=2.32.0
+
+# Embedding: delegated to Fast-VSS API (ViT models)
+# No local model deps; set FASTVSS_API_URL to embedding service URL
+
+# FiftyOne - for sync and launch_app (requires MongoDB)
+fiftyone==1.12.0
+strawberry-graphql==0.291.0
+
+# Caching - Fast-VSS handles its own cache
+
+# Jinja2 for launcher template
+jinja2>=3.1.0
+
+# Image cropping for localization crops
+Pillow>=10.0.0
+
+# Config file support
+PyYAML>=6.0
+
+# Redis queue (required; sync runs in background worker)
+redis>=5.0.0
+rq>=1.15.0
+
+# Prometheus metrics
+prometheus_client>=0.20.0
+
+# Optional: for config.embeddings UMAP visualization only (embeddings come from embed service)
+umap-learn>=0.5
+
+# For enterprise only: S3 crop image upload (sync crops dir to S3, then list with fiftyone.core.storage)
+boto3>=1.34.0

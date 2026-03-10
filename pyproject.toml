@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "fiftyone-sync"
+version = "0.1.0"
+description = "FiftyOne sync service for Tator dashboards"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
