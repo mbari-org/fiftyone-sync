@@ -1,0 +1,69 @@
+name: New Release
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+jobs:
+  semantic_release:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.11'
+
+      - name: Create venv and install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=." >> $GITHUB_ENV
+      - name: Check release status
+        id: release-status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          .venv/bin/pip install python-semantic-release
+          if .venv/bin/semantic-release --noop --strict version
+          then
+            echo "Releasing new version."
+          else
+            echo "Skipping release steps."
+          fi
+
+      - if: steps.release-status.outputs.released == 'true'
+        name: Docker Build and Push
+        run: |
+          export RELEASE_VERSION=${{steps.release-status.outputs.tag}}
+          docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+          docker buildx create --name mybuilder --platform linux/amd64,linux/arm64 --use
+          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64 -t mbari/fiftyone-sync:$RELEASE_VERSION -t mbari/fiftyone-sync:latest --build-arg IMAGE_URI=mbari/fiftyone-sync:$RELEASE_VERSION -f docker/Dockerfile ..
+
+  push_readme_to_dockerhub:
+    runs-on: ubuntu-latest
+    name: Push README to Docker Hub
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v2
+      - name: push README to Dockerhub
+        uses: christian-korneck/update-container-description-action@v1
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          destination_container_repo: mbari/fiftyone-sync:latest
+          provider: dockerhub
+          short_description: 'FiftyOne Sync Service for MBARI datasets'
+          readme_file: 'README.md'
