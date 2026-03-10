@@ -390,13 +390,28 @@ def compute_embeddings_and_viz(
         )
         logger.info(f"Visualization stored with brain key: {brain_key}")
 
-        logger.info(
-            f"Computing similarity index ({n_with_emb} samples, metric=cosine)..."
-        )
-        fob.compute_similarity(
-            view_with_emb,
-            embeddings=embeddings_field,
-            metric="cosine",
-            brain_key=brain_key,
-        )
-        logger.info(f"Similarity stored with brain key: {brain_key}")
+    # Similarity index uses a separate brain key (FiftyOne allows one run per key).
+    similarity_brain_key = model_info.get("similarity_brain_key")
+    similarity_metric = model_info.get("similarity_metric", "cosine")
+    if similarity_brain_key:
+        sim_run_exists = has_brain_run(dataset, similarity_brain_key)
+        if sim_run_exists and not force_umap:
+            logger.info(
+                f"Similarity index already cached with brain key '{similarity_brain_key}' - skipping (use force_umap to recompute)"
+            )
+        else:
+            if sim_run_exists and force_umap:
+                logger.info(
+                    "Force recomputing similarity (deleting existing brain run)"
+                )
+                dataset.delete_brain_run(similarity_brain_key)
+            logger.info(
+                f"Computing similarity index ({n_with_emb} samples, metric={similarity_metric})..."
+            )
+            fob.compute_similarity(
+                view_with_emb,
+                embeddings=embeddings_field,
+                metric=similarity_metric,
+                brain_key=similarity_brain_key,
+            )
+            logger.info(f"Similarity stored with brain key: {similarity_brain_key}")
