@@ -210,11 +210,6 @@ async def queue_embedding_job(
     return job_id
 
 
-def get_embedding_result(job_id: str) -> dict[str, Any] | None:
-    """Get cached result for a queued embedding job by UUID."""
-    return _queue_results.get(job_id)
-
-
 async def get_or_poll_embedding_result(job_id: str) -> dict[str, Any] | None:
     """
     Get cached result for a queued embedding job. Status is updated by a background WebSocket;

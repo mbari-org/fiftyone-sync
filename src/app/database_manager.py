@@ -1,9 +1,8 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: src/app/database_manager.py
-# Description: Maps (project_id, port) to database URI/name and maintains one session per (project_id, port).
+# Description: Maps (project_id, port) to database URI/name from YAML config.
 """
-Database manager: maps (project_id, port) to a database (URI + name) and maintains
-one unique session per (project_id, port).
+Database manager: maps (project_id, port) to a database (URI + name).
 Uses mandatory YAML config (FIFTYONE_SYNC_CONFIG_PATH) keyed by project name
 for per-project, per-port databases.
 """
@@ -15,7 +14,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
 from src.app.database_uri_config import (
     DatabaseEntry,
     DatabaseUriConfig,
@@ -31,15 +29,10 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-MAX_PROJECTS = 20
-
-# Session key: (project_id, port). Value: session dict (port, process, database_name, database_uri, dataset_name).
-_sessions: dict[tuple[int, int], dict[str, Any]] = {}
-
 # Cached config lookup: key is (project_name: str, port: int), value is DatabaseEntry.
 _config: dict[tuple[str, int], DatabaseEntry] | None = None
 
-# Full YAML config for get_vss_project (project name -> ProjectConfig).
+# Full YAML config (project name -> ProjectConfig).
 _yaml_config: DatabaseUriConfig | None = None
 
 # Optional registry: project_id -> project_name (set by run_sync_job so workers can resolve without API).
@@ -97,26 +90,6 @@ def _load_config() -> dict[tuple[str, int], DatabaseEntry] | None:
         _config = None
         _yaml_config = None
         return None
-
-
-def get_vss_project(project_name: str, port: int) -> str | None:
-    """Return vss_project for (project_name, port) from DatabaseUriConfig, or None.
-    For backward compatibility: returns legacy vss_project if set, otherwise returns
-    first VSS project from vss_projects dict if only one exists."""
-    _load_config()
-    if not _yaml_config or not project_name or not project_name.strip():
-        return None
-    proj = _yaml_config.projects.get(project_name.strip())
-    if not proj:
-        return None
-    # Legacy single vss_project (backward compatibility)
-    if proj.vss_project:
-        return proj.vss_project
-    # New nested vss_projects: return first if only one exists
-    if proj.vss_projects and len(proj.vss_projects) == 1:
-        vss_config = next(iter(proj.vss_projects.values()))
-        return vss_config.vss_project
-    return None
 
 
 def get_vss_projects_list(project_name: str) -> list[dict[str, str]]:
@@ -335,42 +308,3 @@ def get_port_for_project(project_id: int, project_name: str | None = None) -> in
     return 5151 + (project_id - 1)
 
 
-def ensure_session(
-    project_id: int,
-    port: int,
-    dataset_name: str | None = None,
-    project_name: str | None = None,
-) -> int | None:
-    """
-    Ensure a FiftyOne session exists for (project_id, port). Returns the port.
-    """
-    db = get_database_entry(project_id, port, project_name=project_name)
-    if db is None:
-        return None
-    if (project_id, port) not in _sessions:
-        _sessions[(project_id, port)] = {
-            "port": port,
-            "process": None,
-            "dataset_name": dataset_name or f"tator_project_{project_id}",
-        }
-    return port
-
-
-def get_session(project_id: int, port: int | None = None) -> dict[str, Any] | None:
-    """Get session info for (project_id, port)."""
-    return (
-        _sessions.get((project_id, port)) if _sessions.get((project_id, port)) else None
-    )
-
-
-def release_session(project_id: int, port: int) -> None:
-    """Release/stop the FiftyOne session for (project_id, port)."""
-    key = (project_id, port)
-    if key in _sessions:
-        sess = _sessions[key]
-        proc = sess.get("process")
-        if proc and getattr(proc, "poll", None) and proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
-        del _sessions[key]
-        logger.info(f"Released session for project_id={project_id} port={port}")
