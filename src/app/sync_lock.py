@@ -1,10 +1,9 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: src/app/sync_lock.py
-# Description: Mutex for FiftyOne sync so only one sync per project runs at a time (Redis-based).
+# Description: Mutex for FiftyOne sync so only one sync per version runs at a time (Redis-based).
 """
-Mutex for FiftyOne sync: only one sync per project at a time.
-Different versions of the same project cannot sync concurrently because they share
-the download directory (/tmp/fiftyone_sync/downloads/{project_id}).
+Mutex for FiftyOne sync: only one sync per (database, project, version) at a time.
+Different versions of the same project can sync concurrently; each version has its own lock.
 Uses Redis (required). Set REDIS_HOST or REDIS_URL.
 """
 
@@ -50,13 +49,17 @@ def _get_connection():
     )
 
 
-def get_sync_lock_key(resolved_db: str, project_id: int, version_id: int | None) -> str:
-    """Return a unique key for the project being synced (same key = same project).
+def _version_slug(version_id: int | None) -> str:
+    """Slug for version in lock key (matches sync.py _version_slug)."""
+    return f"v{version_id}" if version_id is not None else "v_all"
 
-    Lock is per-project (not per-version) because different versions share resources
-    like the download directory (/tmp/fiftyone_sync/downloads/{project_id}).
+
+def get_sync_lock_key(resolved_db: str, project_id: int, version_id: int | None) -> str:
+    """Return a unique key for the (database, project, version) being synced.
+
+    Lock is per-version: different versions of the same project can sync concurrently.
     """
-    return f"{LOCK_KEY_PREFIX}:{resolved_db}:{project_id}"
+    return f"{LOCK_KEY_PREFIX}:{resolved_db}:{project_id}:{_version_slug(version_id)}"
 
 
 def try_acquire_sync_lock(
