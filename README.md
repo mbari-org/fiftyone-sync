@@ -1,7 +1,7 @@
 # FiftyOne Sync Service
 
 Backend service to sync data between Tator and Voxel51 for quickly editing localizations
-and downstream model iteration. 
+and downstream model iteration.
 
 See https://docs.mbari.org/internal/ai/videos/voxel51demo.gif for demo of the community Voxel51 tool.
 
@@ -336,9 +336,9 @@ max_samples: 500                         # optional: limit for testing
 
 The FiftyOne dataset name is always `project_name_v{version_id}_{port}` and cannot be set in config.
 
-### Embeddings and UMAP visualization
+### Embeddings, UMAP, and similarity search
 
-You can optionally compute **embeddings** and a **UMAP** 2D visualization after the dataset is built. Embeddings are fetched from the **embed service** at `{service_url}/embed/{project}`. By default `{project}` is the **Tator project ID** (many services expect this). Set `embeddings.project_name` in config to use a project name or other key instead. Add an `embeddings` block to your config and pass it via `config_path`:
+You can optionally compute **embeddings**, a **UMAP** 2D visualization, and a **similarity** index after the dataset is built. Embeddings are fetched from the **embed service** at `{service_url}/embed/{project}`. By default `{project}` is the **Tator project ID** (many services expect this). Set `embeddings.project_name` in config to use a project name or other key instead. Add an `embeddings` block to your config and pass it via `config_path`:
 
 ```yaml
 embeddings:
@@ -347,6 +347,10 @@ embeddings:
   umap_seed: 51
   force_embeddings: false             # set true to recompute embeddings
   force_umap: false                   # set true to recompute UMAP
+  # Similarity search (fob.compute_similarity): omit or set to "" to disable
+  similarity_brain_key: similarity_cosine
+  similarity_metric: cosine            # e.g. cosine, euclidean
+  force_similarity: false             # set true to recompute similarity index
   batch_size: 32                     # batch size for embed service requests
   service_url: null                   # optional; default FASTVSS_API_URL or http://localhost:8000
   project_name: null                  # optional; override for embed service URL path (default: project_id)
@@ -358,7 +362,7 @@ embeddings:
 pip install umap-learn
 ```
 
-If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP are skipped and a message is logged. Embeddings and UMAP results are cached on the dataset; use `force_embeddings` / `force_umap` to recompute.
+If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
 ### Data layout
 

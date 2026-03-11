@@ -33,7 +33,6 @@ from src.app.database_manager import (
     get_database_uri,
     get_is_enterprise,
     get_port_for_project,
-    get_session,
     get_s3_config,
 )
 from src.app.sync_lock import (
@@ -825,43 +824,6 @@ def _cleanup_download_dir(project_id: int) -> None:
             logger.info(f"Could not remove download directory {dl_dir}: {e}")
 
 
-# Image extensions for S3 raw-image dataset (parent folder = class name)
-DEFAULT_S3_IMAGE_EXTENSIONS = (
-    "png",
-    "jpg",
-    "jpeg",
-    "bmp",
-    "tiff",
-    "tif",
-    "webp",
-    "gif",
-)
-
-
-def _s3_uri_parent_and_stem(s3_uri: str) -> tuple[str, str]:
-    """
-    Parse s3://bucket/prefix/class_name/filename.ext into (parent_folder_name, stem).
-    Parent folder is used as class label; stem is the filename without extension (e.g. elemental_id).
-    """
-    s3_uri = (s3_uri or "").strip().rstrip("/")
-    if not s3_uri.startswith("s3://"):
-        return ("unknown", "")
-    path_part = s3_uri.replace("s3://", "", 1)
-    if "/" in path_part:
-        path_part = path_part.split("/", 1)[1]  # drop bucket
-    parts = [p for p in path_part.split("/") if p]
-    if len(parts) >= 2:
-        parent_folder = parts[-2]
-        last = parts[-1]
-        stem = last.rsplit(".", 1)[0] if "." in last else last
-        return (parent_folder, stem)
-    if len(parts) == 1:
-        last = parts[0]
-        stem = last.rsplit(".", 1)[0] if "." in last else last
-        return ("unknown", stem)
-    return ("unknown", "")
-
-
 def _ensure_s3_bucket_exists(bucket: str) -> None:
     """Create the S3 bucket if it does not exist. Idempotent."""
     import boto3
@@ -983,73 +945,6 @@ def _sync_local_dir_with_s3(
     except subprocess.CalledProcessError as e:
         logger.exception(f"aws s3 sync failed: {e}")
         raise
-
-
-def build_fiftyone_dataset_from_s3(
-    s3_bucket: str,
-    s3_prefix: str | None,
-    dataset_name: str,
-    config: dict[str, Any] | None = None,
-) -> fo.Dataset:
-    """
-    List image files in an S3 bucket/prefix using fiftyone.core.storage, then build a FiftyOne
-    dataset where the parent folder of each file is used as the class label.
-    Assumes layout: s3://bucket/prefix/class_name/image_id.jpg (class_name = label).
-    """
-    import fiftyone.core.storage as fos
-
-    config = config or {}
-    image_extensions = config.get("image_extensions") or list(
-        DEFAULT_S3_IMAGE_EXTENSIONS
-    )
-    # Normalize to bare extensions for matching (e.g. "jpg" from "*.jpg" or "jpg")
-    ext_set = set()
-    for ext in image_extensions:
-        e = (ext or "").strip().lstrip("*.")
-        if e:
-            ext_set.add(e.lower())
-
-    prefix = (s3_prefix or "").strip().rstrip("/")
-    s3_dir = f"s3://{s3_bucket}/{prefix}/" if prefix else f"s3://{s3_bucket}/"
-    logger.info(f"Listing S3 files: {s3_dir} (recursive)")
-    s3_files = fos.list_files(s3_dir, recursive=True, abs_paths=True)
-    samples: list[fo.Sample] = []
-    for s3_uri in s3_files:
-        s3_uri_lower = s3_uri.lower()
-        matched = False
-        for ext in ext_set:
-            if s3_uri_lower.endswith(f".{ext}"):
-                matched = True
-                break
-        if not matched:
-            continue
-        parent_folder, elemental_id = _s3_uri_parent_and_stem(s3_uri)
-        label_name = parent_folder if parent_folder else "unknown"
-        sample = fo.Sample(filepath=s3_uri)
-        sample["ground_truth"] = fo.Classification(label=label_name, confidence=1.0)
-        sample["elemental_id"] = elemental_id
-        sample["label"] = label_name
-        sample["local_filepath"] = s3_uri.replace("s3://", "")
-        samples.append(sample)
-
-    if not samples:
-        raise ValueError(
-            f"No image files found in {s3_dir} (extensions: {list(ext_set)})"
-        )
-    logger.info(f"Collected {len(samples)} samples from S3 for dataset {dataset_name}")
-
-    if dataset_name in fo.list_datasets():
-        dataset = fo.load_dataset(dataset_name)
-        dataset.persistent = True
-        dataset.clear()
-        dataset.add_samples(samples)
-        logger.info(f"Replaced dataset '{dataset_name}' with {len(samples)} S3 samples")
-    else:
-        dataset = fo.Dataset(dataset_name)
-        dataset.persistent = True
-        dataset.add_samples(samples)
-        logger.info(f"Created dataset '{dataset_name}' with {len(samples)} S3 samples")
-    return dataset
 
 
 def _find_crop_cache_misses(
@@ -1293,10 +1188,7 @@ def _normalize_modified_at(val: Any) -> float | None:
     if isinstance(val, date) and not isinstance(val, datetime):
         return datetime.combine(val, datetime.min.time()).timestamp()
     if isinstance(val, str):
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            pass
+        # Try datetime-like formats first to avoid ValueError from float(val) on "2026-03-10 00:58:37.574000"
         for fmt in (
             "%Y-%m-%d %H:%M:%S.%f",
             "%Y-%m-%d %H:%M:%S",
@@ -1309,7 +1201,61 @@ def _normalize_modified_at(val: Any) -> float | None:
                 ).timestamp()
             except (ValueError, TypeError):
                 continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            pass
     return None
+
+
+def _to_datetime(val: Any) -> datetime | None:
+    """Convert to a datetime for storage."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(float(val))
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return datetime.combine(val, datetime.min.time())
+    if isinstance(val, str):
+        # Try datetime-like formats first so "2026-03-10 00:58:37.574000" parses instead of raising from float(val)
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                return datetime.strptime(val.replace("Z", "+00:00")[:26], fmt)
+            except (ValueError, TypeError):
+                continue
+        try:
+            return datetime.fromtimestamp(float(val))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _get_tator_modified_at_datetime(sample: fo.Sample) -> tuple[datetime | None, bool]:
+    """Get tator_modified_at from sample as datetime. If the stored value is not a valid
+    datetime (e.g. string or number from MongoDB), convert via _to_datetime_modified_at
+    and update the sample. Returns (datetime or None, True if sample was updated).
+    """
+    val = None
+    if TATOR_MODIFIED_AT_FIELD in sample:
+        val = sample[TATOR_MODIFIED_AT_FIELD]
+    if val is None:
+        val = getattr(sample, TATOR_MODIFIED_AT_FIELD, None)
+    if val is None:
+        return None, False
+    if isinstance(val, datetime):
+        return val, False
+    dt = _to_datetime(val)
+    if dt is not None:
+        sample[TATOR_MODIFIED_AT_FIELD] = dt
+        return dt, True
+    return None, False
 
 
 def _apply_loc_to_sample(
@@ -1335,7 +1281,7 @@ def _apply_loc_to_sample(
     if verified is not None and bool(verified):
         sample.tags.append("verified")
     if label_s is not None and "Unknown" not in label_s:
-        sample.append(label_s)
+        sample.tags.append(label_s)
     if cluster is not None and "Unknown" not in cluster:
         sample.tags.append(cluster)
     if api_url and project_id is not None:
@@ -1343,8 +1289,9 @@ def _apply_loc_to_sample(
         if tator_url:
             sample["annotation"] = tator_url
     modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
-    if modified_at is not None:
-        sample[TATOR_MODIFIED_AT_FIELD] = modified_at
+    dt = _to_datetime(modified_at)
+    if dt is not None:
+        sample[TATOR_MODIFIED_AT_FIELD] = dt
 
 
 def _create_sample_from_loc(
@@ -1453,10 +1400,15 @@ def reconcile_dataset_with_tator(
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
+    samples_to_fix_storage: list[fo.Sample] = []
     for eid, sample in eid_to_sample.items():
         loc = loc_index[eid]
-        modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
-        tator_modified_at = getattr(sample, TATOR_MODIFIED_AT_FIELD, None)
+        modified_at = _to_datetime(
+            loc.get("modified_datetime") or loc.get("created_datetime")
+        )
+        tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
+        if was_fixed:
+            samples_to_fix_storage.append(sample)
         mod_ts = _normalize_modified_at(modified_at)
         last_ts = _normalize_modified_at(tator_modified_at)
 
@@ -1469,6 +1421,10 @@ def reconcile_dataset_with_tator(
             )
             samples_to_update.append((sample, loc))
             updated += 1
+
+    # Persist samples whose tator_modified_at was normalized from non-datetime
+    for sample in samples_to_fix_storage:
+        sample.save()
 
     # Apply current localization data to changed samples and save
     if samples_to_update:
@@ -1673,8 +1629,9 @@ def build_fiftyone_dataset_from_crops(
                 modified_at = loc.get("modified_datetime") or loc.get(
                     "created_datetime"
                 )
-                if modified_at is not None:
-                    sample[TATOR_MODIFIED_AT_FIELD] = modified_at
+                dt = _to_datetime(modified_at)
+                if dt is not None:
+                    sample[TATOR_MODIFIED_AT_FIELD] = dt
             samples.append(sample)
         if max_samples and len(samples) >= max_samples:
             break
@@ -1897,13 +1854,19 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        modified_at = (
-            sample[TATOR_MODIFIED_AT_FIELD]
-            if TATOR_MODIFIED_AT_FIELD in sample
-            else (
+        # Prefer tator_modified_at (normalize to datetime if stored as string/float)
+        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(
+            sample, TATOR_MODIFIED_AT_FIELD
+        ):
+            modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
+            if was_fixed:
+                sample.save()
+        else:
+            modified_at = (
                 sample["modified_datetime"] if "modified_datetime" in sample else None
             )
-        )
+            if isinstance(modified_at, float):
+                modified_at = datetime.fromtimestamp(modified_at)
         created_at = (
             sample["created_datetime"] if "created_datetime" in sample else None
         )
@@ -2040,13 +2003,9 @@ def sync_project_to_fiftyone(
     logger.info(
         f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'}"
     )
-    sess = get_session(project_id, port)
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
-    ) or (sess.get("database_name") if sess else None)
-    # Ensure resolved_db has a default value if not set
-    if not resolved_db:
-        resolved_db = get_database_name(project_id, port, project_name=project_name)
+    ) or get_database_name(project_id, port, project_name=project_name)
     resolved_uri = (
         database_uri.strip() if database_uri and database_uri.strip() else None
     ) or get_database_uri(project_id, port, project_name=project_name)
@@ -2306,7 +2265,7 @@ def sync_project_to_fiftyone(
         except Exception:
             project_name_for_config = str(project_id)
 
-        from database_manager import get_vss_project_config
+        from src.app.database_manager import get_vss_project_config
 
         vss_project = None
         vss_config = get_vss_project_config(project_name_for_config, vss_project_key)
@@ -2325,10 +2284,18 @@ def sync_project_to_fiftyone(
                     "embeddings_field", "embeddings"
                 ),
                 "brain_key": embeddings_config.get("brain_key", "umap_viz"),
+                "similarity_brain_key": embeddings_config.get("similarity_brain_key")
+                or "",
+                "similarity_metric": embeddings_config.get(
+                    "similarity_metric", "cosine"
+                ),
             }
             try:
-                from embedding_service import is_embedding_service_available
-                from embeddings_viz import compute_embeddings_and_viz, has_embeddings
+                from src.app.embedding_service import is_embedding_service_available
+                from src.app.embeddings_viz import (
+                    compute_embeddings_and_viz,
+                    has_embeddings,
+                )
 
                 embeddings_field = model_info["embeddings_field"]
                 # When bypass was used (cached JSONL), skip embedding computation if embeddings already exist in MongoDB
@@ -2344,7 +2311,7 @@ def sync_project_to_fiftyone(
                 else:
                     batch_size = embeddings_config.get("batch_size", 32)
                     logger.info(
-                        f"Computing embeddings with batch size {batch_size} and UMAP for dataset '{dataset_name}'..."
+                        f"Computing embeddings with batch size {batch_size}, UMAP, and similarity for dataset '{dataset_name}'..."
                     )
                     compute_embeddings_and_viz(
                         dataset,
@@ -2360,7 +2327,7 @@ def sync_project_to_fiftyone(
                         or os.environ.get("FASTVSS_API_URL"),
                     )
                     logger.info(
-                        f"Embeddings and UMAP completed for dataset '{dataset_name}'"
+                        f"Embeddings, UMAP, and similarity completed for dataset '{dataset_name}'"
                     )
             except ImportError as e:
                 logger.info(f"Skipping embeddings/UMAP (missing deps): {e}")

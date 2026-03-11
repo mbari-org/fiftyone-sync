@@ -1,13 +1,14 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: src/app/embeddings_viz.py
-# Description: Compute embeddings and UMAP visualization for FiftyOne datasets with caching.
+# Description: Compute embeddings, UMAP visualization, and similarity search for FiftyOne datasets with caching.
 """
-Compute embeddings and UMAP visualization for FiftyOne datasets with caching.
+Compute embeddings, UMAP visualization, and optional similarity search for FiftyOne datasets with caching.
 
 Embeddings are fetched from the embed service at {base}/embed/{project}
 where project is typically the Tator project ID (sync passes str(project_id) by default; config can override).
 Job status is received via WebSocket {base}/ws/predict/job/{job_id}/{project}.
 UMAP requires umap-learn (see requirements.txt).
+Similarity search uses fob.compute_similarity when config.embeddings.similarity_brain_key is set.
 """
 
 from __future__ import annotations
@@ -300,18 +301,19 @@ def compute_embeddings_and_viz(
     service_url: Optional[str] = None,
 ) -> None:
     """
-    Compute embeddings and UMAP visualization with caching.
+    Compute embeddings, UMAP visualization, and optional similarity index with caching.
 
     Embeddings are fetched from the embed service at {service_url}/embed/{project_name},
     where project_name is the Tator project name (get_project(project_id).name).
     UMAP is computed locally and stored under brain_key.
+    If model_info has similarity_brain_key, similarity search is computed via fob.compute_similarity.
 
     When is_enterprise is True, only local_filepath is passed to the embed service (sample filepath may be S3).
 
     Args:
         dataset: FiftyOne dataset
-        model_info: Dict with embeddings_field, brain_key (and optionally path for local model; if
-            project_name is set, the service is used instead).
+        model_info: Dict with embeddings_field, brain_key; optionally similarity_brain_key,
+            similarity_metric (e.g. "cosine").
         umap_seed: Random seed for UMAP
         force_embeddings: If True, recompute embeddings even if they exist
         force_umap: If True, recompute UMAP even if it exists
@@ -356,21 +358,12 @@ def compute_embeddings_and_viz(
     # Reload so exists() and brain see the persisted embeddings
     dataset.reload()
 
-    # --- UMAP (local) ---
-    try:
-        import umap  # noqa: F401
-    except ImportError:
-        logger.warning(
-            "UMAP visualization skipped (install umap-learn). Embeddings are stored."
-        )
-        return
-
-    # Only run UMAP on samples that have embeddings (avoid empty array error)
+    # Only run UMAP/similarity on samples that have embeddings (avoid empty array error)
     view_with_emb = dataset.exists(embeddings_field)
     n_with_emb = view_with_emb.count()
     if n_with_emb == 0:
         logger.warning(
-            "UMAP skipped: no samples have embeddings (need at least 1). Embeddings may be missing or failed."
+            "UMAP/similarity skipped: no samples have embeddings (need at least 1). Embeddings may be missing or failed."
         )
         return
 
@@ -396,3 +389,29 @@ def compute_embeddings_and_viz(
             seed=umap_seed,
         )
         logger.info(f"Visualization stored with brain key: {brain_key}")
+
+    # Similarity index uses a separate brain key (FiftyOne allows one run per key).
+    similarity_brain_key = model_info.get("similarity_brain_key")
+    similarity_metric = model_info.get("similarity_metric", "cosine")
+    if similarity_brain_key:
+        sim_run_exists = has_brain_run(dataset, similarity_brain_key)
+        if sim_run_exists and not force_umap:
+            logger.info(
+                f"Similarity index already cached with brain key '{similarity_brain_key}' - skipping (use force_umap to recompute)"
+            )
+        else:
+            if sim_run_exists and force_umap:
+                logger.info(
+                    "Force recomputing similarity (deleting existing brain run)"
+                )
+                dataset.delete_brain_run(similarity_brain_key)
+            logger.info(
+                f"Computing similarity index ({n_with_emb} samples, metric={similarity_metric})..."
+            )
+            fob.compute_similarity(
+                view_with_emb,
+                embeddings=embeddings_field,
+                metric=similarity_metric,
+                brain_key=similarity_brain_key,
+            )
+            logger.info(f"Similarity stored with brain key: {similarity_brain_key}")
