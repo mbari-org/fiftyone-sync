@@ -24,6 +24,19 @@ import fiftyone as fo
 
 logger = logging.getLogger(__name__)
 
+# #region agent log
+_DEBUG_LOG_PATH = "/Users/dcline/Dropbox/code/ai/fiftyone-sync/.cursor/debug-e530c0.log"
+def _agent_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
+    try:
+        payload = {"sessionId": "e530c0", "location": location, "message": message, "data": data, "timestamp": int(time.time() * 1000)}
+        if hypothesis_id:
+            payload["hypothesisId"] = hypothesis_id
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+# #endregion
+
 # Base URL for embed service (POST /embed/{project}, job status via WS /ws/predict/job/{job_id}/{project})
 EMBED_SERVICE_BASE_URL = os.environ.get(
     "FASTVSS_API_URL", "http://cortext.shore.mbari.org/vss"
@@ -51,31 +64,48 @@ async def _wait_job_result_ws(ws_url: str, timeout: float = _WS_JOB_TIMEOUT) -> 
     Wait for job completion via Fast-VSS WebSocket. Returns result dict on "done"; raises on "failed"/"error"/timeout.
     """
     import websockets
+    from websockets.exceptions import InvalidStatus
 
+    # #region agent log
+    _agent_log("embeddings_viz.py:_wait_job_result_ws", "entering WebSocket connect", {"ws_url": ws_url}, "A")
+    # #endregion
     deadline = time.monotonic() + timeout
-    async with websockets.connect(
-        ws_url,
-        open_timeout=10,
-        close_timeout=5,
-        max_size=10 * 1024 * 1024,  # 10MB max message size (default is 1MB)
-    ) as ws:
-        while True:
-            remaining = max(1.0, deadline - time.monotonic())
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            msg = json.loads(raw)
-            status = msg.get("status")
-            logger.debug(
-                f"WebSocket message: status={status}, keys={list(msg.keys())}, msg_size={len(raw)} bytes"
-            )
-            if status == "done":
-                result = msg.get("result") or msg
-                if isinstance(result, dict):
-                    logger.debug(f"Result keys: {list(result.keys())}")
-                return result
-            if status == "failed":
-                raise RuntimeError(msg.get("message", "Job failed"))
-            if status == "error":
-                raise RuntimeError(msg.get("message", str(msg)))
+    try:
+        async with websockets.connect(
+            ws_url,
+            open_timeout=10,
+            close_timeout=5,
+            max_size=10 * 1024 * 1024,  # 10MB max message size (default is 1MB)
+        ) as ws:
+            while True:
+                remaining = max(1.0, deadline - time.monotonic())
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                status = msg.get("status")
+                logger.debug(
+                    f"WebSocket message: status={status}, keys={list(msg.keys())}, msg_size={len(raw)} bytes"
+                )
+                if status == "done":
+                    result = msg.get("result") or msg
+                    if isinstance(result, dict):
+                        logger.debug(f"Result keys: {list(result.keys())}")
+                    return result
+                if status == "failed":
+                    raise RuntimeError(msg.get("message", "Job failed"))
+                if status == "error":
+                    raise RuntimeError(msg.get("message", str(msg)))
+    except InvalidStatus as e:
+        # #region agent log
+        r = getattr(e, "response", None) or (e.args[0] if e.args else None)
+        resp_data = {}
+        if r is not None:
+            resp_data["response_status"] = getattr(r, "status_code", None)
+            resp_data["response_reason"] = getattr(r, "reason_phrase", None)
+            if hasattr(r, "headers"):
+                resp_data["response_headers"] = dict(r.headers)
+        _agent_log("embeddings_viz.py:_wait_job_result_ws", "WebSocket InvalidStatus (403)", {"ws_url": ws_url, "exception": str(e), **resp_data}, "B,C,D,E")
+        # #endregion
+        raise
 
 
 def has_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> bool:
@@ -109,6 +139,9 @@ def _compute_embeddings_via_service(
 
     base = service_url.rstrip("/")
     ws_base = _service_base_to_ws(base)
+    # #region agent log
+    _agent_log("embeddings_viz.py:_compute_embeddings_via_service", "embed service URL state", {"base": base, "ws_base": ws_base, "service_url": service_url, "project_name": project_name}, "A")
+    # #endregion
     all_samples = list(dataset.iter_samples(autosave=True))
     if not all_samples:
         return
@@ -187,6 +220,9 @@ def _compute_embeddings_via_service(
 
         for batch_idx, job_id in jobs:
             ws_url = f"{ws_base}/ws/predict/job/{job_id}/{project_name}"
+            # #region agent log
+            _agent_log("embeddings_viz.py:ws_url_built", "WebSocket URL for job", {"ws_url": ws_url, "job_id": job_id, "project_name": project_name, "ws_base": ws_base}, "A")
+            # #endregion
             logger.info(f"Using WebSocket URL: {ws_url}")
             last_error = None
             for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):
