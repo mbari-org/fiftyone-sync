@@ -26,13 +26,21 @@ logger = logging.getLogger(__name__)
 
 # #region agent log
 _DEBUG_LOG_PATH = "/Users/dcline/Dropbox/code/ai/fiftyone-sync/.cursor/debug-e530c0.log"
+_DEBUG_LOG_PATH_FALLBACK = os.environ.get("DEBUG_LOG_PATH", "/tmp/debug-e530c0.log")
+
 def _agent_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
     try:
         payload = {"sessionId": "e530c0", "location": location, "message": message, "data": data, "timestamp": int(time.time() * 1000)}
         if hypothesis_id:
             payload["hypothesisId"] = hypothesis_id
-        with open(_DEBUG_LOG_PATH, "a") as f:
-            f.write(json.dumps(payload) + "\n")
+        line = json.dumps(payload) + "\n"
+        for path in (_DEBUG_LOG_PATH, _DEBUG_LOG_PATH_FALLBACK):
+            try:
+                with open(path, "a") as f:
+                    f.write(line)
+                break
+            except Exception:
+                continue
     except Exception:
         pass
 # #endregion
@@ -59,6 +67,15 @@ def _service_base_to_ws(base: str) -> str:
     return "ws://" + base
 
 
+def _ws_url_to_origin(ws_url: str) -> str:
+    """Derive HTTP Origin from WebSocket URL (wss://host/path -> https://host). Many servers 403 WS without matching Origin."""
+    from urllib.parse import urlparse
+    parsed = urlparse(ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    netloc = parsed.netloc or parsed.path.split("/")[0] or "localhost"
+    return f"{scheme}://{netloc}"
+
+
 async def _wait_job_result_ws(ws_url: str, timeout: float = _WS_JOB_TIMEOUT) -> dict:
     """
     Wait for job completion via Fast-VSS WebSocket. Returns result dict on "done"; raises on "failed"/"error"/timeout.
@@ -67,7 +84,8 @@ async def _wait_job_result_ws(ws_url: str, timeout: float = _WS_JOB_TIMEOUT) -> 
     from websockets.exceptions import InvalidStatus
 
     # #region agent log
-    _agent_log("embeddings_viz.py:_wait_job_result_ws", "entering WebSocket connect", {"ws_url": ws_url}, "A")
+    origin = _ws_url_to_origin(ws_url)
+    _agent_log("embeddings_viz.py:_wait_job_result_ws", "entering WebSocket connect", {"ws_url": ws_url, "origin_header": origin}, "A")
     # #endregion
     deadline = time.monotonic() + timeout
     try:
@@ -76,6 +94,7 @@ async def _wait_job_result_ws(ws_url: str, timeout: float = _WS_JOB_TIMEOUT) -> 
             open_timeout=10,
             close_timeout=5,
             max_size=10 * 1024 * 1024,  # 10MB max message size (default is 1MB)
+            additional_headers={"Origin": origin},
         ) as ws:
             while True:
                 remaining = max(1.0, deadline - time.monotonic())
