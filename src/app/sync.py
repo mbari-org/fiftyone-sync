@@ -3,7 +3,7 @@
 # Description: Tator to FiftyOne sync: fetch media and localizations, build dataset, launch app.
 """
 Tator to FiftyOne sync: fetch media + localizations, build FiftyOne dataset, launch app.
-Phase 2 implementation. Requires fiftyone, tator, Pillow, PyYAML and MongoDB.
+Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping uses ffmpeg.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from typing import Any
 import fiftyone as fo
 import tator
 import yaml
-from PIL import Image
 from src.app.database_uri_config import database_name_from_uri
 from src.app.database_manager import (
     get_database_entry_or_enterprise_default,
@@ -411,6 +410,149 @@ def _is_video_name(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
 
+def _is_streaming_video(m: Any) -> bool:
+    """True if Media has a single HTTP streaming URL (video, no download)."""
+    if not hasattr(m, "media_files") or m.media_files is None:
+        return False
+    if not hasattr(m.media_files, "streaming") or not m.media_files.streaming:
+        return False
+    if len(m.media_files.streaming) != 1:
+        return False
+    path = getattr(m.media_files.streaming[0], "path", None) or (
+        m.media_files.streaming[0].get("path") if isinstance(m.media_files.streaming[0], dict) else None
+    )
+    return isinstance(path, str) and path.startswith("http")
+
+
+def _ffprobe_dimensions(input_path_or_url: str | Path, _cache: dict[str, tuple[int, int]] | None = None) -> tuple[int, int] | None:
+    """
+    Return (width, height) for an image or video (local path or HTTP URL). Uses ffprobe.
+    Returns None on failure. Results are cached per input string.
+    """
+    cache: dict[str, tuple[int, int]] = _cache if _cache is not None else {}
+    key = str(input_path_or_url)
+    if key in cache:
+        return cache[key]
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0",
+            "-i", key,
+        ]
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if out.returncode != 0:
+            logger.debug(f"ffprobe failed for {key}: {out.stderr}")
+            return None
+        line = (out.stdout or "").strip()
+        if not line:
+            return None
+        parts = line.split(",")
+        if len(parts) >= 2:
+            w, h = int(parts[0]), int(parts[1])
+            if w > 0 and h > 0:
+                cache[key] = (w, h)
+                return (w, h)
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError) as e:
+        logger.debug(f"ffprobe error for {key}: {e}")
+    return None
+
+
+def _crop_media_group(
+    input_path_or_url: str | Path,
+    locs_with_out_paths: list[tuple[dict, Path]],
+    frame_index: int | None = None,
+    size: int = 224,
+    _dim_cache: dict[str, tuple[int, int]] | None = None,
+) -> tuple[int, int]:
+    """
+    Crop multiple localizations from one image or one video frame using ffmpeg.
+    For video, frame_index must be set; input is streaming URL. For image, frame_index is None.
+    Tator box: x, y, width, height normalized 0-1. Filter: crop=W:H:x1:y1,scale=224:224.
+    Returns (num_ok, num_fail).
+    """
+    if not locs_with_out_paths:
+        return (0, 0)
+    dim_cache: dict[str, tuple[int, int]] = _dim_cache if _dim_cache is not None else {}
+    dims = _ffprobe_dimensions(input_path_or_url, _cache=dim_cache)
+    if not dims:
+        logger.info(f"Could not get dimensions for {input_path_or_url}; skipping crop group")
+        return (0, len(locs_with_out_paths))
+    width, height = dims
+    input_str = str(input_path_or_url)
+
+    # Compute pixel crop for each loc: x1,y1,x2,y2 then W,H
+    crops: list[tuple[int, int, int, int]] = []
+    out_paths: list[Path] = []
+    for loc, out_path in locs_with_out_paths:
+        x = float(loc.get("x", 0))
+        y = float(loc.get("y", 0))
+        w = float(loc.get("width", 0))
+        h = float(loc.get("height", 0))
+        if w <= 0 or h <= 0:
+            continue
+        x1 = int(width * x)
+        y1 = int(height * y)
+        x2 = int(width * (x + w))
+        y2 = int(height * (y + h))
+        x1 = max(0, min(x1, width - 1))
+        y1 = max(0, min(y1, height - 1))
+        x2 = max(1, min(x2, width))
+        y2 = max(1, min(y2, height))
+        crops.append((x2 - x1, y2 - y1, x1, y1))
+        out_paths.append(out_path)
+
+    if len(crops) != len(locs_with_out_paths):
+        skipped = len(locs_with_out_paths) - len(crops)
+        logger.debug(f"Skipped {skipped} locs with invalid box")
+    if not crops:
+        return (0, len(locs_with_out_paths))
+
+    n = len(crops)
+    # filter_complex: [0:v] optionally select frame, then split into n streams, each crop+scale
+    if frame_index is not None:
+        select = f"select=eq(n\\,{frame_index})"
+        first = f"[0:v]{select},split={n}"
+    else:
+        first = f"[0:v]split={n}"
+    pads = "".join(f"[o{i}]" for i in range(n))
+    first = first + pads
+    parts = [first]
+    for i in range(n):
+        W, H, x1, y1 = crops[i]
+        parts.append(f"[o{i}]crop={W}:{H}:{x1}:{y1},scale={size}:{size}[out{i}]")
+    filter_complex = ";".join(parts)
+
+    for op in out_paths:
+        op.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["ffmpeg", "-y", "-i", input_str, "-filter_complex", filter_complex, "-vframes", "1"]
+    for i in range(n):
+        cmd.extend(["-map", f"[out{i}]", str(out_paths[i])])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            logger.info(f"ffmpeg crop failed for {input_str}: {result.stderr}")
+            return (0, n)
+        return (n, 0)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.info(f"ffmpeg crop error for {input_str}: {e}")
+        return (0, n)
+
+
 def save_media_to_tmp(
     api: Any,
     project_id: int,
@@ -594,59 +736,6 @@ def fetch_and_save_localizations(
     return out_path
 
 
-def _crop_one(
-    size: int,
-    image_path: Path,
-    loc: dict,
-    out_path: Path,
-) -> bool:
-    """
-    Crop one localization from an image: pad shorter side to square (longest side), resize to size x size.
-    Tator box: x, y, width, height as normalized 0-1.
-    """
-    try:
-        x = float(loc.get("x", 0))
-        y = float(loc.get("y", 0))
-        w = float(loc.get("width", 0))
-        h = float(loc.get("height", 0))
-        if w <= 0 or h <= 0:
-            return False
-        img = Image.open(image_path).convert("RGB")
-        image_width, image_height = img.size
-        x1 = int(image_width * x)
-        y1 = int(image_height * y)
-        x2 = int(image_width * (x + w))
-        y2 = int(image_height * (y + h))
-        # Clamp to image bounds
-        x1 = max(0, min(x1, image_width - 1))
-        y1 = max(0, min(y1, image_height - 1))
-        x2 = max(1, min(x2, image_width))
-        y2 = max(1, min(y2, image_height))
-        width = x2 - x1
-        height = y2 - y1
-        shorter_side = min(height, width)
-        longer_side = max(height, width)
-        delta = abs(longer_side - shorter_side)
-        padding = delta // 2
-        if width == shorter_side:
-            x1 = max(0, x1 - padding)
-            x2 = min(image_width, x2 + padding)
-        else:
-            y1 = max(0, y1 - padding)
-            y2 = min(image_height, y2 + padding)
-        cropped = img.crop((x1, y1, x2, y2))
-        resample = (
-            Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-        )
-        resized = cropped.resize((size, size), resample=resample)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        resized.save(out_path)
-        return True
-    except Exception as e:
-        logger.info(f"Crop failed for {out_path.stem}: {e}")
-        return False
-
-
 def crop_localizations_parallel(
     download_dir: str,
     localizations_jsonl_path: str,
@@ -654,18 +743,23 @@ def crop_localizations_parallel(
     size: int = 224,
     max_workers: int | None = None,
     locs_to_crop: list[dict] | None = None,
+    media_objects: list[Any] | None = None,
 ) -> tuple[int, int]:
     """
-    Crop localizations from their media in parallel.
+    Crop localizations from their media in parallel using ffmpeg (image and video).
     Saves using elemental_id as filestem (e.g. elemental_id.png).
+    Image: local files from download_dir, grouped by media_id. Video: streaming URL from
+    media_objects (streaming attribute), grouped by (media_id, frame).
 
     When locs_to_crop is provided, only those localizations are cropped (cache-miss
     optimization). Otherwise falls back to reading all localizations from the JSONL.
+    media_objects: Tator Media list for cache-miss media; used to get video streaming URL
+    and stems for video (no file in download_dir).
 
     Returns (num_cropped, num_failed).
     """
-    if not os.path.exists(download_dir):
-        logger.info("Download dir missing; skipping crops")
+    if not os.path.exists(download_dir) and not media_objects:
+        logger.info("Download dir missing and no media_objects; skipping crops")
         return (0, 0)
     if locs_to_crop is None and not os.path.exists(localizations_jsonl_path):
         logger.info(
@@ -675,22 +769,45 @@ def crop_localizations_parallel(
     download_path = Path(download_dir)
     crops_path = Path(crops_dir)
     crops_path.mkdir(parents=True, exist_ok=True)
-    media_id_to_path: dict[int, Path] = {}
-    for f in download_path.iterdir():
-        if f.is_file() and f.suffix.lower() in (
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp",
-            ".bmp",
-        ):
-            stem = f.stem
-            if "_" in stem:
-                try:
-                    mid = int(stem.split("_", 1)[0])
-                    media_id_to_path[mid] = f
-                except ValueError:
-                    pass
+
+    # Image: media_id -> local path (from download dir)
+    media_id_to_image_path: dict[int, Path] = {}
+    if download_path.exists():
+        for f in download_path.iterdir():
+            if f.is_file() and f.suffix.lower() in (
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".bmp",
+            ):
+                stem = f.stem
+                if "_" in stem:
+                    try:
+                        mid = int(stem.split("_", 1)[0])
+                        media_id_to_image_path[mid] = f
+                    except ValueError:
+                        pass
+
+    # Video: media_id -> streaming URL and stem (from media_objects)
+    media_id_to_video_url: dict[int, str] = {}
+    media_id_to_stem: dict[int, str] = {}
+    for m in (media_objects or []):
+        if not isinstance(m, tator.models.Media):
+            continue
+        mid = getattr(m, "id", None)
+        if mid is None:
+            continue
+        stem = f"{mid}_{getattr(m, 'name', '') or ''}"
+        media_id_to_stem[mid] = stem
+        if _is_streaming_video(m):
+            path = getattr(m.media_files.streaming[0], "path", None)
+            if path and isinstance(path, str) and path.startswith("http"):
+                media_id_to_video_url[mid] = path
+        else:
+            # Image: stem from download dir file if present
+            if mid in media_id_to_image_path:
+                media_id_to_stem[mid] = media_id_to_image_path[mid].stem
 
     if locs_to_crop is not None:
         loc_list = locs_to_crop
@@ -716,37 +833,96 @@ def crop_localizations_parallel(
             locs_by_media[mid] = []
         locs_by_media[mid].append(loc)
 
-    tasks: list[tuple[Path, dict, Path]] = []
+    # Image tasks: (image_path, [(loc, out_path), ...]) one per image
+    image_tasks: list[tuple[Path, list[tuple[dict, Path]]]] = []
     for mid, locs in locs_by_media.items():
-        image_path = media_id_to_path.get(mid)
+        image_path = media_id_to_image_path.get(mid)
         if image_path is None or not image_path.exists():
             continue
+        stem = media_id_to_stem.get(mid) or image_path.stem
+        group: list[tuple[dict, Path]] = []
         for loc in locs:
             elemental_id = loc.get("elemental_id") or loc.get("id")
             if elemental_id is None:
                 continue
-            out_path = crops_path / image_path.stem / f"{elemental_id}.png"
-            tasks.append((image_path, loc, out_path))
-    if not tasks:
+            out_path = crops_path / stem / f"{elemental_id}.png"
+            group.append((loc, out_path))
+        if group:
+            image_tasks.append((image_path, group))
+
+    # Video tasks: (video_url, frame_index, [(loc, out_path), ...]) one per (media_id, frame)
+    video_tasks: list[tuple[str, int, list[tuple[dict, Path]]]] = []
+    for mid, locs in locs_by_media.items():
+        if mid not in media_id_to_video_url:
+            continue
+        video_url = media_id_to_video_url[mid]
+        stem = media_id_to_stem.get(mid) or str(mid)
+        by_frame: dict[int, list[tuple[dict, Path]]] = {}
+        for loc in locs:
+            frame = loc.get("frame")
+            if frame is None:
+                continue
+            try:
+                frame_idx = int(frame)
+            except (TypeError, ValueError):
+                continue
+            elemental_id = loc.get("elemental_id") or loc.get("id")
+            if elemental_id is None:
+                continue
+            out_path = crops_path / stem / f"{elemental_id}.png"
+            if frame_idx not in by_frame:
+                by_frame[frame_idx] = []
+            by_frame[frame_idx].append((loc, out_path))
+        for frame_idx, group in by_frame.items():
+            if group:
+                video_tasks.append((video_url, frame_idx, group))
+
+    total_tasks = len(image_tasks) + len(video_tasks)
+    if total_tasks == 0:
         logger.info("No localization crops to process")
         return (0, 0)
-    logger.info(f"Cropping {len(tasks)} localizations in parallel (size={size}x{size})")
+    total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, g in video_tasks)
+    logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
     workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
+    dim_cache: dict[str, tuple[int, int]] = {}
     num_ok = 0
     num_fail = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(_crop_one, size, imp, loc, op): (imp, loc, op)
-            for imp, loc, op in tasks
-        }
+        futures = []
+        for image_path, group in image_tasks:
+            futures.append(
+                ex.submit(
+                    _crop_media_group,
+                    image_path,
+                    group,
+                    None,
+                    size,
+                    dim_cache,
+                )
+            )
+        for video_url, frame_idx, group in video_tasks:
+            futures.append(
+                ex.submit(
+                    _crop_media_group,
+                    video_url,
+                    group,
+                    frame_idx,
+                    size,
+                    dim_cache,
+                )
+            )
         for fut in as_completed(futures):
-            if fut.exception():
+            try:
+                if fut.exception():
+                    num_fail += 1
+                    logger.info(f"Crop task failed: {fut.exception()}")
+                else:
+                    ok, fail = fut.result()
+                    num_ok += ok
+                    num_fail += fail
+            except Exception as e:
                 num_fail += 1
-                logger.info(f"Crop task failed: {fut.exception()}")
-            elif fut.result():
-                num_ok += 1
-            else:
-                num_fail += 1
+                logger.info(f"Crop task error: {e}")
     logger.info(f"Crops done: {num_ok} saved to {crops_path}, {num_fail} failed")
     return (num_ok, num_fail)
 
@@ -1030,22 +1206,37 @@ def _find_crop_cache_misses(
     return media_ids_needed, locs_to_crop, updated_manifest
 
 
-def _patch_manifest_stems(manifest: dict[str, dict], download_dir: str) -> None:
+def _patch_manifest_stems(
+    manifest: dict[str, dict],
+    download_dir: str,
+    media_objects: list[Any] | None = None,
+) -> None:
     """
     After downloading new media, update manifest entries whose media_stem is
-    still a bare media_id (fallback) with the real stem from the download directory.
+    still a bare media_id (fallback) with the real stem from the download directory
+    or from media_objects (for video; no file in download dir).
     """
     real_stems = _media_id_to_stem(download_dir)
-    if not real_stems:
-        return
+    media_stem_map: dict[int, str] = {}
+    for m in (media_objects or []):
+        if not isinstance(m, tator.models.Media):
+            continue
+        mid = getattr(m, "id", None)
+        if mid is None:
+            continue
+        media_stem_map[mid] = f"{mid}_{getattr(m, 'name', '') or ''}"
     for entry in manifest.values():
         mid = entry.get("media_id")
         if mid is None:
             continue
         mid = int(mid)
         current_stem = entry.get("media_stem", "")
-        if current_stem == str(mid) and mid in real_stems:
+        if current_stem != str(mid):
+            continue
+        if real_stems and mid in real_stems:
             entry["media_stem"] = real_stems[mid]
+        elif mid in media_stem_map:
+            entry["media_stem"] = media_stem_map[mid]
 
 
 def _cleanup_deleted_crops(
@@ -2123,7 +2314,8 @@ def sync_project_to_fiftyone(
             # 4. Clean up orphaned crop files for deleted localizations
             _cleanup_deleted_crops(old_manifest, updated_manifest, crops)
 
-            # 5. Download only media that have cache misses
+            # 5. Download only media that have cache misses; get Media objects for cropping
+            all_media: list[Any] = []
             if not media_ids_list:
                 logger.info(f"No media IDs for project {project_id}; skipping download")
             elif not media_ids_needed:
@@ -2148,7 +2340,7 @@ def sync_project_to_fiftyone(
                         api, project_id, all_media, media_ids_filter=media_ids_needed
                     )
 
-            # 6. Crop only the cache-miss localizations
+            # 6. Crop only the cache-miss localizations (ffmpeg; image + video)
             if locs_to_crop and localizations_path:
                 crop_localizations_parallel(
                     dl_dir,
@@ -2156,12 +2348,13 @@ def sync_project_to_fiftyone(
                     crops,
                     size=224,
                     locs_to_crop=locs_to_crop,
+                    media_objects=all_media,
                 )
             elif not locs_to_crop:
                 logger.info("No crop cache misses; skipping crop step")
 
-            # 7. Patch manifest stems from actual downloaded filenames
-            _patch_manifest_stems(updated_manifest, dl_dir)
+            # 7. Patch manifest stems from downloaded filenames and from Media (video)
+            _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
 
             # 8. Persist the updated manifest
             _save_crop_manifest(project_id, version_id, updated_manifest)
@@ -2447,22 +2640,23 @@ def main() -> None:
         )
         _cleanup_deleted_crops(old_manifest, updated_manifest, crops)
 
-        # Download only media with cache misses
+        # Download only media with cache misses; get Media objects for cropping
+        all_media_cli: list[Any] = []
         if media_ids and media_ids_needed:
             needed_ids = [mid for mid in media_ids if mid in media_ids_needed]
-            all_media = get_media_chunked(
+            all_media_cli = get_media_chunked(
                 api, project_id, needed_ids, media_id_batch_size=media_id_batch_size_cli
             )
-            if all_media:
+            if all_media_cli:
                 save_media_to_tmp(
-                    api, project_id, all_media, media_ids_filter=media_ids_needed
+                    api, project_id, all_media_cli, media_ids_filter=media_ids_needed
                 )
             else:
                 logger.info("No Media objects returned; download skipped.")
         elif not media_ids_needed:
             logger.info("All crops cached; skipping media download")
 
-        # Crop only cache misses
+        # Crop only cache misses (ffmpeg; image + video)
         if locs_to_crop:
             crop_localizations_parallel(
                 dl_dir,
@@ -2470,10 +2664,11 @@ def main() -> None:
                 crops,
                 size=224,
                 locs_to_crop=locs_to_crop,
+                media_objects=all_media_cli,
             )
 
-        # Patch manifest stems from actual downloaded filenames
-        _patch_manifest_stems(updated_manifest, dl_dir)
+        # Patch manifest stems from downloaded filenames and from Media (video)
+        _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media_cli)
 
         # Save updated manifest
         _save_crop_manifest(project_id, version_id, updated_manifest)
