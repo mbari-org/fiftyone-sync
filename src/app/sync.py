@@ -53,7 +53,7 @@ logger.addHandler(handler)
 _DEFAULT_MEDIA_ID_BATCH_SIZE = 200
 _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
 # Fewer workers when cropping from remote video to avoid timeouts and server overload
-_VIDEO_CROP_MAX_WORKERS = 4
+_VIDEO_CROP_MAX_WORKERS = 8
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
