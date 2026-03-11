@@ -86,3 +86,25 @@ def release_sync_lock(lock_key: str) -> None:
         conn.delete(lock_key)
     finally:
         conn.close()
+
+
+def cleanup_all_sync_locks() -> int:
+    """
+    Delete all sync lock keys from Redis (e.g. on service startup).
+    Returns the number of keys deleted.
+    Raises if Redis is not configured or unavailable.
+    """
+    conn = _get_connection()
+    try:
+        pattern = f"{LOCK_KEY_PREFIX}:*"
+        cursor = 0
+        deleted_count = 0
+        while True:
+            cursor, keys = conn.scan(cursor, match=pattern, count=100)
+            if keys:
+                deleted_count += conn.delete(*keys)
+            if cursor == 0:
+                break
+        return deleted_count
+    finally:
+        conn.close()

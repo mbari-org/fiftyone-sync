@@ -29,6 +29,15 @@ def main() -> None:
     if not url:
         print("Set REDIS_HOST or REDIS_URL to run the sync worker.", file=sys.stderr)
         sys.exit(1)
+    # Clear all sync locks on startup so restarts don't leave stale locks
+    try:
+        from src.app.sync_lock import cleanup_all_sync_locks
+
+        deleted = cleanup_all_sync_locks()
+        if deleted > 0:
+            print(f"Cleaned {deleted} stale sync lock(s) on worker startup", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not clean sync locks on startup: {e}", file=sys.stderr)
     # Launch FiftyOne app only when not enterprise (enterprise uses its own app; no local MongoDB)
     if not get_is_enterprise():
         fo.launch_app(address="0.0.0.0", port=5151)
