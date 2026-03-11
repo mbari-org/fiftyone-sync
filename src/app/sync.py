@@ -52,6 +52,8 @@ logger.addHandler(handler)
 # Fallback batch sizes when not set in config (see config.yml: media_id_batch_size, localization_batch_size)
 _DEFAULT_MEDIA_ID_BATCH_SIZE = 200
 _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
+# Fewer workers when cropping from remote video to avoid timeouts and server overload
+_VIDEO_CROP_MAX_WORKERS = 4
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
@@ -571,12 +573,14 @@ def _crop_media_group(
         # -update 1 tells image2 muxer we write a single image per file (avoids sequence-pattern errors)
         cmd.extend(["-map", f"[out{i}]", "-update", "1", str(out_paths[i])])
 
+    # Remote URLs need longer timeout for network seek + decode + filter
+    timeout_seconds = 180 if input_str.startswith("http") else 60
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout_seconds,
         )
         if result.returncode != 0:
             logger.info(f"ffmpeg crop failed for {input_str}: {result.stderr}")
@@ -921,6 +925,9 @@ def crop_localizations_parallel(
     total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, _, g in video_tasks)
     logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
     workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
+    if video_tasks:
+        workers = min(workers, _VIDEO_CROP_MAX_WORKERS)
+        logger.info(f"Video tasks present: capping workers at {workers}")
     dim_cache: dict[str, tuple[int, int]] = {}
     num_ok = 0
     num_fail = 0
