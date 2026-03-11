@@ -559,8 +559,9 @@ def _crop_media_group(
         parts.append(f"[o{i}]crop={W}:{H}:{x1}:{y1},scale={size}:{size}[out{i}]")
     filter_complex = ";".join(parts)
 
-    for op in out_paths:
-        op.parent.mkdir(parents=True, exist_ok=True)
+    # Create crop parent directory (shared by all outputs) before ffmpeg runs
+    if out_paths:
+        out_paths[0].parent.mkdir(parents=True, exist_ok=True)
 
     cmd = ["ffmpeg", "-y"]
     if use_ss:
