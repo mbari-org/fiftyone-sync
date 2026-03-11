@@ -424,6 +424,16 @@ def _is_streaming_video(m: Any) -> bool:
     return isinstance(path, str) and path.startswith("http")
 
 
+def frame_to_timestamp(media: Any, frame: int) -> str:
+    """Convert frame number to timestamp string for ffmpeg -ss (accurate frame indexing)."""
+    fps = getattr(media, "fps", None)
+    if fps is None or fps <= 0:
+        fps = 1.0
+    total_seconds = frame / fps
+    total_microseconds = int(total_seconds * 1_000_000)
+    return f"{total_microseconds}us"
+
+
 def _ffprobe_dimensions(input_path_or_url: str | Path, _cache: dict[str, tuple[int, int]] | None = None) -> tuple[int, int] | None:
     """
     Return (width, height) for an image or video (local path or HTTP URL). Uses ffprobe.
@@ -471,10 +481,12 @@ def _crop_media_group(
     frame_index: int | None = None,
     size: int = 224,
     _dim_cache: dict[str, tuple[int, int]] | None = None,
+    media: Any = None,
 ) -> tuple[int, int]:
     """
     Crop multiple localizations from one image or one video frame using ffmpeg.
-    For video, frame_index must be set; input is streaming URL. For image, frame_index is None.
+    For video, frame_index must be set; input is streaming URL. Uses -ss frame_to_timestamp(media, frame)
+    for accurate frame indexing when media is provided. For image, frame_index is None.
     Tator box: x, y, width, height normalized 0-1. Filter: crop=W:H:x1:y1,scale=224:224.
     Returns (num_ok, num_fail).
     """
@@ -516,8 +528,14 @@ def _crop_media_group(
         return (0, len(locs_with_out_paths))
 
     n = len(crops)
-    # filter_complex: [0:v] optionally select frame, then split into n streams, each crop+scale
-    if frame_index is not None:
+    # filter_complex: [0:v] optionally select frame (or rely on -ss), then split into n streams, each crop+scale
+    use_ss = (
+        frame_index is not None
+        and media is not None
+        and getattr(media, "fps", None) is not None
+        and getattr(media, "fps", None) > 0
+    )
+    if frame_index is not None and not use_ss:
         select = f"select=eq(n\\,{frame_index})"
         first = f"[0:v]{select},split={n}"
     else:
@@ -533,9 +551,13 @@ def _crop_media_group(
     for op in out_paths:
         op.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = ["ffmpeg", "-y", "-i", input_str, "-filter_complex", filter_complex, "-vframes", "1"]
+    cmd = ["ffmpeg", "-y"]
+    if use_ss:
+        cmd.extend(["-ss", frame_to_timestamp(media, frame_index)])
+    cmd.extend(["-i", input_str, "-filter_complex", filter_complex, "-vframes", "1"])
     for i in range(n):
-        cmd.extend(["-map", f"[out{i}]", str(out_paths[i])])
+        # -update 1 tells image2 muxer we write a single image per file (avoids sequence-pattern errors)
+        cmd.extend(["-map", f"[out{i}]", "-update", "1", str(out_paths[i])])
 
     try:
         result = subprocess.run(
@@ -789,15 +811,17 @@ def crop_localizations_parallel(
                     except ValueError:
                         pass
 
-    # Video: media_id -> streaming URL and stem (from media_objects)
+    # Video: media_id -> streaming URL, stem, and Media (from media_objects)
     media_id_to_video_url: dict[int, str] = {}
     media_id_to_stem: dict[int, str] = {}
+    media_id_to_media: dict[int, Any] = {}
     for m in (media_objects or []):
         if not isinstance(m, tator.models.Media):
             continue
         mid = getattr(m, "id", None)
         if mid is None:
             continue
+        media_id_to_media[mid] = m
         stem = f"{mid}_{getattr(m, 'name', '') or ''}"
         media_id_to_stem[mid] = stem
         if _is_streaming_video(m):
@@ -850,12 +874,13 @@ def crop_localizations_parallel(
         if group:
             image_tasks.append((image_path, group))
 
-    # Video tasks: (video_url, frame_index, [(loc, out_path), ...]) one per (media_id, frame)
-    video_tasks: list[tuple[str, int, list[tuple[dict, Path]]]] = []
+    # Video tasks: (video_url, frame_index, media, [(loc, out_path), ...]) one per (media_id, frame)
+    video_tasks: list[tuple[str, int, Any, list[tuple[dict, Path]]]] = []
     for mid, locs in locs_by_media.items():
         if mid not in media_id_to_video_url:
             continue
         video_url = media_id_to_video_url[mid]
+        media = media_id_to_media.get(mid)
         stem = media_id_to_stem.get(mid) or str(mid)
         by_frame: dict[int, list[tuple[dict, Path]]] = {}
         for loc in locs:
@@ -875,13 +900,13 @@ def crop_localizations_parallel(
             by_frame[frame_idx].append((loc, out_path))
         for frame_idx, group in by_frame.items():
             if group:
-                video_tasks.append((video_url, frame_idx, group))
+                video_tasks.append((video_url, frame_idx, media, group))
 
     total_tasks = len(image_tasks) + len(video_tasks)
     if total_tasks == 0:
         logger.info("No localization crops to process")
         return (0, 0)
-    total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, g in video_tasks)
+    total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, _, g in video_tasks)
     logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
     workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
     dim_cache: dict[str, tuple[int, int]] = {}
@@ -900,7 +925,7 @@ def crop_localizations_parallel(
                     dim_cache,
                 )
             )
-        for video_url, frame_idx, group in video_tasks:
+        for video_url, frame_idx, media, group in video_tasks:
             futures.append(
                 ex.submit(
                     _crop_media_group,
@@ -909,6 +934,7 @@ def crop_localizations_parallel(
                     frame_idx,
                     size,
                     dim_cache,
+                    media,
                 )
             )
         for fut in as_completed(futures):
