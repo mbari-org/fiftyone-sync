@@ -410,6 +410,17 @@ def _is_video_name(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
 
+def _sanitize_media_stem(stem: str) -> str:
+    """Make stem safe for use as a directory name (no spaces or path chars that break ffmpeg)."""
+    if not stem:
+        return stem
+    # Replace spaces and path-sep chars so ffmpeg and filesystems don't choke
+    stem = stem.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    stem = stem.replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_")
+    stem = stem.replace("<", "_").replace(">", "_").replace("|", "_")
+    return stem.strip(".") or stem
+
+
 def _is_streaming_video(m: Any) -> bool:
     """True if Media has a single HTTP streaming URL (video, no download)."""
     if not hasattr(m, "media_files") or m.media_files is None:
@@ -822,16 +833,16 @@ def crop_localizations_parallel(
         if mid is None:
             continue
         media_id_to_media[mid] = m
-        stem = f"{mid}_{getattr(m, 'name', '') or ''}"
+        stem = _sanitize_media_stem(f"{mid}_{getattr(m, 'name', '') or ''}")
         media_id_to_stem[mid] = stem
         if _is_streaming_video(m):
             path = getattr(m.media_files.streaming[0], "path", None)
             if path and isinstance(path, str) and path.startswith("http"):
                 media_id_to_video_url[mid] = path
         else:
-            # Image: stem from download dir file if present
+            # Image: stem from download dir file if present (sanitize for path safety)
             if mid in media_id_to_image_path:
-                media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+                media_id_to_stem[mid] = _sanitize_media_stem(media_id_to_image_path[mid].stem)
 
     if locs_to_crop is not None:
         loc_list = locs_to_crop
@@ -1201,7 +1212,7 @@ def _find_crop_cache_misses(
             mid = int(media_id)
             modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
 
-            media_stem = (
+            media_stem = _sanitize_media_stem(
                 manifest_stem_map.get(mid) or download_stem_map.get(mid) or f"{mid}"
             )
 
@@ -1250,7 +1261,7 @@ def _patch_manifest_stems(
         mid = getattr(m, "id", None)
         if mid is None:
             continue
-        media_stem_map[mid] = f"{mid}_{getattr(m, 'name', '') or ''}"
+        media_stem_map[mid] = _sanitize_media_stem(f"{mid}_{getattr(m, 'name', '') or ''}")
     for entry in manifest.values():
         mid = entry.get("media_id")
         if mid is None:
@@ -1260,7 +1271,7 @@ def _patch_manifest_stems(
         if current_stem != str(mid):
             continue
         if real_stems and mid in real_stems:
-            entry["media_stem"] = real_stems[mid]
+            entry["media_stem"] = _sanitize_media_stem(real_stems[mid])
         elif mid in media_stem_map:
             entry["media_stem"] = media_stem_map[mid]
 
