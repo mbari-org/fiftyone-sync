@@ -130,59 +130,20 @@ async def prometheus_middleware(request: Request, call_next):
 async def cleanup_locks_on_startup():
     """Clean all sync lock keys from Redis on startup to prevent stale locks."""
     try:
-        from redis import Redis
-        from redis.backoff import ExponentialBackoff
-        from redis.retry import Retry
-        from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
+        from src.app.sync_lock import cleanup_all_sync_locks
 
-        # Get Redis URL from sync_lock module
-        redis_url_env = os.environ.get("REDIS_URL", "").strip()
-        if redis_url_env:
-            redis_url = redis_url_env
+        deleted_count = cleanup_all_sync_locks()
+        if deleted_count > 0:
+            logger.info(f"Cleaned {deleted_count} stale sync lock(s) on startup")
         else:
-            host = os.environ.get("REDIS_HOST", "").strip()
-            if not host:
-                logger.warning(
-                    "Redis not configured (set REDIS_HOST or REDIS_URL), skipping lock cleanup"
-                )
-                return
-            port = os.environ.get("REDIS_PORT", "6379")
-            password = os.environ.get("REDIS_PASSWORD", "")
-            use_ssl = os.environ.get("REDIS_USE_SSL", "false").lower() == "true"
-            scheme = "rediss" if use_ssl else "redis"
-            if password:
-                redis_url = f"{scheme}://:{password}@{host}:{port}/0"
-            else:
-                redis_url = f"{scheme}://{host}:{port}/0"
-
-        retry = Retry(ExponentialBackoff(), 3)
-        conn = Redis.from_url(
-            redis_url,
-            retry=retry,
-            retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError],
-            health_check_interval=30,
-        )
-
-        try:
-            # Delete all keys matching the lock key prefix
-            pattern = f"{LOCK_KEY_PREFIX}:*"
-            cursor = 0
-            deleted_count = 0
-            while True:
-                cursor, keys = conn.scan(cursor, match=pattern, count=100)
-                if keys:
-                    deleted_count += conn.delete(*keys)
-                if cursor == 0:
-                    break
-
-            if deleted_count > 0:
-                logger.info(f"Cleaned {deleted_count} stale sync lock(s) on startup")
-            else:
-                logger.info("No stale sync locks found on startup")
-        finally:
-            conn.close()
+            logger.info("No stale sync locks found on startup")
     except Exception as e:
-        logger.warning(f"Failed to clean sync locks on startup: {e}")
+        if "not configured" in str(e).lower():
+            logger.warning(
+                "Redis not configured (set REDIS_HOST or REDIS_URL), skipping lock cleanup"
+            )
+        else:
+            logger.warning(f"Failed to clean sync locks on startup: {e}")
 
 
 router = APIRouter(tags=["embedding"])

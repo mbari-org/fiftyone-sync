@@ -46,36 +46,51 @@ def _service_base_to_ws(base: str) -> str:
     return "ws://" + base
 
 
+def _ws_url_to_origin(ws_url: str) -> str:
+    """Derive HTTP Origin from WebSocket URL (wss://host/path -> https://host). Many servers 403 WS without matching Origin."""
+    from urllib.parse import urlparse
+    parsed = urlparse(ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    netloc = parsed.netloc or parsed.path.split("/")[0] or "localhost"
+    return f"{scheme}://{netloc}"
+
+
 async def _wait_job_result_ws(ws_url: str, timeout: float = _WS_JOB_TIMEOUT) -> dict:
     """
     Wait for job completion via Fast-VSS WebSocket. Returns result dict on "done"; raises on "failed"/"error"/timeout.
     """
     import websockets
+    from websockets.exceptions import InvalidStatus
 
+    origin = _ws_url_to_origin(ws_url)
     deadline = time.monotonic() + timeout
-    async with websockets.connect(
-        ws_url,
-        open_timeout=10,
-        close_timeout=5,
-        max_size=10 * 1024 * 1024,  # 10MB max message size (default is 1MB)
-    ) as ws:
-        while True:
-            remaining = max(1.0, deadline - time.monotonic())
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            msg = json.loads(raw)
-            status = msg.get("status")
-            logger.debug(
-                f"WebSocket message: status={status}, keys={list(msg.keys())}, msg_size={len(raw)} bytes"
-            )
-            if status == "done":
-                result = msg.get("result") or msg
-                if isinstance(result, dict):
-                    logger.debug(f"Result keys: {list(result.keys())}")
-                return result
-            if status == "failed":
-                raise RuntimeError(msg.get("message", "Job failed"))
-            if status == "error":
-                raise RuntimeError(msg.get("message", str(msg)))
+    try:
+        async with websockets.connect(
+            ws_url,
+            open_timeout=10,
+            close_timeout=5,
+            max_size=10 * 1024 * 1024,  # 10MB max message size (default is 1MB)
+            additional_headers={"Origin": origin},
+        ) as ws:
+            while True:
+                remaining = max(1.0, deadline - time.monotonic())
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                status = msg.get("status")
+                logger.debug(
+                    f"WebSocket message: status={status}, keys={list(msg.keys())}, msg_size={len(raw)} bytes"
+                )
+                if status == "done":
+                    result = msg.get("result") or msg
+                    if isinstance(result, dict):
+                        logger.debug(f"Result keys: {list(result.keys())}")
+                    return result
+                if status == "failed":
+                    raise RuntimeError(msg.get("message", "Job failed"))
+                if status == "error":
+                    raise RuntimeError(msg.get("message", str(msg)))
+    except InvalidStatus:
+        raise
 
 
 def has_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> bool:

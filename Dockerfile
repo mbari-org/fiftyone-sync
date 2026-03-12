@@ -3,9 +3,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system deps for Pillow / image handling
+# Install system deps for Pillow / image handling and ffmpeg for cropping (image + video)
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     libjpeg-dev zlib1g-dev \
+    ffmpeg \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY . .
