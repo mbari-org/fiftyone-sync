@@ -9,6 +9,11 @@ Supports both Voxel51 Community and Enterprise sync.  Syncing is done by version
 through a simple applet:
 ![template_applet.png](docs/imgs/template_applet.png)
 
+Example Voxel51 similarity search view:
+![sim_search.png](docs/imgs/sim_search.png)
+Example Voxel51 embedding/gris view:
+![embedding_grid.png](docs/imgs/embedding_grid.png)
+
 ## Architecture
 
 ```mermaid
