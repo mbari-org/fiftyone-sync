@@ -52,8 +52,6 @@ logger.addHandler(handler)
 # Fallback batch sizes when not set in config (see config.yml: media_id_batch_size, localization_batch_size)
 _DEFAULT_MEDIA_ID_BATCH_SIZE = 200
 _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
-# Fewer workers when cropping from remote video to avoid timeouts and server overload
-_VIDEO_CROP_MAX_WORKERS = 8
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
@@ -412,17 +410,6 @@ def _is_video_name(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
 
-def _sanitize_media_stem(stem: str) -> str:
-    """Make stem safe for use as a directory name (no spaces or path chars that break ffmpeg)."""
-    if not stem:
-        return stem
-    # Replace spaces and path-sep chars so ffmpeg and filesystems don't choke
-    stem = stem.replace(" ", "_").replace("/", "_").replace("\\", "_")
-    stem = stem.replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_")
-    stem = stem.replace("<", "_").replace(">", "_").replace("|", "_")
-    return stem.strip(".") or stem
-
-
 def _is_streaming_video(m: Any) -> bool:
     """True if Media has a single HTTP streaming URL (video, no download)."""
     if not hasattr(m, "media_files") or m.media_files is None:
@@ -561,9 +548,8 @@ def _crop_media_group(
         parts.append(f"[o{i}]crop={W}:{H}:{x1}:{y1},scale={size}:{size}[out{i}]")
     filter_complex = ";".join(parts)
 
-    # Create crop parent directory (shared by all outputs) before ffmpeg runs
-    if out_paths:
-        out_paths[0].parent.mkdir(parents=True, exist_ok=True)
+    for op in out_paths:
+        op.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = ["ffmpeg", "-y"]
     if use_ss:
@@ -573,14 +559,12 @@ def _crop_media_group(
         # -update 1 tells image2 muxer we write a single image per file (avoids sequence-pattern errors)
         cmd.extend(["-map", f"[out{i}]", "-update", "1", str(out_paths[i])])
 
-    # Remote URLs need longer timeout for network seek + decode + filter
-    timeout_seconds = 180 if input_str.startswith("http") else 60
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=timeout_seconds,
+            timeout=60,
         )
         if result.returncode != 0:
             logger.info(f"ffmpeg crop failed for {input_str}: {result.stderr}")
@@ -838,16 +822,16 @@ def crop_localizations_parallel(
         if mid is None:
             continue
         media_id_to_media[mid] = m
-        stem = _sanitize_media_stem(f"{mid}_{getattr(m, 'name', '') or ''}")
+        stem = f"{mid}_{getattr(m, 'name', '') or ''}"
         media_id_to_stem[mid] = stem
         if _is_streaming_video(m):
             path = getattr(m.media_files.streaming[0], "path", None)
             if path and isinstance(path, str) and path.startswith("http"):
                 media_id_to_video_url[mid] = path
         else:
-            # Image: stem from download dir file if present (sanitize for path safety)
+            # Image: stem from download dir file if present
             if mid in media_id_to_image_path:
-                media_id_to_stem[mid] = _sanitize_media_stem(media_id_to_image_path[mid].stem)
+                media_id_to_stem[mid] = media_id_to_image_path[mid].stem
 
     if locs_to_crop is not None:
         loc_list = locs_to_crop
@@ -925,9 +909,6 @@ def crop_localizations_parallel(
     total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, _, g in video_tasks)
     logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
     workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
-    if video_tasks:
-        workers = min(workers, _VIDEO_CROP_MAX_WORKERS)
-        logger.info(f"Video tasks present: capping workers at {workers}")
     dim_cache: dict[str, tuple[int, int]] = {}
     num_ok = 0
     num_fail = 0
@@ -1220,7 +1201,7 @@ def _find_crop_cache_misses(
             mid = int(media_id)
             modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
 
-            media_stem = _sanitize_media_stem(
+            media_stem = (
                 manifest_stem_map.get(mid) or download_stem_map.get(mid) or f"{mid}"
             )
 
@@ -1269,7 +1250,7 @@ def _patch_manifest_stems(
         mid = getattr(m, "id", None)
         if mid is None:
             continue
-        media_stem_map[mid] = _sanitize_media_stem(f"{mid}_{getattr(m, 'name', '') or ''}")
+        media_stem_map[mid] = f"{mid}_{getattr(m, 'name', '') or ''}"
     for entry in manifest.values():
         mid = entry.get("media_id")
         if mid is None:
@@ -1279,7 +1260,7 @@ def _patch_manifest_stems(
         if current_stem != str(mid):
             continue
         if real_stems and mid in real_stems:
-            entry["media_stem"] = _sanitize_media_stem(real_stems[mid])
+            entry["media_stem"] = real_stems[mid]
         elif mid in media_stem_map:
             entry["media_stem"] = media_stem_map[mid]
 
