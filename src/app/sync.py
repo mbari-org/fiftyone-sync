@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -482,6 +483,7 @@ def _crop_media_group(
     size: int = 224,
     _dim_cache: dict[str, tuple[int, int]] | None = None,
     media: Any = None,
+    _cancel: threading.Event | None = None,
 ) -> tuple[int, int]:
     """
     Crop multiple localizations from one image or one video frame using ffmpeg.
@@ -492,6 +494,8 @@ def _crop_media_group(
     """
     if not locs_with_out_paths:
         return (0, 0)
+    if _cancel is not None and _cancel.is_set():
+        return (0, len(locs_with_out_paths))
     dim_cache: dict[str, tuple[int, int]] = _dim_cache if _dim_cache is not None else {}
     dims = _ffprobe_dimensions(input_path_or_url, _cache=dim_cache)
     if not dims:
@@ -564,13 +568,18 @@ def _crop_media_group(
             cmd,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
         )
         if result.returncode != 0:
             logger.info(f"ffmpeg crop failed for {input_str}: {result.stderr}")
             return (0, n)
         return (n, 0)
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+    except subprocess.TimeoutExpired as e:
+        logger.info(f"ffmpeg crop timeout for {input_str}: {e}")
+        if _cancel is not None:
+            _cancel.set()
+        return (0, n)
+    except FileNotFoundError as e:
         logger.info(f"ffmpeg crop error for {input_str}: {e}")
         return (0, n)
 
@@ -910,6 +919,7 @@ def crop_localizations_parallel(
     logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
     workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
     dim_cache: dict[str, tuple[int, int]] = {}
+    cancel_event = threading.Event()
     num_ok = 0
     num_fail = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -923,6 +933,8 @@ def crop_localizations_parallel(
                     None,
                     size,
                     dim_cache,
+                    None,
+                    cancel_event,
                 )
             )
         for video_url, frame_idx, media, group in video_tasks:
@@ -935,6 +947,7 @@ def crop_localizations_parallel(
                     size,
                     dim_cache,
                     media,
+                    cancel_event,
                 )
             )
         for fut in as_completed(futures):
@@ -949,6 +962,11 @@ def crop_localizations_parallel(
             except Exception as e:
                 num_fail += 1
                 logger.info(f"Crop task error: {e}")
+            if cancel_event.is_set():
+                for f in futures:
+                    f.cancel()
+                logger.info("Crop timeout detected; cancelled remaining crop tasks")
+                break
     logger.info(f"Crops done: {num_ok} saved to {crops_path}, {num_fail} failed")
     return (num_ok, num_fail)
 
