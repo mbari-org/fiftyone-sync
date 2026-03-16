@@ -622,19 +622,20 @@ def save_media_to_tmp(
     if media_ids_filter is not None:
         valid = [m for m in valid if m.id in media_ids_filter]
     total = len(valid)
-    logger.info(f"Saving {total} media files to {out_dir}")
+    logger.info(f"Processing {total} media -> {out_dir}")
     downloaded = 0
-    skipped = 0
+    videos_skipped = 0
+    cached_skipped = 0
     failed = 0
     log_interval = max(1, total // 10)
     for idx, m in enumerate(valid, 1):
         safe_name = f"{m.id}_{m.name}"
         out_path = os.path.join(out_dir, safe_name)
         if _is_video_name(m.name):
-            skipped += 1
+            videos_skipped += 1
             continue
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            skipped += 1
+            cached_skipped += 1
             continue
         num_tries = 0
         success = False
@@ -654,10 +655,12 @@ def save_media_to_tmp(
             logger.warning(f"Could not download {m.name} after 3 tries")
         if idx % log_interval == 0 or idx == total:
             logger.info(
-                f"Download progress: {idx}/{total} processed ({downloaded} saved, {skipped} skipped, {failed} failed)"
+                f"Download progress: {idx}/{total} processed "
+                f"({downloaded} saved, {videos_skipped} videos skipped, {cached_skipped} already cached, {failed} failed)"
             )
     logger.info(
-        f"Download complete: {downloaded} saved, {skipped} skipped, {failed} failed -> {out_dir}"
+        f"Download complete: {downloaded} saved, {videos_skipped} videos skipped, "
+        f"{cached_skipped} already cached, {failed} failed -> {out_dir}"
     )
     return out_dir
 
@@ -2448,7 +2451,7 @@ def sync_project_to_fiftyone(
                         f"No Media objects returned for {len(needed_ids)} ids; skipping download"
                     )
                 else:
-                    logger.info(f"Downloading {len(all_media)} media to tmp...")
+                    logger.info(f"Saving {len(all_media)} media images to tmp (videos skipped)...")
                     dl_dir = save_media_to_tmp(
                         api, project_id, all_media, media_ids_filter=media_ids_needed
                     )
