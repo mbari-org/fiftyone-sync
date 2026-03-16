@@ -3,7 +3,7 @@
 # Description: Tator to FiftyOne sync: fetch media and localizations, build dataset, launch app.
 """
 Tator to FiftyOne sync: fetch media + localizations, build FiftyOne dataset, launch app.
-Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping uses ffmpeg.
+Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping uses PIL.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import subprocess
-import threading
+import tempfile
 import time
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +26,7 @@ from typing import Any
 import fiftyone as fo
 import tator
 import yaml
+from PIL import Image
 from src.app.database_uri_config import database_name_from_uri
 from src.app.database_manager import (
     get_database_entry_or_enterprise_default,
@@ -478,63 +479,62 @@ def _ffprobe_dimensions(input_path_or_url: str | Path, _cache: dict[str, tuple[i
 
 _DEFAULT_CROP_TIMEOUT = int(os.environ.get("CROP_TIMEOUT", "300"))
 _DEFAULT_VIDEO_WORKERS = int(os.environ.get("CROP_VIDEO_WORKERS", "8"))
-_MAX_CROPS_PER_FFMPEG = int(os.environ.get("MAX_CROPS_PER_FFMPEG", "50"))
+_FRAME_BATCH_SIZE = int(os.environ.get("CROP_FRAME_BATCH_SIZE", "20"))
+
+_PIL_RESAMPLE = Image.LANCZOS
 
 
-def _run_ffmpeg_batch(
+def _extract_video_frame(
     input_str: str,
-    batch_crops: list[tuple[int, int, int, int]],
-    batch_out_paths: list[Path],
     frame_index: int | None,
     media: Any,
-    size: int,
     crop_timeout: int,
-) -> tuple[int, int]:
-    """Run a single ffmpeg invocation for a batch of crops. Returns (ok, fail)."""
-    n = len(batch_crops)
+) -> Path | None:
+    """Extract a single video frame to a temp PNG file using ffmpeg. Returns path or None."""
     use_ss = (
         frame_index is not None
         and media is not None
         and getattr(media, "fps", None) is not None
         and getattr(media, "fps", None) > 0
     )
-    if frame_index is not None and not use_ss:
-        select = f"select=eq(n\\,{frame_index})"
-        first = f"[0:v]{select},split={n}"
-    else:
-        first = f"[0:v]split={n}"
-    pads = "".join(f"[o{i}]" for i in range(n))
-    first = first + pads
-    parts = [first]
-    for i in range(n):
-        W, H, x1, y1 = batch_crops[i]
-        parts.append(f"[o{i}]crop={W}:{H}:{x1}:{y1},scale={size}:{size}[out{i}]")
-    filter_complex = ";".join(parts)
-
+    fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="frame_")
+    os.close(fd)
     cmd = ["ffmpeg", "-y"]
     if use_ss:
         cmd.extend(["-ss", frame_to_timestamp(media, frame_index)])
-    cmd.extend(["-i", input_str, "-filter_complex", filter_complex, "-vframes", "1"])
-    for i in range(n):
-        cmd.extend(["-map", f"[out{i}]", "-update", "1", str(batch_out_paths[i])])
+    cmd.extend(["-i", input_str])
+    if frame_index is not None and not use_ss:
+        cmd.extend(["-vf", f"select=eq(n\\,{frame_index})"])
+    cmd.extend(["-vframes", "1", "-update", "1", tmp_path])
 
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=crop_timeout,
+            cmd, capture_output=True, text=True, timeout=crop_timeout,
         )
         if result.returncode != 0:
-            logger.info(f"ffmpeg crop failed for {input_str}: {result.stderr[:500]}")
-            return (0, n)
-        return (n, 0)
+            logger.info(f"ffmpeg frame extract failed for {input_str}: {result.stderr[:500]}")
+            _safe_unlink(tmp_path)
+            return None
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            _safe_unlink(tmp_path)
+            return None
+        return Path(tmp_path)
     except subprocess.TimeoutExpired as e:
-        logger.info(f"ffmpeg crop timeout ({crop_timeout}s) for {input_str}: {e}")
-        return (0, n)
+        logger.info(f"ffmpeg frame extract timeout ({crop_timeout}s) for {input_str}: {e}")
+        _safe_unlink(tmp_path)
+        return None
     except FileNotFoundError as e:
-        logger.info(f"ffmpeg crop error for {input_str}: {e}")
-        return (0, n)
+        logger.info(f"ffmpeg not found during frame extract for {input_str}: {e}")
+        _safe_unlink(tmp_path)
+        return None
+
+
+def _safe_unlink(path: str | Path) -> None:
+    """Remove a file, ignoring errors if it doesn't exist."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _crop_media_group(
@@ -547,62 +547,69 @@ def _crop_media_group(
     crop_timeout: int = _DEFAULT_CROP_TIMEOUT,
 ) -> tuple[int, int]:
     """
-    Crop multiple localizations from one image or one video frame using ffmpeg.
-    Large groups are split into batches of _MAX_CROPS_PER_FFMPEG to avoid
-    overwhelming ffmpeg's thread-based PNG encoder.
-    Returns (num_ok, num_fail).
+    Crop multiple localizations from one image or one video frame using PIL.
+
+    For images the source file is opened directly. For video frames a single
+    frame is extracted via ffmpeg to a temp file, cropped with PIL, then the
+    temp file is deleted. Returns (num_ok, num_fail).
     """
     if not locs_with_out_paths:
         return (0, 0)
-    dim_cache: dict[str, tuple[int, int]] = _dim_cache if _dim_cache is not None else {}
-    dims = _ffprobe_dimensions(input_path_or_url, _cache=dim_cache)
-    if not dims:
-        logger.info(f"Could not get dimensions for {input_path_or_url}; skipping crop group")
-        return (0, len(locs_with_out_paths))
-    width, height = dims
+
     input_str = str(input_path_or_url)
+    is_video = frame_index is not None
+    frame_path: Path | None = None
 
-    crops: list[tuple[int, int, int, int]] = []
-    out_paths: list[Path] = []
-    for loc, out_path in locs_with_out_paths:
-        x = float(loc.get("x", 0))
-        y = float(loc.get("y", 0))
-        w = float(loc.get("width", 0))
-        h = float(loc.get("height", 0))
-        if w <= 0 or h <= 0:
-            continue
-        x1 = int(width * x)
-        y1 = int(height * y)
-        x2 = int(width * (x + w))
-        y2 = int(height * (y + h))
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(1, min(x2, width))
-        y2 = max(1, min(y2, height))
-        crops.append((x2 - x1, y2 - y1, x1, y1))
-        out_paths.append(out_path)
+    try:
+        if is_video:
+            frame_path = _extract_video_frame(input_str, frame_index, media, crop_timeout)
+            if frame_path is None:
+                return (0, len(locs_with_out_paths))
+            img = Image.open(frame_path)
+        else:
+            img = Image.open(input_str)
 
-    if len(crops) != len(locs_with_out_paths):
-        skipped = len(locs_with_out_paths) - len(crops)
-        logger.debug(f"Skipped {skipped} locs with invalid box")
-    if not crops:
+        img.load()
+        width, height = img.size
+
+        total_ok = 0
+        total_fail = 0
+        for loc, out_path in locs_with_out_paths:
+            x = float(loc.get("x", 0))
+            y = float(loc.get("y", 0))
+            w = float(loc.get("width", 0))
+            h = float(loc.get("height", 0))
+            if w <= 0 or h <= 0:
+                total_fail += 1
+                continue
+            x1 = int(width * x)
+            y1 = int(height * y)
+            x2 = int(width * (x + w))
+            y2 = int(height * (y + h))
+            x1 = max(0, min(x1, width - 1))
+            y1 = max(0, min(y1, height - 1))
+            x2 = max(1, min(x2, width))
+            y2 = max(1, min(y2, height))
+
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                crop = img.crop((x1, y1, x2, y2))
+                crop = crop.resize((size, size), _PIL_RESAMPLE)
+                crop.save(out_path, format="PNG")
+                total_ok += 1
+            except Exception as e:
+                logger.debug(f"PIL crop failed for {out_path}: {e}")
+                total_fail += 1
+
+        img.close()
+        return (total_ok, total_fail)
+
+    except Exception as e:
+        logger.info(f"Could not open source for cropping ({input_str}): {e}")
         return (0, len(locs_with_out_paths))
-
-    for op in out_paths:
-        op.parent.mkdir(parents=True, exist_ok=True)
-
-    total_ok = 0
-    total_fail = 0
-    batch_size = _MAX_CROPS_PER_FFMPEG
-    for start in range(0, len(crops), batch_size):
-        batch_crops = crops[start : start + batch_size]
-        batch_paths = out_paths[start : start + batch_size]
-        ok, fail = _run_ffmpeg_batch(
-            input_str, batch_crops, batch_paths, frame_index, media, size, crop_timeout,
-        )
-        total_ok += ok
-        total_fail += fail
-    return (total_ok, total_fail)
+    finally:
+        if frame_path is not None:
+            _safe_unlink(frame_path)
 
 
 def save_media_to_tmp(
@@ -801,7 +808,12 @@ def crop_localizations_parallel(
     media_objects: list[Any] | None = None,
 ) -> tuple[int, int]:
     """
-    Crop localizations from their media in parallel using ffmpeg (image and video).
+    Crop localizations from their media in parallel using PIL.
+
+    Frames are downloaded/extracted in batches of _FRAME_BATCH_SIZE to limit disk
+    and memory usage. Video frames are extracted via ffmpeg to temp files, cropped
+    with PIL, then the temp files are deleted. Image files are opened directly.
+
     Saves using elemental_id as filestem (e.g. elemental_id.png).
     Image: local files from download_dir, grouped by media_id. Video: streaming URL from
     media_objects (streaming attribute), grouped by (media_id, frame).
@@ -848,7 +860,6 @@ def crop_localizations_parallel(
     media_id_to_video_url: dict[int, str] = {}
     media_id_to_stem: dict[int, str] = {}
     media_id_to_media: dict[int, Any] = {}
-    video_url_to_resolution: dict[str, tuple[int, int]] = {}
     for m in (media_objects or []):
         if not isinstance(m, tator.models.Media):
             continue
@@ -863,9 +874,6 @@ def crop_localizations_parallel(
             path = getattr(s, "path", None)
             if path and isinstance(path, str) and path.startswith("http"):
                 media_id_to_video_url[mid] = path
-                res = getattr(s, "resolution", None)
-                if res and len(res) == 2 and res[0] > 0 and res[1] > 0:
-                    video_url_to_resolution[path] = (int(res[0]), int(res[1]))
         else:
             if mid in media_id_to_image_path:
                 media_id_to_stem[mid] = media_id_to_image_path[mid].stem
@@ -948,43 +956,11 @@ def crop_localizations_parallel(
 
     image_workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
     video_workers = min(_DEFAULT_VIDEO_WORKERS, len(video_tasks)) if video_tasks else 0
+    batch_size = _FRAME_BATCH_SIZE
     logger.info(
         f"Crop workers: {image_workers} image, {video_workers} video "
-        f"(timeout={_DEFAULT_CROP_TIMEOUT}s)"
+        f"(batch_size={batch_size}, timeout={_DEFAULT_CROP_TIMEOUT}s)"
     )
-
-    dim_cache: dict[str, tuple[int, int]] = {}
-
-    # Seed video dimensions from Tator streaming metadata (no network call).
-    for url, res in video_url_to_resolution.items():
-        dim_cache[url] = res
-    logger.info(f"Seeded {len(video_url_to_resolution)} video dimensions from Tator metadata")
-
-    # Only ffprobe sources not already resolved (images + any videos missing metadata).
-    probe_sources: set[str] = set()
-    for image_path, _ in image_tasks:
-        src = str(image_path)
-        if src not in dim_cache:
-            probe_sources.add(src)
-    for video_url, _, _, _ in video_tasks:
-        if video_url not in dim_cache:
-            probe_sources.add(video_url)
-
-    if probe_sources:
-        logger.info(f"ffprobe dimensions for {len(probe_sources)} sources (images / missing metadata)")
-        probe_pool = min(16, len(probe_sources))
-        lock = threading.Lock()
-
-        def _probe_one(src: str) -> None:
-            result = _ffprobe_dimensions(src)
-            if result is not None:
-                with lock:
-                    dim_cache[src] = result
-
-        with ThreadPoolExecutor(max_workers=probe_pool) as ex:
-            list(ex.map(_probe_one, probe_sources))
-
-    logger.info(f"Dimension cache populated: {len(dim_cache)} entries")
 
     num_ok = 0
     num_fail = 0
@@ -1003,41 +979,32 @@ def crop_localizations_parallel(
         return ok_total, fail_total
 
     if image_tasks:
-        with ThreadPoolExecutor(max_workers=image_workers) as ex:
-            futures = [
-                ex.submit(
-                    _crop_media_group,
-                    image_path,
-                    group,
-                    None,
-                    size,
-                    dim_cache,
-                )
-                for image_path, group in image_tasks
-            ]
-            ok, fail = _collect(futures)
-            num_ok += ok
-            num_fail += fail
-        logger.info(f"Image crops done: {ok} ok, {fail} failed")
+        for batch_start in range(0, len(image_tasks), batch_size):
+            batch = image_tasks[batch_start : batch_start + batch_size]
+            with ThreadPoolExecutor(max_workers=image_workers) as ex:
+                futures = [
+                    ex.submit(_crop_media_group, image_path, group, None, size)
+                    for image_path, group in batch
+                ]
+                ok, fail = _collect(futures)
+                num_ok += ok
+                num_fail += fail
+        logger.info(f"Image crops done: {num_ok} ok, {num_fail} failed")
 
     if video_tasks:
-        with ThreadPoolExecutor(max_workers=video_workers) as ex:
-            futures = [
-                ex.submit(
-                    _crop_media_group,
-                    video_url,
-                    group,
-                    frame_idx,
-                    size,
-                    dim_cache,
-                    media,
-                )
-                for video_url, frame_idx, media, group in video_tasks
-            ]
-            ok, fail = _collect(futures)
-            num_ok += ok
-            num_fail += fail
-        logger.info(f"Video crops done: {ok} ok, {fail} failed")
+        for batch_start in range(0, len(video_tasks), batch_size):
+            batch = video_tasks[batch_start : batch_start + batch_size]
+            with ThreadPoolExecutor(max_workers=video_workers) as ex:
+                futures = [
+                    ex.submit(
+                        _crop_media_group, video_url, group, frame_idx, size, None, media,
+                    )
+                    for video_url, frame_idx, media, group in batch
+                ]
+                ok, fail = _collect(futures)
+                num_ok += ok
+                num_fail += fail
+        logger.info(f"Video crops done: {num_ok} ok, {num_fail} failed")
 
     logger.info(f"Crops done: {num_ok} saved to {crops_path}, {num_fail} failed")
     return (num_ok, num_fail)
