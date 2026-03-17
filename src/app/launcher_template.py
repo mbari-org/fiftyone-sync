@@ -20,6 +20,8 @@ LAUNCHER_TEMPLATE = r"""
     .applet-header .sync-status.error { color: #c99; }
     .applet-header button { padding: 0.35rem 0.75rem; cursor: pointer; background: #3a7bd5; color: #fff; border: none; border-radius: 4px; font-size: 0.8rem; }
     .applet-header button:hover { background: #2d6ac4; }
+    .applet-header button.btn-danger { background: #b33; }
+    .applet-header button.btn-danger:hover { background: #922; }
     .applet-header button:disabled { opacity: 0.6; cursor: not-allowed; }
     .applet-header .btn-icon { margin-right: 0.25rem; }
     .applet-header .btn-icon.end { margin-right: 0; margin-left: 0.25rem; }
@@ -98,6 +100,7 @@ LAUNCHER_TEMPLATE = r"""
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
+              <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Dataset</button>
             </div>
             <div id="sync-log-panel" class="sync-log-panel" aria-live="polite" title="Sync progress log"></div>
           </td>
@@ -147,6 +150,7 @@ LAUNCHER_TEMPLATE = r"""
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
+      var deleteDatasetBtn = document.getElementById('delete-dataset-btn');
       var tokenInput = document.getElementById('user-token');
       var testTokenBtn = document.getElementById('test-token-btn');
       var tokenVerified = false;
@@ -183,6 +187,7 @@ LAUNCHER_TEMPLATE = r"""
         }
         if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
       }
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
@@ -190,6 +195,7 @@ LAUNCHER_TEMPLATE = r"""
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
         if (syncBtn) syncBtn.disabled = !enabled || !hasDatabaseEntry;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !enabled || !hasDatabaseEntry || !versionId;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !enabled || !hasDatabaseEntry || !versionId;
       }
       function loadVssProjects(token) {
         if (!vssProjectSelect || !syncServiceUrl || !apiUrl || !token) return;
@@ -582,6 +588,55 @@ LAUNCHER_TEMPLATE = r"""
               syncStatus.classList.add('error');
             })
             .finally(function() { setVersionFromDropdown(); });
+        });
+      }
+      if (deleteDatasetBtn && syncStatus && syncServiceUrl && apiUrl) {
+        deleteDatasetBtn.addEventListener('click', function() {
+          var token = getToken();
+          if (!token || !tokenVerified) return;
+          var v = versionSelect ? versionSelect.value : '';
+          if (!v) {
+            syncStatus.textContent = 'Select a version first.';
+            syncStatus.classList.add('error');
+            return;
+          }
+          var versionLabel = versionSelect.options[versionSelect.selectedIndex]
+            ? versionSelect.options[versionSelect.selectedIndex].textContent
+            : 'version ' + v;
+          if (!confirm('Delete FiftyOne dataset for ' + versionLabel + '? This cannot be undone.')) return;
+          deleteDatasetBtn.disabled = true;
+          syncStatus.textContent = 'Deleting dataset…';
+          syncStatus.classList.remove('error');
+          var params = new URLSearchParams({
+            project_id: String(project),
+            version_id: v,
+            api_url: apiUrl,
+            port: String(port)
+          });
+          fetch(syncServiceUrl + '/delete-dataset?' + params.toString(), {
+            method: 'POST',
+            headers: { 'Authorization': 'Token ' + token }
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(result) {
+              if (result.ok) {
+                var deleted = result.data.deleted;
+                syncStatus.textContent = deleted
+                  ? 'Deleted dataset: ' + deleted
+                  : (result.data.message || 'No dataset found for this version.');
+                syncStatus.classList.remove('error');
+                if (fiftyoneAppLink) fiftyoneAppLink.style.display = 'none';
+                setTimeout(function() { syncStatus.textContent = ''; }, 5000);
+              } else {
+                syncStatus.textContent = 'Delete failed: ' + (result.data.detail || result.data.message || 'Unknown error');
+                syncStatus.classList.add('error');
+              }
+            })
+            .catch(function(err) {
+              syncStatus.textContent = 'Delete error: ' + (err.message || 'Network error');
+              syncStatus.classList.add('error');
+            })
+            .finally(function() { deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId; });
         });
       }
     })();
