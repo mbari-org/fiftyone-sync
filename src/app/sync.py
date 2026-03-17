@@ -1543,6 +1543,8 @@ def _apply_loc_to_sample(
     """Update an existing sample's metadata from a localization (ground_truth, prediction, tags, annotation, tator_modified_at)."""
     label = _get_label_from_loc(loc)
     attrs = loc.get("attributes") or {}
+    eid = loc.get("elemental_id") or loc.get("id")
+    logger.debug("_apply_loc_to_sample eid=%s raw attrs keys=%s", eid, list(attrs.keys()))
 
     score = attrs.get("score")
     sample["ground_truth"] = fo.Classification(
@@ -1553,7 +1555,7 @@ def _apply_loc_to_sample(
     predicted_label = attrs.get("predicted_label") or label
     sample["prediction"] = fo.Classification(label=predicted_label)
     pred = sample["prediction"]
-    for source, target, cast in (
+    _PRED_ATTR_MAP = (
         ("label", "label", str),
         ("label_s", "label_s", str),
         ("score", "confidence", float),
@@ -1565,10 +1567,20 @@ def _apply_loc_to_sample(
         ("area", "area", int),
         ("cluster", "cluster", str),
         ("comment", "comment", str),
-    ):
+    )
+    applied = {}
+    missing = []
+    for source, target, cast in _PRED_ATTR_MAP:
         val = attrs.get(source)
         if val is not None:
             setattr(pred, target, cast(val))
+            applied[target] = cast(val)
+        else:
+            missing.append(source)
+    logger.debug(
+        "_apply_loc_to_sample eid=%s prediction.label=%s applied=%s missing=%s",
+        eid, predicted_label, applied, missing,
+    )
     verified = attrs.get("verified")
     if verified is not None and bool(verified):
         pred.tags.append("verified")
