@@ -1540,7 +1540,7 @@ def _apply_loc_to_sample(
     project_id: int | None = None,
     version_id: int | None = None,
 ) -> None:
-    """Update an existing sample's metadata from a localization (ground_truth, prediction, tags, annotation, tator_modified_at)."""
+    """Update an existing sample's metadata from a localization (ground_truth, top1/top2_prediction, anomaly, primitives, annotation, tator_modified_at)."""
     label = _get_label_from_loc(loc)
     attrs = loc.get("attributes") or {}
     eid = loc.get("elemental_id") or loc.get("id")
@@ -1553,11 +1553,35 @@ def _apply_loc_to_sample(
     )
 
     predicted_label = attrs.get("predicted_label") or label
-    _PRED_ATTR_MAP = (
-        ("label_s", "label_s", str),
-        ("score", "confidence", float),
-        ("score_s", "confidence_s", float),
-        ("anomaly_score", "anomaly_score", float),
+
+    # top1_prediction: primary model prediction
+    top1_kwargs = {"label": predicted_label}
+    score_val = attrs.get("score")
+    if score_val is not None:
+        top1_kwargs["confidence"] = float(score_val)
+    verified = attrs.get("verified")
+    if verified is not None and bool(verified):
+        top1_kwargs["tags"] = ["verified"]
+    sample["top1_prediction"] = fo.Classification(**top1_kwargs)
+
+    # top2_prediction: secondary/suggested label
+    label_s = attrs.get("label_s")
+    score_s = attrs.get("score_s")
+    if label_s is not None or score_s is not None:
+        top2_kwargs = {"label": str(label_s) if label_s is not None else ""}
+        if score_s is not None:
+            top2_kwargs["confidence"] = float(score_s)
+        sample["top2_prediction"] = fo.Classification(**top2_kwargs)
+
+    # anomaly: anomaly detection score
+    anomaly_val = attrs.get("anomaly_score")
+    if anomaly_val is not None:
+        sample["anomaly"] = fo.Classification(
+            label=predicted_label, confidence=float(anomaly_val),
+        )
+
+    # Primitive sample-level attributes
+    _PRIMITIVE_ATTR_MAP = (
         ("depth", "depth", float),
         ("altitude", "altitude", float),
         ("saliency", "saliency", int),
@@ -1565,22 +1589,17 @@ def _apply_loc_to_sample(
         ("cluster", "cluster", str),
         ("comment", "comment", str),
     )
-    pred_kwargs = {"label": predicted_label}
     applied = {}
     missing = []
-    for source, target, cast in _PRED_ATTR_MAP:
+    for source, target, cast in _PRIMITIVE_ATTR_MAP:
         val = attrs.get(source)
         if val is not None:
-            pred_kwargs[target] = cast(val)
+            sample[target] = cast(val)
             applied[target] = cast(val)
         else:
             missing.append(source)
-    verified = attrs.get("verified")
-    if verified is not None and bool(verified):
-        pred_kwargs["tags"] = ["verified"]
-    sample["prediction"] = fo.Classification(**pred_kwargs)
     logger.debug(
-        "_apply_loc_to_sample eid=%s prediction.label=%s applied=%s missing=%s",
+        "_apply_loc_to_sample eid=%s top1_prediction.label=%s applied=%s missing=%s",
         eid, predicted_label, applied, missing,
     )
     if api_url and project_id is not None:
@@ -1720,7 +1739,7 @@ def reconcile_dataset_with_tator(
         mod_ts = _normalize_modified_at(modified_at)
         last_ts = _normalize_modified_at(tator_modified_at)
 
-        has_prediction = sample.has_field("prediction") and sample["prediction"] is not None
+        has_prediction = sample.has_field("top1_prediction") and sample["top1_prediction"] is not None
         logger.debug(
             f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at} has_prediction: {has_prediction}"
         )
@@ -1970,21 +1989,22 @@ def build_fiftyone_dataset_from_crops(
 
 
 def _ensure_field_indexes(dataset: fo.Dataset) -> None:
-    """Create MongoDB indexes on prediction and ground_truth fields for faster queries."""
+    """Create MongoDB indexes on classification and primitive fields for faster queries."""
     for field_path in (
         "ground_truth.label",
         "ground_truth.confidence",
-        "prediction.label",
-        "prediction.confidence",
-        "prediction.confidence_s",
-        "prediction.label_s",
-        "prediction.depth",
-        "prediction.altitude",
-        "prediction.saliency",
-        "prediction.anomaly_score",
-        "prediction.area",
-        "prediction.cluster",
-        "prediction.comment",
+        "top1_prediction.label",
+        "top1_prediction.confidence",
+        "top2_prediction.label",
+        "top2_prediction.confidence",
+        "anomaly.label",
+        "anomaly.confidence",
+        "depth",
+        "altitude",
+        "saliency",
+        "area",
+        "cluster",
+        "comment",
     ):
         try:
             dataset.create_index(field_path)
