@@ -1556,11 +1556,10 @@ def _apply_loc_to_sample(
     sample["prediction"] = fo.Classification(label=predicted_label)
     pred = sample["prediction"]
     _PRED_ATTR_MAP = (
-        ("label", "label", str),
         ("label_s", "label_s", str),
         ("score", "confidence", float),
         ("score_s", "confidence_s", float),
-        ("anomaly", "anomaly_score", float),
+        ("anomaly_score", "anomaly_score", float),
         ("depth", "depth", float),
         ("altitude", "altitude", float),
         ("saliency", "saliency", int),
@@ -1964,7 +1963,7 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
         "prediction.depth",
         "prediction.altitude",
         "prediction.saliency",
-        "prediction.anomaly",
+        "prediction.anomaly_score",
         "prediction.area",
         "prediction.cluster",
         "prediction.comment",
