@@ -1695,13 +1695,22 @@ def reconcile_dataset_with_tator(
         if elemental_id and str(elemental_id) in loc_index:
             eid_to_sample[str(elemental_id)] = sample
 
-    # Now process only samples that have matching loc_index entries and have been modified
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
+    force_sync = bool(config.get("force_sync"))
+    if force_sync:
+        logger.info("Reconcile: force_sync enabled — rewriting all samples")
+
     samples_to_fix_storage: list[fo.Sample] = []
     for eid, sample in eid_to_sample.items():
         loc = loc_index[eid]
+
+        if force_sync:
+            samples_to_update.append((sample, loc))
+            updated += 1
+            continue
+
         modified_at = _to_datetime(
             loc.get("modified_datetime") or loc.get("created_datetime")
         )
@@ -2510,6 +2519,7 @@ def sync_project_to_fiftyone(
         config["source_url"] = api_url.rstrip("/")
         config["project_id"] = project_id
         config["version_id"] = version_id
+        config["force_sync"] = force_sync
         # In enterprise/production, use S3 URIs for sample filepaths so FiftyOne loads from S3
         if s3_bucket:
             config["s3_bucket"] = s3_bucket
