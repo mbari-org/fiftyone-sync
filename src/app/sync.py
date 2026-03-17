@@ -1711,12 +1711,15 @@ def reconcile_dataset_with_tator(
         mod_ts = _normalize_modified_at(modified_at)
         last_ts = _normalize_modified_at(tator_modified_at)
 
+        has_prediction = sample.has_field("prediction") and sample["prediction"] is not None
         logger.debug(
-            f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at}"
+            f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at} has_prediction: {has_prediction}"
         )
-        if mod_ts is not None and mod_ts != last_ts:
+        needs_update = (mod_ts is not None and mod_ts != last_ts) or not has_prediction
+        if needs_update:
+            reason = "timestamp_changed" if (mod_ts is not None and mod_ts != last_ts) else "missing_prediction"
             logger.debug(
-                f"====>Sample {sample.id} needs update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at}"
+                f"Sample {sample.id} needs update ({reason}): {eid}"
             )
             samples_to_update.append((sample, loc))
             updated += 1
