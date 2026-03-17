@@ -1553,21 +1553,21 @@ def _apply_loc_to_sample(
     predicted_label = attrs.get("predicted_label") or label
     sample["prediction"] = fo.Classification(label=predicted_label)
     pred = sample["prediction"]
-    for attr, cast in (
-        ("label", str),
-        ("label_s", str),
-        ("score", float),
-        ("score_s", float),
-        ("depth", float),
-        ("altitude", float),
-        ("saliency", int),
-        ("area", int),
-        ("cluster", str),
-        ("comment", str),
+    for source, target, cast in (
+        ("label", "label", str),
+        ("label_s", "label_s", str),
+        ("score", "confidence", float),
+        ("score_s", "confidence_s", float),
+        ("depth", "depth", float),
+        ("altitude", "altitude", float),
+        ("saliency", "saliency", int),
+        ("area", "area", int),
+        ("cluster", "cluster", str),
+        ("comment", "comment", str),
     ):
-        val = attrs.get(attr)
+        val = attrs.get(source)
         if val is not None:
-            setattr(pred, attr, cast(val))
+            setattr(pred, target, cast(val))
     verified = attrs.get("verified")
     if verified is not None and bool(verified):
         pred.tags.append("verified")
@@ -1887,10 +1887,8 @@ def build_fiftyone_dataset_from_crops(
             )
             sample = fo.Sample(filepath=sample_filepath)
             sample["local_filepath"] = filepath
-            sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
             sample["elemental_id"] = elemental_id
             sample["media_stem"] = media_stem
-            # Media-level attributes (Image type only), if provided in config
             media_attrs_map = config.get("media_attributes_map") or {}
             if loc:
                 media_id = loc.get("media")
@@ -1899,26 +1897,9 @@ def build_fiftyone_dataset_from_crops(
                     for k, v in media_attrs.items():
                         if v is not None:
                             sample[k] = v
-                # Localization attributes: confidence, verified, label_s, cluster (same as _create_sample_from_loc)
-                attrs = loc.get("attributes") or {}
-                score = attrs.get("score")
-                verified = attrs.get("verified")
-                label_s = attrs.get("label_s")
-                cluster = attrs.get("cluster")
-                if score is not None:
-                    sample["confidence"] = float(score)
-                if verified is not None and bool(verified):
-                    sample.tags.append("verified")
-                if label_s is not None and "Unknown" not in label_s:
-                    sample.tags.append(label_s)
-                if cluster is not None and "Unknown" not in cluster:
-                    sample.tags.append(cluster)
-                modified_at = loc.get("modified_datetime") or loc.get(
-                    "created_datetime"
-                )
-                dt = _to_datetime(modified_at)
-                if dt is not None:
-                    sample[TATOR_MODIFIED_AT_FIELD] = dt
+                _apply_loc_to_sample(sample, loc)
+            else:
+                sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
             samples.append(sample)
         if max_samples and len(samples) >= max_samples:
             break
@@ -1965,7 +1946,7 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
         "ground_truth.confidence",
         "prediction.label",
         "prediction.confidence",
-        "prediction.score_s",
+        "prediction.confidence_s",
         "prediction.label_s",
         "prediction.depth",
         "prediction.altitude",
