@@ -2853,6 +2853,70 @@ def main() -> None:
         )
 
 
+def check_dataset_exists_for_version(
+    project_id: int,
+    version_id: int,
+    port: int,
+    api_url: str,
+    token: str,
+    project_name: str | None = None,
+    database_uri: str | None = None,
+    database_name: str | None = None,
+) -> dict[str, Any]:
+    """Check whether a FiftyOne dataset exists for the given version/port.
+
+    Returns {"exists": bool, "dataset_name": str | None, "database_name": str}.
+    """
+    resolved_db = (
+        database_name.strip() if database_name and database_name.strip() else None
+    ) or get_database_name(project_id, port, project_name=project_name)
+    resolved_uri = (
+        database_uri.strip() if database_uri and database_uri.strip() else None
+    ) or get_database_uri(project_id, port, project_name=project_name)
+
+    if not get_is_enterprise():
+        fo.config.database_uri = resolved_uri
+        fo.config.database_name = resolved_db
+        os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
+        os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
+
+    try:
+        if get_is_enterprise():
+            _test_fiftyone_connection()
+        else:
+            _test_mongodb_connection(resolved_uri)
+    except ConnectionError as exc:
+        raise RuntimeError(f"Connection check failed: {exc}") from exc
+
+    host = api_url.rstrip("/")
+    api = tator.get_api(host, token)
+    ds_name = _default_dataset_name(api, project_id, version_id)
+    ds_name_with_port = _dataset_name_with_port(ds_name, port)
+
+    project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
+    port_suffix = f"_{port}"
+    version_part = f"_v{version_id}"
+
+    available = fo.list_datasets()
+
+    def _find_match() -> str | None:
+        if ds_name_with_port in available:
+            return ds_name_with_port
+        if ds_name in available:
+            return ds_name
+        for d in available:
+            if d.startswith(project_prefix) and version_part in d and d.endswith(port_suffix):
+                return d
+        return None
+
+    target = _find_match()
+    return {
+        "exists": target is not None,
+        "dataset_name": target,
+        "database_name": resolved_db,
+    }
+
+
 def delete_dataset_for_version(
     project_id: int,
     version_id: int,

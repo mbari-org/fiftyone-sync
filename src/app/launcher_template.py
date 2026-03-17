@@ -157,6 +157,7 @@ LAUNCHER_TEMPLATE = r"""
       var hasDatabaseEntry = false;
       var isEnterprise = false;
       var versionId = '';
+      var datasetExists = false;
       var vssProjectKey = '';
       var vssProjectsData = [];  // full list from /vss-projects: [{key, name}]; embedding service URL is global
       function getToken() {
@@ -187,7 +188,9 @@ LAUNCHER_TEMPLATE = r"""
         }
         if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
-        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
+        datasetExists = false;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = true;
+        if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
       }
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
@@ -195,7 +198,23 @@ LAUNCHER_TEMPLATE = r"""
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
         if (syncBtn) syncBtn.disabled = !enabled || !hasDatabaseEntry;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !enabled || !hasDatabaseEntry || !versionId;
-        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !enabled || !hasDatabaseEntry || !versionId;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !enabled || !hasDatabaseEntry || !versionId || !datasetExists;
+      }
+      function checkDatasetExists() {
+        var token = getToken();
+        var v = versionId;
+        if (!syncServiceUrl || !apiUrl || !token || !v) return;
+        fetch(syncServiceUrl + '/dataset-exists?project_id=' + project + '&version_id=' + encodeURIComponent(v) + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port, {
+          headers: { 'Authorization': 'Token ' + token }
+        })
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .then(function(data) {
+            if (!data) return;
+            if (versionId !== v) return;
+            datasetExists = !!data.exists;
+            if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
+          })
+          .catch(function() {});
       }
       function loadVssProjects(token) {
         if (!vssProjectSelect || !syncServiceUrl || !apiUrl || !token) return;
@@ -504,6 +523,7 @@ LAUNCHER_TEMPLATE = r"""
                         syncBtn.disabled = false;
                         if (syncLogPanel) syncLogPanel.classList.add('visible');
                         updateLogPanel(hideLogPanelAfterDelay);
+                        checkDatasetExists();
                         return;
                       }
                       if (s.status === 'unknown') {
@@ -540,6 +560,7 @@ LAUNCHER_TEMPLATE = r"""
               }
               setTimeout(function() { syncStatus.textContent = ''; }, 5000);
               syncBtn.disabled = false;
+              checkDatasetExists();
             })
             .catch(function(err) {
               syncStatus.textContent = 'Sync error: ' + (err.message || 'Network error');
@@ -636,7 +657,11 @@ LAUNCHER_TEMPLATE = r"""
               syncStatus.textContent = 'Delete error: ' + (err.message || 'Network error');
               syncStatus.classList.add('error');
             })
-            .finally(function() { deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId; });
+            .finally(function() {
+              datasetExists = false;
+              deleteDatasetBtn.disabled = true;
+              checkDatasetExists();
+            });
         });
       }
     })();
