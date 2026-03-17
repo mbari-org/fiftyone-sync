@@ -1886,6 +1886,8 @@ def build_fiftyone_dataset_from_crops(
         "*.tiff",
     ]
     max_samples = config.get("max_samples")
+    force_sync = bool(config.get("force_sync"))
+    dataset_already_exists = dataset_name in fo.list_datasets()
 
     # Load localizations index by elemental_id
     loc_index = _load_localizations_index(localizations_jsonl_path)
@@ -1934,13 +1936,14 @@ def build_fiftyone_dataset_from_crops(
                     for k, v in media_attrs.items():
                         if v is not None:
                             sample[k] = v
-                _apply_loc_to_sample(
-                    sample,
-                    loc,
-                    api_url=config.get("api_url"),
-                    project_id=config.get("project_id"),
-                    version_id=config.get("version_id"),
-                )
+                if not dataset_already_exists or force_sync:
+                    _apply_loc_to_sample(
+                        sample,
+                        loc,
+                        api_url=config.get("api_url"),
+                        project_id=config.get("project_id"),
+                        version_id=config.get("version_id"),
+                    )
             else:
                 sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
             samples.append(sample)
@@ -1953,7 +1956,7 @@ def build_fiftyone_dataset_from_crops(
     logger.info(f"Collected {len(samples)} samples for dataset")
 
     # Handle existing dataset: always reconcile, never delete
-    if dataset_name in fo.list_datasets():
+    if dataset_already_exists:
         logger.info(f"Reconcile: loading dataset {dataset_name}...")
         dataset = fo.load_dataset(dataset_name)
         dataset.persistent = (
