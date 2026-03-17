@@ -1540,24 +1540,37 @@ def _apply_loc_to_sample(
     project_id: int | None = None,
     version_id: int | None = None,
 ) -> None:
-    """Update an existing sample's metadata from a localization (ground_truth, confidence, tags, annotation, tator_modified_at)."""
+    """Update an existing sample's metadata from a localization (ground_truth, prediction, tags, annotation, tator_modified_at)."""
     label = _get_label_from_loc(loc)
-    sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
     attrs = loc.get("attributes") or {}
+
     score = attrs.get("score")
+    sample["ground_truth"] = fo.Classification(
+        label=label,
+        confidence=float(score) if score is not None else 1.0,
+    )
+
+    predicted_label = attrs.get("predicted_label") or label
+    sample["prediction"] = fo.Classification(label=predicted_label)
+    pred = sample["prediction"]
+    for attr, cast in (
+        ("label", str),
+        ("label_s", str),
+        ("score", float),
+        ("score_s", float),
+        ("depth", float),
+        ("altitude", float),
+        ("saliency", int),
+        ("area", int),
+        ("cluster", str),
+        ("comment", str),
+    ):
+        val = attrs.get(attr)
+        if val is not None:
+            setattr(pred, attr, cast(val))
     verified = attrs.get("verified")
-    label_s = attrs.get("label_s")
-    cluster = attrs.get("cluster")
-    if score is not None:
-        sample["confidence"] = float(score)
-    # Replace tags with current values from loc (avoid stale label/cluster/verified)
-    sample.tags.clear()
     if verified is not None and bool(verified):
-        sample.tags.append("verified")
-    if label_s is not None and "Unknown" not in label_s:
-        sample.tags.append(label_s)
-    if cluster is not None and "Unknown" not in cluster:
-        sample.tags.append(cluster)
+        pred.tags.append("verified")
     if api_url and project_id is not None:
         tator_url = _tator_localization_url(api_url, project_id, loc, version_id)
         if tator_url:
@@ -1687,7 +1700,7 @@ def reconcile_dataset_with_tator(
         last_ts = _normalize_modified_at(tator_modified_at)
 
         logger.debug(
-            f"====>Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at}"
+            f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at}"
         )
         if mod_ts is not None and mod_ts != last_ts:
             logger.debug(
@@ -1930,6 +1943,7 @@ def build_fiftyone_dataset_from_crops(
             config=config,
             max_samples=max_samples,
         )
+        _ensure_field_indexes(dataset)
         logger.info(f"Reconcile: dataset {dataset_name} loaded")
         return dataset
 
@@ -1939,8 +1953,31 @@ def build_fiftyone_dataset_from_crops(
     dataset = fo.Dataset(dataset_name)
     dataset.persistent = True  # Persist dataset in MongoDB after session ends
     dataset.add_samples(samples)
+    _ensure_field_indexes(dataset)
     logger.info(f"Created dataset '{dataset_name}' with {len(samples)} samples")
     return dataset
+
+
+def _ensure_field_indexes(dataset: fo.Dataset) -> None:
+    """Create MongoDB indexes on prediction and ground_truth fields for faster queries."""
+    for field_path in (
+        "ground_truth.label",
+        "ground_truth.confidence",
+        "prediction.label",
+        "prediction.confidence",
+        "prediction.score_s",
+        "prediction.label_s",
+        "prediction.depth",
+        "prediction.altitude",
+        "prediction.saliency",
+        "prediction.area",
+        "prediction.cluster",
+        "prediction.comment",
+    ):
+        try:
+            dataset.create_index(field_path)
+        except Exception:
+            pass
 
 
 DEFAULT_LABEL_ATTR = "Label"
