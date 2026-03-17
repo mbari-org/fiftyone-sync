@@ -1559,9 +1559,6 @@ def _apply_loc_to_sample(
     score_val = attrs.get("score")
     if score_val is not None:
         top1_kwargs["confidence"] = float(score_val)
-    verified = attrs.get("verified")
-    if verified is not None and bool(verified):
-        top1_kwargs["tags"] = ["verified"]
     sample["top1_prediction"] = fo.Classification(**top1_kwargs)
 
     # top2_prediction: secondary/suggested label
@@ -1582,6 +1579,7 @@ def _apply_loc_to_sample(
         ("area", "area", int),
         ("cluster", "cluster", str),
         ("comment", "comment", str),
+        ("verified", "verified", bool),
     )
     applied = {}
     missing = []
@@ -2001,6 +1999,7 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
         "area",
         "cluster",
         "comment",
+        "verified",
     ):
         try:
             dataset.create_index(field_path)
@@ -2190,6 +2189,10 @@ def sync_edits_to_tator(
             attrs[label_attr] = str(label)
         if confidence is not None and score_attr:
             attrs[score_attr] = float(confidence)
+        if "verified" in sample:
+            verified_val = sample["verified"]
+            if verified_val is not None:
+                attrs["verified"] = bool(verified_val)
         if not attrs:
             continue
 
