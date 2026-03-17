@@ -1573,15 +1573,9 @@ def _apply_loc_to_sample(
             top2_kwargs["confidence"] = float(score_s)
         sample["top2_prediction"] = fo.Classification(**top2_kwargs)
 
-    # anomaly: anomaly detection score
-    anomaly_val = attrs.get("anomaly_score")
-    if anomaly_val is not None:
-        sample["anomaly"] = fo.Classification(
-            label=predicted_label, confidence=float(anomaly_val),
-        )
-
     # Primitive sample-level attributes
     _PRIMITIVE_ATTR_MAP = (
+        ("anomaly_score", "anomaly_score", float),
         ("depth", "depth", float),
         ("altitude", "altitude", float),
         ("saliency", "saliency", int),
@@ -1997,8 +1991,7 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
         "top1_prediction.confidence",
         "top2_prediction.label",
         "top2_prediction.confidence",
-        "anomaly.label",
-        "anomaly.confidence",
+        "anomaly_score",
         "depth",
         "altitude",
         "saliency",
