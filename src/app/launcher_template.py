@@ -512,9 +512,7 @@ LAUNCHER_TEMPLATE = r"""
                           ? 'Sync done. ' + res.sample_count + ' samples.'
                           : 'Sync done.';
                         var baseUrl = (res.app_url && res.app_url.replace(/\/$/, '')) || ('http://' + iframeHost + ':' + (res.port != null ? res.port : port));
-                        var openUrl = res.dataset_name
-                          ? baseUrl + '/datasets/' + encodeURIComponent(res.dataset_name) + '/samples'
-                          : baseUrl;
+                        var openUrl = baseUrl + '/';
                         if (fiftyoneAppLink) {
                           fiftyoneAppLink.href = openUrl;
                           fiftyoneAppLink.style.display = '';
@@ -550,10 +548,8 @@ LAUNCHER_TEMPLATE = r"""
               syncStatus.textContent = data.sample_count != null
                 ? 'Sync done. ' + data.sample_count + ' samples.'
                 : 'Sync done.';
-              var baseUrl = data.app_url || 'http://localhost:' + port;
-              var openUrl = data.dataset_name
-                ? baseUrl + '/datasets/' + encodeURIComponent(data.dataset_name) + '/samples'
-                : baseUrl;
+              var baseUrl = (data.app_url || 'http://localhost:' + port).replace(/\/$/, '');
+              var openUrl = baseUrl + '/';
               if (fiftyoneAppLink) {
                 fiftyoneAppLink.href = openUrl;
                 fiftyoneAppLink.style.display = '';
