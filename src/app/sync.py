@@ -1553,8 +1553,6 @@ def _apply_loc_to_sample(
     )
 
     predicted_label = attrs.get("predicted_label") or label
-    sample["prediction"] = fo.Classification(label=predicted_label)
-    pred = sample["prediction"]
     _PRED_ATTR_MAP = (
         ("label_s", "label_s", str),
         ("score", "confidence", float),
@@ -1567,22 +1565,24 @@ def _apply_loc_to_sample(
         ("cluster", "cluster", str),
         ("comment", "comment", str),
     )
+    pred_kwargs = {"label": predicted_label}
     applied = {}
     missing = []
     for source, target, cast in _PRED_ATTR_MAP:
         val = attrs.get(source)
         if val is not None:
-            setattr(pred, target, cast(val))
+            pred_kwargs[target] = cast(val)
             applied[target] = cast(val)
         else:
             missing.append(source)
+    verified = attrs.get("verified")
+    if verified is not None and bool(verified):
+        pred_kwargs["tags"] = ["verified"]
+    sample["prediction"] = fo.Classification(**pred_kwargs)
     logger.debug(
         "_apply_loc_to_sample eid=%s prediction.label=%s applied=%s missing=%s",
         eid, predicted_label, applied, missing,
     )
-    verified = attrs.get("verified")
-    if verified is not None and bool(verified):
-        pred.tags.append("verified")
     if api_url and project_id is not None:
         tator_url = _tator_localization_url(api_url, project_id, loc, version_id)
         if tator_url:
@@ -1921,7 +1921,13 @@ def build_fiftyone_dataset_from_crops(
                     for k, v in media_attrs.items():
                         if v is not None:
                             sample[k] = v
-                _apply_loc_to_sample(sample, loc)
+                _apply_loc_to_sample(
+                    sample,
+                    loc,
+                    api_url=config.get("api_url"),
+                    project_id=config.get("project_id"),
+                    version_id=config.get("version_id"),
+                )
             else:
                 sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
             samples.append(sample)
@@ -2516,7 +2522,7 @@ def sync_project_to_fiftyone(
             }
 
         # Inject Tator base URL and ids so sample "url" can link to the localization's media page
-        config["source_url"] = api_url.rstrip("/")
+        config["api_url"] = api_url.rstrip("/")
         config["project_id"] = project_id
         config["version_id"] = version_id
         config["force_sync"] = force_sync
@@ -2811,7 +2817,9 @@ def main() -> None:
             fo.config.database_name = get_database_name(project_id, port, project_name)
             os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
             os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
-        config = config
+        config["api_url"] = host.rstrip("/")
+        config["project_id"] = project_id
+        config["version_id"] = version_id
         config["media_attributes_map"] = _build_media_attributes_map(
             api,
             project_id,
