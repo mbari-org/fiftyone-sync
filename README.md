@@ -325,7 +325,7 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
 
-**Sync-from-Tator flow (dashboard):** The launcher template calls `POST /sync`, then opens the FiftyOne app in a new tab. The frontend opens the **dataset URL** (e.g. `http://host:port/datasets/MyProject_v66_5151`) using `dataset_name` from the response so the App loads the synced dataset directly. The dataset name is always `project_name + "_v" + version_id + "_" + port` (e.g. `MyProject_v66_5151`). It cannot be overridden via config.
+**Sync-from-Tator flow (dashboard):** The launcher template calls `POST /sync`, then opens the FiftyOne app in a new tab. The "Open Voxel51" link always points to the base URL from `FIFTYONE_APP_PUBLIC_BASE_URL` (e.g. `https://cortex.shore.mbari.org/fiftyone/`) — no port or dataset path is appended. The dataset name is always `project_name + "_v" + version_id + "_" + port` (e.g. `MyProject_v66_5151`). It cannot be overridden via config.
 
 ### Config file (YAML/JSON)
 

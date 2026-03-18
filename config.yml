@@ -4,8 +4,7 @@ localization_batch_size: 10000
 
 # When true (enterprise): enable S3 upload and do not set fo.config.database_uri/database_name
 # (FiftyOne uses its own config). When false: S3 upload disabled, sync sets database per project/port.
-# In enterprise mode, the FiftyOne app URL will be constructed without port (e.g., https://mbari.fiftyone.ai)
-# and the dataset link will be in the format: https://mbari.fiftyone.ai/datasets/{project-name}-v{version-id}-{port}/samples
+# The FiftyOne app URL is always taken directly from FIFTYONE_APP_PUBLIC_BASE_URL (no port suffix).
 is_enterprise: true
 
 embeddings:

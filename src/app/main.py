@@ -331,9 +331,9 @@ async def render_launcher() -> HTMLResponse:
     Return Jinja2 template for HostedTemplate. Tator fetches this URL and renders with tparams.
     Required tparams: project (Tator project ID). Optional: iframe_host (host for app URL), base_port (5151), project_name (vss_project for embedding status only).
     The applet uses GET /database-info?project_id=... to resolve port and database from DatabaseUriConfig.
-    When the sync worker runs on a different host than the API, set FIFTYONE_APP_PUBLIC_BASE_URL in the worker
-    environment to the hostname the browser can use to reach the FiftyOne app (e.g. worker host); the sync
-    result will include app_url and the applet will open that URL.
+    Set FIFTYONE_APP_PUBLIC_BASE_URL to the full base URL for the FiftyOne app
+    (e.g. https://cortex.shore.mbari.org/fiftyone). The sync result includes app_url
+    (used as-is, no port suffix) and the applet opens that URL.
     "Open FiftyOne" opens the app in a new window. For sync: set sync_service_url and api_url; the user enters their Tator API token in the applet and clicks "Verify Token" to enable Sync from Tator / Sync to Tator.
     Embedding service status: server uses FASTVSS_API_URL; applet calls GET /vss-embedding to show availability and project registration.
     """

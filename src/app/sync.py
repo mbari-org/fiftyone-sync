@@ -2682,16 +2682,11 @@ def sync_project_to_fiftyone(
         else:
             logger.info("No vss_project; skipping embeddings/UMAP")
 
-        # URL for the launcher: must use FIFTYONE_APP_PUBLIC_BASE_URL so the dashboard
-        # opens the correct FiftyOne app (e.g. maximilian.shore.mbari.org), always http.
-        # In enterprise mode, don't append port; use the base URL directly (e.g. https://mbari.fiftyone.ai)
-        public_url = os.environ.get(
+        # URL for the launcher: always use FIFTYONE_APP_PUBLIC_BASE_URL as-is (no port suffix).
+        # Include the full URL with any path prefix, e.g. https://cortex.shore.mbari.org/fiftyone
+        app_url = os.environ.get(
             "FIFTYONE_APP_PUBLIC_BASE_URL", "http://localhost"
-        ).strip()
-        if get_is_enterprise():
-            app_url = public_url.rstrip("/")
-        else:
-            app_url = f"{public_url.rstrip('/')}:{port}"
+        ).strip().rstrip("/")
         logger.info(f"FiftyOne app URL (FIFTYONE_APP_PUBLIC_BASE_URL): {app_url}")
 
         result = {
