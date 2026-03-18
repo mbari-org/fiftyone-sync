@@ -20,6 +20,8 @@ LAUNCHER_TEMPLATE = r"""
     .applet-header .sync-status.error { color: #c99; }
     .applet-header button { padding: 0.35rem 0.75rem; cursor: pointer; background: #3a7bd5; color: #fff; border: none; border-radius: 4px; font-size: 0.8rem; }
     .applet-header button:hover { background: #2d6ac4; }
+    .applet-header button.btn-danger { background: #b33; }
+    .applet-header button.btn-danger:hover { background: #922; }
     .applet-header button:disabled { opacity: 0.6; cursor: not-allowed; }
     .applet-header .btn-icon { margin-right: 0.25rem; }
     .applet-header .btn-icon.end { margin-right: 0; margin-left: 0.25rem; }
@@ -98,6 +100,7 @@ LAUNCHER_TEMPLATE = r"""
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
+              <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Dataset</button>
             </div>
             <div id="sync-log-panel" class="sync-log-panel" aria-live="polite" title="Sync progress log"></div>
           </td>
@@ -147,24 +150,31 @@ LAUNCHER_TEMPLATE = r"""
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
+      var deleteDatasetBtn = document.getElementById('delete-dataset-btn');
       var tokenInput = document.getElementById('user-token');
       var testTokenBtn = document.getElementById('test-token-btn');
       var tokenVerified = false;
       var hasDatabaseEntry = false;
       var isEnterprise = false;
       var versionId = '';
+      var datasetExists = false;
       var vssProjectKey = '';
       var vssProjectsData = [];  // full list from /vss-projects: [{key, name}]; embedding service URL is global
+      var embeddingServiceReady = false;  // true when WS test passed or service not configured
       function getToken() {
         return tokenInput ? tokenInput.value.trim() : '';
       }
       function getSelectedVssProjectName() {
-        // Returns the vss_project name (e.g. "902004-Planktivore-HighMag") for the selected key, or falls back to static projectName tparam.
+        // Returns the vss_project name for the selected key. No fallback; must have vss_project_key.
         if (vssProjectKey && vssProjectsData.length) {
           var found = vssProjectsData.find(function(vp) { return vp.key === vssProjectKey; });
           if (found && found.name) return found.name;
         }
-        return projectName;
+        return '';
+      }
+      function getEmbeddingProject() {
+        // Returns the project for the embedding API. Always uses vss_project_key (no fallback).
+        return vssProjectKey || '';
       }
       function setVssProjectFromDropdown() {
         vssProjectKey = vssProjectSelect && vssProjectSelect.value ? vssProjectSelect.value : '';
@@ -181,15 +191,37 @@ LAUNCHER_TEMPLATE = r"""
           var selOpt = versionSelect.options[versionSelect.selectedIndex];
           versionSelect.title = selOpt ? (selOpt.getAttribute('data-description') || '') : '';
         }
-        if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry;
+        updateSyncButtonsState();
+        datasetExists = false;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = true;
+        if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
+      }
+      function updateSyncButtonsState() {
+        if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry || !embeddingServiceReady;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
       }
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
         if (versionSelect) versionSelect.disabled = !enabled;
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
-        if (syncBtn) syncBtn.disabled = !enabled || !hasDatabaseEntry;
-        if (syncToTatorBtn) syncToTatorBtn.disabled = !enabled || !hasDatabaseEntry || !versionId;
+        updateSyncButtonsState();
+      }
+      function checkDatasetExists() {
+        var token = getToken();
+        var v = versionId;
+        if (!syncServiceUrl || !apiUrl || !token || !v) return;
+        fetch(syncServiceUrl + '/dataset-exists?project_id=' + project + '&version_id=' + encodeURIComponent(v) + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port, {
+          headers: { 'Authorization': 'Token ' + token }
+        })
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .then(function(data) {
+            if (!data) return;
+            if (versionId !== v) return;
+            datasetExists = !!data.exists;
+            updateSyncButtonsState();
+          })
+          .catch(function() {});
       }
       function loadVssProjects(token) {
         if (!vssProjectSelect || !syncServiceUrl || !apiUrl || !token) return;
@@ -372,29 +404,72 @@ LAUNCHER_TEMPLATE = r"""
         var base = syncServiceUrl || window.location.origin;
         var url = base.replace(/\/$/, '') + '/vss-embedding';
         var checkName = getSelectedVssProjectName();
+        embeddingServiceReady = false;
+        updateSyncButtonsState();
         fetch(url)
           .then(function(r) {
-            if (!r.ok) throw new Error(r.status === 503 ? (r.statusText || 'Service unavailable') : (r.status + ' ' + r.statusText));
+            if (!r.ok) {
+              return r.json().catch(function() { return { detail: r.statusText }; }).then(function(d) {
+                var detail = (d && d.detail) ? d.detail : '';
+                if (detail.indexOf('not set') !== -1) {
+                  embeddingServiceReady = true;
+                  el.textContent = 'Not configured (Load from Tator works without embeddings)';
+                  el.classList.remove('error');
+                } else {
+                  el.textContent = detail || 'Service unavailable';
+                  el.classList.add('error');
+                }
+                updateSyncButtonsState();
+                throw null;
+              });
+            }
             return r.json();
           })
           .then(function(data) {
             var projects = (data && data.projects) ? data.projects : [];
+            var embeddingProject = getEmbeddingProject();
+            if (!embeddingProject) {
+              el.textContent = 'Select a VSS project (Verify Token first)';
+              el.classList.add('error');
+              updateSyncButtonsState();
+              return;
+            }
             if (checkName) {
               var inList = projects.indexOf(checkName) !== -1;
               el.textContent = inList
-                ? 'Available, project registered'
-                : 'Available, but project not registered; cannot compute embeddings or UMAP but you can still edit the localizations';
+                ? 'Checking WebSocket…'
+                : 'Available, but project not registered; checking WebSocket…';
               if (!inList) el.classList.add('error');
               else el.classList.remove('error');
             } else {
-              el.textContent = 'Available (' + (projects.length || 0) + ' project(s)); set project_name tparam (vss_project) to check this project';
+              el.textContent = 'Checking WebSocket…';
               el.classList.remove('error');
             }
+            var wsTestUrl = base.replace(/\/$/, '') + '/vss-embedding/ws-test?project=' + encodeURIComponent(embeddingProject);
+            return fetch(wsTestUrl).then(function(wsR) {
+              if (wsR.ok) {
+                embeddingServiceReady = true;
+                if (checkName) {
+                  var inList = projects.indexOf(checkName) !== -1;
+                  el.textContent = inList
+                    ? 'Available, project registered'
+                    : 'Available, but project not registered; cannot compute embeddings or UMAP but you can still edit the localizations';
+                  if (!inList) el.classList.add('error');
+                  else el.classList.remove('error');
+                } else {
+                  el.textContent = 'Available (' + (projects.length || 0) + ' project(s)); set project_name tparam (vss_project) to check this project';
+                  el.classList.remove('error');
+                }
+              } else {
+                return wsR.json().catch(function() { return { detail: 'WebSocket test failed' }; }).then(function(d) {
+                  el.textContent = (d && d.detail) ? d.detail : 'WebSocket test failed';
+                  el.classList.add('error');
+                });
+              }
+            });
           })
-          .catch(function(err) {
-            el.textContent = err.message || 'Network error';
-            el.classList.add('error');
-          });
+          .then(function() { updateSyncButtonsState(); })
+          .catch(function(err) { if (err) { el.textContent = err.message || 'Network error'; el.classList.add('error'); updateSyncButtonsState(); } });
       }
       checkEmbeddingService();
       if (syncBtn && syncStatus && syncServiceUrl && apiUrl) {
@@ -475,6 +550,9 @@ LAUNCHER_TEMPLATE = r"""
                       }
                       if (s.status === 'finished' && s.result) {
                         var res = s.result;
+                        if (!res || typeof res !== 'object' || Array.isArray(res)) {
+                          res = {};
+                        }
                         if (res.status === 'busy' || res.status === 'error') {
                           syncStatus.textContent = res.message || 'Sync failed. Please try again in a few minutes.';
                           syncStatus.classList.add('error');
@@ -487,9 +565,7 @@ LAUNCHER_TEMPLATE = r"""
                           ? 'Sync done. ' + res.sample_count + ' samples.'
                           : 'Sync done.';
                         var baseUrl = (res.app_url && res.app_url.replace(/\/$/, '')) || ('http://' + iframeHost + ':' + (res.port != null ? res.port : port));
-                        var openUrl = res.dataset_name
-                          ? baseUrl + '/datasets/' + encodeURIComponent(res.dataset_name) + '/samples'
-                          : baseUrl;
+                        var openUrl = baseUrl + '/';
                         if (fiftyoneAppLink) {
                           fiftyoneAppLink.href = openUrl;
                           fiftyoneAppLink.style.display = '';
@@ -498,6 +574,7 @@ LAUNCHER_TEMPLATE = r"""
                         syncBtn.disabled = false;
                         if (syncLogPanel) syncLogPanel.classList.add('visible');
                         updateLogPanel(hideLogPanelAfterDelay);
+                        checkDatasetExists();
                         return;
                       }
                       if (s.status === 'unknown') {
@@ -521,19 +598,19 @@ LAUNCHER_TEMPLATE = r"""
                 poll();
                 return;
               }
-              syncStatus.textContent = data.sample_count != null
-                ? 'Sync done. ' + data.sample_count + ' samples.'
+              var dataObj = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+              syncStatus.textContent = dataObj.sample_count != null
+                ? 'Sync done. ' + dataObj.sample_count + ' samples.'
                 : 'Sync done.';
-              var baseUrl = data.app_url || 'http://localhost:' + port;
-              var openUrl = data.dataset_name
-                ? baseUrl + '/datasets/' + encodeURIComponent(data.dataset_name) + '/samples'
-                : baseUrl;
+              var baseUrl = (dataObj.app_url || 'http://localhost:' + port).replace(/\/$/, '');
+              var openUrl = baseUrl + '/';
               if (fiftyoneAppLink) {
                 fiftyoneAppLink.href = openUrl;
                 fiftyoneAppLink.style.display = '';
               }
               setTimeout(function() { syncStatus.textContent = ''; }, 5000);
               syncBtn.disabled = false;
+              checkDatasetExists();
             })
             .catch(function(err) {
               syncStatus.textContent = 'Sync error: ' + (err.message || 'Network error');
@@ -582,6 +659,59 @@ LAUNCHER_TEMPLATE = r"""
               syncStatus.classList.add('error');
             })
             .finally(function() { setVersionFromDropdown(); });
+        });
+      }
+      if (deleteDatasetBtn && syncStatus && syncServiceUrl && apiUrl) {
+        deleteDatasetBtn.addEventListener('click', function() {
+          var token = getToken();
+          if (!token || !tokenVerified) return;
+          var v = versionSelect ? versionSelect.value : '';
+          if (!v) {
+            syncStatus.textContent = 'Select a version first.';
+            syncStatus.classList.add('error');
+            return;
+          }
+          var versionLabel = versionSelect.options[versionSelect.selectedIndex]
+            ? versionSelect.options[versionSelect.selectedIndex].textContent
+            : 'version ' + v;
+          if (!confirm('Delete FiftyOne dataset for ' + versionLabel + '? This cannot be undone.')) return;
+          deleteDatasetBtn.disabled = true;
+          syncStatus.textContent = 'Deleting dataset…';
+          syncStatus.classList.remove('error');
+          var params = new URLSearchParams({
+            project_id: String(project),
+            version_id: v,
+            api_url: apiUrl,
+            port: String(port)
+          });
+          fetch(syncServiceUrl + '/delete-dataset?' + params.toString(), {
+            method: 'POST',
+            headers: { 'Authorization': 'Token ' + token }
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(result) {
+              if (result.ok) {
+                var deleted = result.data.deleted;
+                syncStatus.textContent = deleted
+                  ? 'Deleted dataset: ' + deleted
+                  : (result.data.message || 'No dataset found for this version.');
+                syncStatus.classList.remove('error');
+                if (fiftyoneAppLink) fiftyoneAppLink.style.display = 'none';
+                setTimeout(function() { syncStatus.textContent = ''; }, 5000);
+              } else {
+                syncStatus.textContent = 'Delete failed: ' + (result.data.detail || result.data.message || 'Unknown error');
+                syncStatus.classList.add('error');
+              }
+            })
+            .catch(function(err) {
+              syncStatus.textContent = 'Delete error: ' + (err.message || 'Network error');
+              syncStatus.classList.add('error');
+            })
+            .finally(function() {
+              datasetExists = false;
+              deleteDatasetBtn.disabled = true;
+              checkDatasetExists();
+            });
         });
       }
     })();

@@ -139,7 +139,8 @@ def get_vss_project_config(
 ) -> dict[str, str | None] | None:
     """Return VSS project configuration for a specific key.
     Returns dict with vss_project, s3_bucket, s3_prefix. Embedding service URL is global (embeddings.service_url).
-    If vss_project_key is None, returns first/only VSS project or legacy config."""
+    If vss_project_key is None, returns first/only VSS project or legacy config.
+    When vss_project_key is provided, vss_project is always set to vss_project_key (no fallback)."""
     _load_config()
     if not _yaml_config or not project_name or not project_name.strip():
         return None
@@ -153,7 +154,7 @@ def get_vss_project_config(
             vss_config = proj.vss_projects.get(vss_project_key)
             if vss_config:
                 return {
-                    "vss_project": vss_config.vss_project,
+                    "vss_project": vss_project_key,
                     "s3_bucket": vss_config.s3_bucket,
                     "s3_prefix": vss_config.s3_prefix,
                 }

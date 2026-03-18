@@ -70,16 +70,47 @@ async def queue_embedding_job(
         }
 
     async def run_job() -> None:
+        logger.info(
+            "[embedding_service] run_job started job_id=%s project=%r FASTVSS_BASE_URL=%s",
+            job_id,
+            project,
+            FASTVSS_BASE_URL,
+        )
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 files = [
                     ("files", (os.path.basename(fp), data))
                     for fp, data in zip(local_filepaths, image_bytes_list)
                 ]
-                url = f"{FASTVSS_BASE_URL}/embeddings/{project}/"
+                url = f"{FASTVSS_BASE_URL}/embed/{project}"
+                logger.info(
+                    "[embedding_service] POST %s project=%r files=%d sizes=%s",
+                    url,
+                    project,
+                    len(files),
+                    [len(b) for b in image_bytes_list],
+                )
                 resp = await client.post(url, files=files)
+                logger.info(
+                    "[embedding_service] POST response status=%s url=%s",
+                    resp.status_code,
+                    str(resp.url),
+                )
+                if resp.history:
+                    for i, r in enumerate(resp.history):
+                        logger.info(
+                            "[embedding_service] redirect %d: %s -> %s",
+                            i + 1,
+                            r.status_code,
+                            r.headers.get("location", ""),
+                        )
                 resp.raise_for_status()
                 data = resp.json()
+                logger.info(
+                    "[embedding_service] POST json keys=%s job_id=%s",
+                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                    data.get("job_id") or data.get("job-id") if isinstance(data, dict) else None,
+                )
 
             fastvss_job_id = data.get("job_id") or data.get("job-id")
             if fastvss_job_id:
@@ -102,7 +133,13 @@ async def queue_embedding_job(
                     else:
                         ws_base = "ws://" + FASTVSS_BASE_URL
                     url = f"{ws_base}/ws/predict/job/{str(fastvss_job_id)}/{project}"
-                    logger.info("Connecting to WebSocket URL: %s", url)
+                    logger.info(
+                        "[embedding_service] WebSocket connect ws_base=%s job_id=%s project=%s url=%s",
+                        ws_base,
+                        fastvss_job_id,
+                        project,
+                        url,
+                    )
                     try:
                         async with websockets.connect(
                             url,
@@ -128,7 +165,13 @@ async def queue_embedding_job(
                                     return
                                 msg = json.loads(raw)
                                 status = msg.get("status")
+                                logger.debug(
+                                    "[embedding_service] WebSocket recv status=%s keys=%s",
+                                    status,
+                                    list(msg.keys()) if isinstance(msg, dict) else "n/a",
+                                )
                                 if status == "done":
+                                    logger.info("[embedding_service] WebSocket status=done")
                                     result = msg.get("result")
                                     emb = result if result is not None else msg
                                     async with _queue_lock:
@@ -140,27 +183,41 @@ async def queue_embedding_job(
                                         _job_map.pop(job_id, None)
                                     return
                                 if status == "failed":
+                                    err_msg = msg.get("message", "Job failed")
+                                    logger.warning(
+                                        "[embedding_service] WebSocket status=failed: %s",
+                                        err_msg,
+                                    )
                                     async with _queue_lock:
                                         _queue_results[job_id] = {
                                             "status": "failed",
                                             "embeddings": None,
-                                            "error": msg.get("message", "Job failed"),
+                                            "error": err_msg,
                                         }
                                         _job_map.pop(job_id, None)
                                     return
                                 if status == "error":
+                                    err_msg = msg.get("message", str(msg))
+                                    logger.warning(
+                                        "[embedding_service] WebSocket status=error: %s",
+                                        err_msg,
+                                    )
                                     async with _queue_lock:
                                         _queue_results[job_id] = {
                                             "status": "failed",
                                             "embeddings": None,
-                                            "error": msg.get("message", str(msg)),
+                                            "error": err_msg,
                                         }
                                         _job_map.pop(job_id, None)
                                     return
                     except Exception as e:
                         logger.warning(
-                            "Fast-VSS WebSocket failed for job %s: %s", job_id, e
+                            "[embedding_service] WebSocket failed job=%s: %s (%s)",
+                            job_id,
+                            e,
+                            type(e).__name__,
                         )
+                        logger.debug("[embedding_service] WebSocket exception", exc_info=True)
                         async with _queue_lock:
                             _queue_results[job_id] = {
                                 "status": "failed",
@@ -171,7 +228,11 @@ async def queue_embedding_job(
 
                 asyncio.create_task(wait_job())
             else:
-                # Sync response with embeddings
+                # Sync response with embeddings (no job_id, embeddings in response)
+                logger.info(
+                    "[embedding_service] Sync response (no job_id) keys=%s",
+                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                )
                 emb = data.get("embeddings") or data
                 if isinstance(emb, list):
                     async with _queue_lock:
@@ -188,7 +249,20 @@ async def queue_embedding_job(
                             "error": None,
                         }
         except Exception as e:
-            logger.exception("Fast-VSS embedding request failed")
+            err_detail = str(e)
+            resp_attrs = ""
+            if hasattr(e, "response") and e.response is not None:
+                r = e.response
+                resp_attrs = (
+                    f" response_status={r.status_code} response_url={r.url} "
+                    f"location={r.headers.get('location', '')}"
+                )
+            logger.exception(
+                "[embedding_service] POST failed: %s (%s)%s",
+                err_detail,
+                type(e).__name__,
+                resp_attrs,
+            )
             async with _queue_lock:
                 _queue_results[job_id] = {
                     "status": "failed",
@@ -206,3 +280,44 @@ async def get_or_poll_embedding_result(job_id: str) -> dict[str, Any] | None:
     clients poll GET /embed/{job_id} until status is not pending.
     """
     return _queue_results.get(job_id)
+
+
+# Minimal 1x1 PNG for WebSocket connectivity test (67 bytes)
+_FAKE_IMAGE_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00"
+    b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+_WS_TEST_TIMEOUT = 30.0
+_WS_TEST_POLL_INTERVAL = 0.5
+
+
+async def test_embedding_websocket(project: str = "default") -> tuple[bool, str | None]:
+    """
+    Send a fake 1x1 image to the embedding service and verify the WebSocket pipeline works.
+    Returns (success, error_message). Used by the launcher to gate the Load from Tator button.
+    """
+    if not FASTVSS_BASE_URL:
+        return False, "FASTVSS_API_URL is not set"
+    try:
+        job_id = await queue_embedding_job(
+            [_FAKE_IMAGE_PNG],
+            ["test_1x1.png"],
+            project=project,
+        )
+        deadline = time.monotonic() + _WS_TEST_TIMEOUT
+        while time.monotonic() < deadline:
+            result = _queue_results.get(job_id)
+            if result is None:
+                await asyncio.sleep(_WS_TEST_POLL_INTERVAL)
+                continue
+            status = result.get("status")
+            if status == "completed":
+                return True, None
+            if status == "failed":
+                return False, result.get("error") or "Job failed"
+            await asyncio.sleep(_WS_TEST_POLL_INTERVAL)
+        return False, "WebSocket test timed out"
+    except Exception as e:
+        return False, str(e)

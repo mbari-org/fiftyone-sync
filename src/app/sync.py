@@ -1540,24 +1540,60 @@ def _apply_loc_to_sample(
     project_id: int | None = None,
     version_id: int | None = None,
 ) -> None:
-    """Update an existing sample's metadata from a localization (ground_truth, confidence, tags, annotation, tator_modified_at)."""
+    """Update an existing sample's metadata from a localization (ground_truth, top1/top2_prediction, anomaly, primitives, annotation, tator_modified_at)."""
     label = _get_label_from_loc(loc)
-    sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
     attrs = loc.get("attributes") or {}
+    eid = loc.get("elemental_id") or loc.get("id")
+    logger.debug("_apply_loc_to_sample eid=%s raw attrs keys=%s", eid, list(attrs.keys()))
+
     score = attrs.get("score")
-    verified = attrs.get("verified")
+    sample["ground_truth"] = fo.Classification(
+        label=label,
+        confidence=float(score) if score is not None else 1.0,
+    )
+
+    predicted_label = attrs.get("predicted_label") or label
+
+    # top1_prediction: primary model prediction
+    top1_kwargs = {"label": predicted_label}
+    score_val = attrs.get("score")
+    if score_val is not None:
+        top1_kwargs["confidence"] = float(score_val)
+    sample["top1_prediction"] = fo.Classification(**top1_kwargs)
+
+    # top2_prediction: secondary/suggested label
     label_s = attrs.get("label_s")
-    cluster = attrs.get("cluster")
-    if score is not None:
-        sample["confidence"] = float(score)
-    # Replace tags with current values from loc (avoid stale label/cluster/verified)
-    sample.tags.clear()
-    if verified is not None and bool(verified):
-        sample.tags.append("verified")
-    if label_s is not None and "Unknown" not in label_s:
-        sample.tags.append(label_s)
-    if cluster is not None and "Unknown" not in cluster:
-        sample.tags.append(cluster)
+    score_s = attrs.get("score_s")
+    if label_s is not None or score_s is not None:
+        top2_kwargs = {"label": str(label_s) if label_s is not None else ""}
+        if score_s is not None:
+            top2_kwargs["confidence"] = float(score_s)
+        sample["top2_prediction"] = fo.Classification(**top2_kwargs)
+
+    # Primitive sample-level attributes
+    _PRIMITIVE_ATTR_MAP = (
+        ("anomaly_score", "anomaly_score", float),
+        ("depth", "depth", float),
+        ("altitude", "altitude", float),
+        ("saliency", "saliency", int),
+        ("area", "area", int),
+        ("cluster", "cluster", str),
+        ("comment", "comment", str),
+        ("verified", "verified", bool),
+    )
+    applied = {}
+    missing = []
+    for source, target, cast in _PRIMITIVE_ATTR_MAP:
+        val = attrs.get(source)
+        if val is not None:
+            sample[target] = cast(val)
+            applied[target] = cast(val)
+        else:
+            missing.append(source)
+    logger.debug(
+        "_apply_loc_to_sample eid=%s top1_prediction.label=%s applied=%s missing=%s",
+        eid, predicted_label, applied, missing,
+    )
     if api_url and project_id is not None:
         tator_url = _tator_localization_url(api_url, project_id, loc, version_id)
         if tator_url:
@@ -1633,24 +1669,28 @@ def reconcile_dataset_with_tator(
         media_id_to_stem = _media_id_to_stem_from_crops(crops_dir)
 
     # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator)
+    # values() with a single field returns a flat list; calling it twice and zipping avoids the
+    # multi-field return format (which yields one list-per-field, not one tuple-per-sample).
     logger.info("Reconcile: Remove samples deleted in Tator")
-    if tator_eids:
-        # Use list comprehension for faster collection of IDs to remove
-        # Access sample values directly without checking "in sample" each time
-        # This assumes elemental_id is always present - if not guaranteed, keep the original check
-        to_remove = [
-            s.id
-            for s in dataset
-            if getattr(s, "elemental_id", None) is not None
-            and str(s.elemental_id) not in tator_eids
-        ]
+    all_sample_ids = dataset.values("id", _enforce_natural_order=False)
+    all_eids = dataset.values("elemental_id", _enforce_natural_order=False)
+    to_remove: list[str] = []
+    dataset_eids: set[str] = set()
+    for sample_id, eid in zip(all_sample_ids, all_eids):
+        if eid is not None:
+            eid_str = str(eid)
+            if eid_str in tator_eids:
+                dataset_eids.add(eid_str)
+            elif tator_eids:
+                to_remove.append(sample_id)
 
-        if to_remove:
-            # Delete in batches if dataset is large (FiftyOne might handle this internally)
-            dataset.delete_samples(to_remove)
-            logger.info(
-                f"Reconcile: removed {len(to_remove)} samples (deleted in Tator)"
-            )
+    if to_remove:
+        dataset.delete_samples(to_remove)
+        logger.info(
+            f"Reconcile: removed {len(to_remove)} samples (deleted in Tator)"
+        )
+    elif tator_eids:
+        logger.info("Reconcile: no samples to remove (all present in Tator)")
     else:
         logger.info(
             "Reconcile: 0 localizations from Tator; skipping delete step (keeping existing samples)"
@@ -1670,13 +1710,22 @@ def reconcile_dataset_with_tator(
         if elemental_id and str(elemental_id) in loc_index:
             eid_to_sample[str(elemental_id)] = sample
 
-    # Now process only samples that have matching loc_index entries and have been modified
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
+    force_sync = bool(config.get("force_sync"))
+    if force_sync:
+        logger.info("Reconcile: force_sync enabled — rewriting all samples")
+
     samples_to_fix_storage: list[fo.Sample] = []
     for eid, sample in eid_to_sample.items():
         loc = loc_index[eid]
+
+        if force_sync:
+            samples_to_update.append((sample, loc))
+            updated += 1
+            continue
+
         modified_at = _to_datetime(
             loc.get("modified_datetime") or loc.get("created_datetime")
         )
@@ -1686,12 +1735,15 @@ def reconcile_dataset_with_tator(
         mod_ts = _normalize_modified_at(modified_at)
         last_ts = _normalize_modified_at(tator_modified_at)
 
+        has_prediction = sample.has_field("top1_prediction") and sample["top1_prediction"] is not None
         logger.debug(
-            f"====>Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at}"
+            f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at} has_prediction: {has_prediction}"
         )
-        if mod_ts is not None and mod_ts != last_ts:
+        needs_update = (mod_ts is not None and mod_ts != last_ts) or not has_prediction
+        if needs_update:
+            reason = "timestamp_changed" if (mod_ts is not None and mod_ts != last_ts) else "missing_prediction"
             logger.debug(
-                f"====>Sample {sample.id} needs update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at}"
+                f"Sample {sample.id} needs update ({reason}): {eid}"
             )
             samples_to_update.append((sample, loc))
             updated += 1
@@ -1718,12 +1770,7 @@ def reconcile_dataset_with_tator(
         logger.info(f"Reconcile: updated {updated} samples (box changed)")
 
     # 3. Add new samples (elemental_id in Tator but not in dataset)
-    # Use set for O(1) lookups
-    dataset_eids = {
-        str(s.elemental_id) for s in dataset if getattr(s, "elemental_id", None)
-    }
-
-    # Find new EIDs efficiently
+    # dataset_eids was built in step 1 via per-field values() calls
     new_eids = tator_eids - dataset_eids if tator_eids else set()
 
     # Apply max_samples limit
@@ -1836,6 +1883,8 @@ def build_fiftyone_dataset_from_crops(
         "*.tiff",
     ]
     max_samples = config.get("max_samples")
+    force_sync = bool(config.get("force_sync"))
+    dataset_already_exists = dataset_name in fo.list_datasets()
 
     # Load localizations index by elemental_id
     loc_index = _load_localizations_index(localizations_jsonl_path)
@@ -1874,10 +1923,8 @@ def build_fiftyone_dataset_from_crops(
             )
             sample = fo.Sample(filepath=sample_filepath)
             sample["local_filepath"] = filepath
-            sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
             sample["elemental_id"] = elemental_id
             sample["media_stem"] = media_stem
-            # Media-level attributes (Image type only), if provided in config
             media_attrs_map = config.get("media_attributes_map") or {}
             if loc:
                 media_id = loc.get("media")
@@ -1886,26 +1933,16 @@ def build_fiftyone_dataset_from_crops(
                     for k, v in media_attrs.items():
                         if v is not None:
                             sample[k] = v
-                # Localization attributes: confidence, verified, label_s, cluster (same as _create_sample_from_loc)
-                attrs = loc.get("attributes") or {}
-                score = attrs.get("score")
-                verified = attrs.get("verified")
-                label_s = attrs.get("label_s")
-                cluster = attrs.get("cluster")
-                if score is not None:
-                    sample["confidence"] = float(score)
-                if verified is not None and bool(verified):
-                    sample.tags.append("verified")
-                if label_s is not None and "Unknown" not in label_s:
-                    sample.tags.append(label_s)
-                if cluster is not None and "Unknown" not in cluster:
-                    sample.tags.append(cluster)
-                modified_at = loc.get("modified_datetime") or loc.get(
-                    "created_datetime"
-                )
-                dt = _to_datetime(modified_at)
-                if dt is not None:
-                    sample[TATOR_MODIFIED_AT_FIELD] = dt
+                if not dataset_already_exists or force_sync:
+                    _apply_loc_to_sample(
+                        sample,
+                        loc,
+                        api_url=config.get("api_url"),
+                        project_id=config.get("project_id"),
+                        version_id=config.get("version_id"),
+                    )
+            else:
+                sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
             samples.append(sample)
         if max_samples and len(samples) >= max_samples:
             break
@@ -1916,7 +1953,7 @@ def build_fiftyone_dataset_from_crops(
     logger.info(f"Collected {len(samples)} samples for dataset")
 
     # Handle existing dataset: always reconcile, never delete
-    if dataset_name in fo.list_datasets():
+    if dataset_already_exists:
         logger.info(f"Reconcile: loading dataset {dataset_name}...")
         dataset = fo.load_dataset(dataset_name)
         dataset.persistent = (
@@ -1930,6 +1967,7 @@ def build_fiftyone_dataset_from_crops(
             config=config,
             max_samples=max_samples,
         )
+        _ensure_field_indexes(dataset)
         logger.info(f"Reconcile: dataset {dataset_name} loaded")
         return dataset
 
@@ -1939,8 +1977,34 @@ def build_fiftyone_dataset_from_crops(
     dataset = fo.Dataset(dataset_name)
     dataset.persistent = True  # Persist dataset in MongoDB after session ends
     dataset.add_samples(samples)
+    _ensure_field_indexes(dataset)
     logger.info(f"Created dataset '{dataset_name}' with {len(samples)} samples")
     return dataset
+
+
+def _ensure_field_indexes(dataset: fo.Dataset) -> None:
+    """Create MongoDB indexes on classification and primitive fields for faster queries."""
+    for field_path in (
+        "elemental_id",  # Used by reconcile (values aggregation) and sync-to-tator
+        "ground_truth.label",
+        "ground_truth.confidence",
+        "top1_prediction.label",
+        "top1_prediction.confidence",
+        "top2_prediction.label",
+        "top2_prediction.confidence",
+        "anomaly_score",
+        "depth",
+        "altitude",
+        "saliency",
+        "area",
+        "cluster",
+        "comment",
+        "verified",
+    ):
+        try:
+            dataset.create_index(field_path)
+        except Exception:
+            pass
 
 
 DEFAULT_LABEL_ATTR = "Label"
@@ -2016,11 +2080,15 @@ def sync_edits_to_tator(
     score_attr: str | None = DEFAULT_SCORE_ATTR,
     debug: bool = False,
     project_name: str | None = None,
+    force_sync: bool = False,
 ) -> dict[str, Any]:
     """
     Push FiftyOne dataset edits (labels, confidence) back to Tator localizations.
     Matches samples by elemental_id; looks up localization id via get_localization_list,
     then updates attributes via update_localization(id, localization_update).
+    When force_sync=False (default), only samples whose last_modified_at is more than
+    1 minute after created_at are pushed, and tator_modified_at is set to last_modified_at.
+    When force_sync=True, all samples with attrs are pushed regardless of timestamps.
     Returns {"status": "ok", "updated": int, "failed": int, "errors": list} or raises.
     """
     db_entry = get_database_entry_or_enterprise_default(
@@ -2125,46 +2193,44 @@ def sync_edits_to_tator(
             attrs[label_attr] = str(label)
         if confidence is not None and score_attr:
             attrs[score_attr] = float(confidence)
+        if "verified" in sample:
+            verified_val = sample["verified"]
+            if verified_val is not None:
+                attrs["verified"] = bool(verified_val)
         if not attrs:
             continue
 
-        # Prefer tator_modified_at (normalize to datetime if stored as string/float)
-        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(
-            sample, TATOR_MODIFIED_AT_FIELD
-        ):
-            modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
-            if was_fixed:
-                sample.save()
-        else:
-            modified_at = (
-                sample["modified_datetime"] if "modified_datetime" in sample else None
+        # By default, only push samples modified more than 5 seconds after creation;
+        # force_sync=True bypasses this check and updates all samples.
+        last_modified_at = getattr(sample, "last_modified_at", None)
+        if not force_sync:
+            created_at_fo = getattr(sample, "created_at", None)
+            mod_ts = _normalize_modified_at(last_modified_at)
+            created_ts = _normalize_modified_at(created_at_fo)
+            allow_push = (
+                mod_ts is not None
+                and created_ts is not None
+                and (mod_ts - created_ts) > 5
             )
-            if isinstance(modified_at, float):
-                modified_at = datetime.fromtimestamp(modified_at)
-        created_at = (
-            sample["created_datetime"] if "created_datetime" in sample else None
-        )
-        # Allow push when we have no timestamps (our samples use tator_modified_at only), or when modified >= created
-        mod_ts = _normalize_modified_at(modified_at)
-        created_ts = _normalize_modified_at(created_at)
-        allow_push = (mod_ts is None and created_ts is None) or (
-            mod_ts is not None and (created_ts is None or mod_ts >= created_ts)
-        )
-        if allow_push:
-            try:
-                _update_localization_attributes(
-                    api, project_id, version_id, elemental_id, attrs
-                )
-                sample.save()
-                updated += 1
-            except Exception as e:
-                failed += 1
-                errors.append(f"Sample {sample.id}: {e}")
-        else:
-            skipped += 1
-            if _debug:
-                logger.info(f"SKIP elem={elemental_id} unchanged since creation")
-            continue
+            if not allow_push:
+                skipped += 1
+                if _debug:
+                    logger.info(
+                        f"SKIP elem={elemental_id} last_modified_at={last_modified_at} "
+                        f"created_at={created_at_fo} (need >1min diff)"
+                    )
+                continue
+
+        try:
+            _update_localization_attributes(
+                api, project_id, version_id, elemental_id, attrs
+            )
+            sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
+            sample.save()
+            updated += 1
+        except Exception as e:
+            failed += 1
+            errors.append(f"Sample {sample.id}: {e}")
 
     logger.info(
         f"sync_edits_to_tator: updated={updated} skipped={skipped} failed={failed}"
@@ -2473,9 +2539,10 @@ def sync_project_to_fiftyone(
             }
 
         # Inject Tator base URL and ids so sample "url" can link to the localization's media page
-        config["source_url"] = api_url.rstrip("/")
+        config["api_url"] = api_url.rstrip("/")
         config["project_id"] = project_id
         config["version_id"] = version_id
+        config["force_sync"] = force_sync
         # In enterprise/production, use S3 URIs for sample filepaths so FiftyOne loads from S3
         if s3_bucket:
             config["s3_bucket"] = s3_bucket
@@ -2613,16 +2680,11 @@ def sync_project_to_fiftyone(
         else:
             logger.info("No vss_project; skipping embeddings/UMAP")
 
-        # URL for the launcher: must use FIFTYONE_APP_PUBLIC_BASE_URL so the dashboard
-        # opens the correct FiftyOne app (e.g. maximilian.shore.mbari.org), always http.
-        # In enterprise mode, don't append port; use the base URL directly (e.g. https://mbari.fiftyone.ai)
-        public_url = os.environ.get(
+        # URL for the launcher: always use FIFTYONE_APP_PUBLIC_BASE_URL as-is (no port suffix).
+        # Include the full URL with any path prefix, e.g. https://cortex.shore.mbari.org/fiftyone
+        app_url = os.environ.get(
             "FIFTYONE_APP_PUBLIC_BASE_URL", "http://localhost"
-        ).strip()
-        if get_is_enterprise():
-            app_url = public_url.rstrip("/")
-        else:
-            app_url = f"{public_url.rstrip('/')}:{port}"
+        ).strip().rstrip("/")
         logger.info(f"FiftyOne app URL (FIFTYONE_APP_PUBLIC_BASE_URL): {app_url}")
 
         result = {
@@ -2767,7 +2829,9 @@ def main() -> None:
             fo.config.database_name = get_database_name(project_id, port, project_name)
             os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
             os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
-        config = config
+        config["api_url"] = host.rstrip("/")
+        config["project_id"] = project_id
+        config["version_id"] = version_id
         config["media_attributes_map"] = _build_media_attributes_map(
             api,
             project_id,
@@ -2786,6 +2850,155 @@ def main() -> None:
         logger.info(
             f"Dataset built. FiftyOne app should be running in another container on port {port}."
         )
+
+
+def check_dataset_exists_for_version(
+    project_id: int,
+    version_id: int,
+    port: int,
+    api_url: str,
+    token: str,
+    project_name: str | None = None,
+    database_uri: str | None = None,
+    database_name: str | None = None,
+) -> dict[str, Any]:
+    """Check whether a FiftyOne dataset exists for the given version/port.
+
+    Returns {"exists": bool, "dataset_name": str | None, "database_name": str}.
+    """
+    resolved_db = (
+        database_name.strip() if database_name and database_name.strip() else None
+    ) or get_database_name(project_id, port, project_name=project_name)
+    resolved_uri = (
+        database_uri.strip() if database_uri and database_uri.strip() else None
+    ) or get_database_uri(project_id, port, project_name=project_name)
+
+    if not get_is_enterprise():
+        fo.config.database_uri = resolved_uri
+        fo.config.database_name = resolved_db
+        os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
+        os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
+
+    try:
+        if get_is_enterprise():
+            _test_fiftyone_connection()
+        else:
+            _test_mongodb_connection(resolved_uri)
+    except ConnectionError as exc:
+        raise RuntimeError(f"Connection check failed: {exc}") from exc
+
+    host = api_url.rstrip("/")
+    api = tator.get_api(host, token)
+    ds_name = _default_dataset_name(api, project_id, version_id)
+    ds_name_with_port = _dataset_name_with_port(ds_name, port)
+
+    project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
+    port_suffix = f"_{port}"
+    version_part = f"_v{version_id}"
+
+    available = fo.list_datasets()
+
+    def _find_match() -> str | None:
+        if ds_name_with_port in available:
+            return ds_name_with_port
+        if ds_name in available:
+            return ds_name
+        for d in available:
+            if d.startswith(project_prefix) and version_part in d and d.endswith(port_suffix):
+                return d
+        return None
+
+    target = _find_match()
+    return {
+        "exists": target is not None,
+        "dataset_name": target,
+        "database_name": resolved_db,
+    }
+
+
+def delete_dataset_for_version(
+    project_id: int,
+    version_id: int,
+    port: int,
+    api_url: str,
+    token: str,
+    project_name: str | None = None,
+    database_uri: str | None = None,
+    database_name: str | None = None,
+) -> dict[str, Any]:
+    """Delete the FiftyOne dataset (MongoDB) and JSONL cache for a specific version/port.
+
+    Only removes the MongoDB dataset and the localizations JSONL file.
+    Crop images and downloaded media are intentionally preserved.
+    Returns {"status": "ok", "deleted": str, "database_name": str, "jsonl_deleted": bool}.
+    """
+    resolved_db = (
+        database_name.strip() if database_name and database_name.strip() else None
+    ) or get_database_name(project_id, port, project_name=project_name)
+    resolved_uri = (
+        database_uri.strip() if database_uri and database_uri.strip() else None
+    ) or get_database_uri(project_id, port, project_name=project_name)
+
+    if not get_is_enterprise():
+        fo.config.database_uri = resolved_uri
+        fo.config.database_name = resolved_db
+        os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
+        os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
+
+    try:
+        if get_is_enterprise():
+            _test_fiftyone_connection()
+        else:
+            _test_mongodb_connection(resolved_uri)
+    except ConnectionError as exc:
+        raise RuntimeError(f"Connection check failed: {exc}") from exc
+
+    host = api_url.rstrip("/")
+    api = tator.get_api(host, token)
+    ds_name = _default_dataset_name(api, project_id, version_id)
+    ds_name_with_port = _dataset_name_with_port(ds_name, port)
+
+    project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
+    port_suffix = f"_{port}"
+    version_part = f"_v{version_id}"
+
+    available = fo.list_datasets()
+
+    def _find_match() -> str | None:
+        if ds_name_with_port in available:
+            return ds_name_with_port
+        if ds_name in available:
+            return ds_name
+        for d in available:
+            if d.startswith(project_prefix) and version_part in d and d.endswith(port_suffix):
+                return d
+        return None
+
+    target = _find_match()
+    if target is None:
+        return {
+            "status": "ok",
+            "deleted": None,
+            "database_name": resolved_db,
+            "message": f"No dataset found for version {version_id} (looked for '{ds_name_with_port}')",
+        }
+
+    fo.delete_dataset(target)
+    logger.info(f"Deleted dataset '{target}' from database {resolved_db}")
+
+    jsonl_path = _localizations_jsonl_path(project_id, version_id)
+    jsonl_deleted = False
+    if os.path.isfile(jsonl_path):
+        os.remove(jsonl_path)
+        jsonl_deleted = True
+        logger.info(f"Deleted JSONL file: {jsonl_path}")
+
+    return {
+        "status": "ok",
+        "deleted": target,
+        "database_name": resolved_db,
+        "jsonl_deleted": jsonl_deleted,
+    }
 
 
 if __name__ == "__main__":

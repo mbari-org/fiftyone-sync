@@ -39,6 +39,7 @@ from src.app.embedding_service import (
     FASTVSS_BASE_URL,
     get_or_poll_embedding_result,
     queue_embedding_job,
+    test_embedding_websocket,
 )
 from src.app.launcher_template import LAUNCHER_TEMPLATE
 from src.app.sync_lock import LOCK_KEY_PREFIX
@@ -128,7 +129,12 @@ async def prometheus_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def cleanup_locks_on_startup():
-    """Clean all sync lock keys from Redis on startup to prevent stale locks."""
+    """Configure logging from LOG_LEVEL env and clean sync locks."""
+    log_level = os.environ.get("LOG_LEVEL", "").strip().upper()
+    if log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+        level = getattr(logging, log_level)
+        logging.getLogger("src.app").setLevel(level)
+        logger.info("Set src.app logging level to %s", log_level)
     try:
         from src.app.sync_lock import cleanup_all_sync_locks
 
@@ -228,6 +234,32 @@ async def get_vss_embedding() -> dict:
             status_code=503,
             detail=f"Embedding service unavailable: {e!s}",
         ) from e
+
+
+@router.get("/vss-embedding/ws-test")
+async def get_vss_embedding_ws_test(
+    project: str = Query(
+        ...,
+        description="VSS project key for Fast-VSS /embeddings/{project}/ (required, no fallback)",
+    ),
+) -> dict:
+    """
+    Send a fake image to the embedding service and verify the WebSocket pipeline works.
+    Returns {"ok": true} on success, 503 with {"detail": "..."} on failure.
+    Used by the launcher to gate the Load from Tator button.
+    """
+    if not project or not project.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="project (vss_project_key) is required",
+        ) from None
+    ok, error = await test_embedding_websocket(project=project.strip())
+    if ok:
+        return {"ok": True}
+    raise HTTPException(
+        status_code=503,
+        detail=error or "WebSocket test failed",
+    ) from None
 
 
 # --- Launcher (HostedTemplate) ---
@@ -331,9 +363,9 @@ async def render_launcher() -> HTMLResponse:
     Return Jinja2 template for HostedTemplate. Tator fetches this URL and renders with tparams.
     Required tparams: project (Tator project ID). Optional: iframe_host (host for app URL), base_port (5151), project_name (vss_project for embedding status only).
     The applet uses GET /database-info?project_id=... to resolve port and database from DatabaseUriConfig.
-    When the sync worker runs on a different host than the API, set FIFTYONE_APP_PUBLIC_BASE_URL in the worker
-    environment to the hostname the browser can use to reach the FiftyOne app (e.g. worker host); the sync
-    result will include app_url and the applet will open that URL.
+    Set FIFTYONE_APP_PUBLIC_BASE_URL to the full base URL for the FiftyOne app
+    (e.g. https://cortex.shore.mbari.org/fiftyone). The sync result includes app_url
+    (used as-is, no port suffix) and the applet opens that URL.
     "Open FiftyOne" opens the app in a new window. For sync: set sync_service_url and api_url; the user enters their Tator API token in the applet and clicks "Verify Token" to enable Sync from Tator / Sync to Tator.
     Embedding service status: server uses FASTVSS_API_URL; applet calls GET /vss-embedding to show availability and project registration.
     """
@@ -566,6 +598,10 @@ async def sync_to_tator(
         False,
         description="Print per-sample SKIP/UPDATE debug (or set FIFTYONE_SYNC_DEBUG=1)",
     ),
+    force_sync: bool = Query(
+        False,
+        description="When False (default), only push samples whose last_modified_at is >1 min after created_at; when True, push all samples regardless of timestamps",
+    ),
 ) -> dict:
     """
     Push FiftyOne dataset edits (labels, confidence) back to Tator localizations.
@@ -596,6 +632,113 @@ async def sync_to_tator(
             score_attr=score_attr,
             debug=debug,
             project_name=project_name.strip(),
+            force_sync=force_sync,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app_launch.get("/dataset-exists")
+async def dataset_exists(
+    project_id: int = Query(..., description="Tator project ID"),
+    version_id: int = Query(..., description="Tator version ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    port: int = Query(..., description="Port for this project"),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> dict:
+    """Check whether a FiftyOne dataset exists for a specific version/port."""
+    token = _token_from_authorization(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid Authorization header"
+        )
+    project_name: str | None = None
+    try:
+        import tator
+
+        api = tator.get_api(_resolve_api_url(api_url), token)
+        proj = api.get_project(project_id)
+        project_name = getattr(proj, "name", None) or str(project_id)
+    except Exception as e:
+        logger.warning(f"dataset_exists get_project({project_id}) failed: {e}")
+    if not project_name or not project_name.strip():
+        project_name = str(project_id)
+    project_name = project_name.strip()
+
+    database_entry = get_database_entry_or_enterprise_default(
+        project_id, port, project_name=project_name
+    )
+    if database_entry is None:
+        return {"exists": False, "dataset_name": None}
+
+    try:
+        from src.app.sync import check_dataset_exists_for_version
+
+        return check_dataset_exists_for_version(
+            project_id=project_id,
+            version_id=version_id,
+            port=database_entry.port,
+            api_url=_resolve_api_url(api_url),
+            token=token,
+            project_name=project_name,
+            database_name=database_name_from_uri(database_entry.uri),
+        )
+    except Exception as e:
+        logger.warning(f"dataset_exists check failed: {e}")
+        return {"exists": False, "dataset_name": None}
+
+
+@app_launch.post("/delete-dataset")
+async def delete_dataset(
+    project_id: int = Query(..., description="Tator project ID"),
+    version_id: int = Query(..., description="Tator version ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    port: int = Query(..., description="Port for this project"),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> dict:
+    """
+    Delete the FiftyOne dataset for a specific version/port. Requires authentication.
+    Returns {"status": "ok", "deleted": str | None, "database_name": str}.
+    """
+    token = _token_from_authorization(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid Authorization header"
+        )
+    project_name: str | None = None
+    try:
+        import tator
+
+        api = tator.get_api(_resolve_api_url(api_url), token)
+        proj = api.get_project(project_id)
+        project_name = getattr(proj, "name", None) or str(project_id)
+    except Exception as e:
+        logger.warning(f"delete_dataset get_project({project_id}) failed: {e}")
+    if not project_name or not project_name.strip():
+        project_name = str(project_id)
+    project_name = project_name.strip()
+
+    database_entry = get_database_entry_or_enterprise_default(
+        project_id, port, project_name=project_name
+    )
+    if database_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No DatabaseUriConfig entry for project_id={project_id}",
+        )
+
+    try:
+        from src.app.sync import delete_dataset_for_version
+
+        result = delete_dataset_for_version(
+            project_id=project_id,
+            version_id=version_id,
+            port=database_entry.port,
+            api_url=_resolve_api_url(api_url),
+            token=token,
+            project_name=project_name,
+            database_name=database_name_from_uri(database_entry.uri),
         )
         return result
     except Exception as e:
