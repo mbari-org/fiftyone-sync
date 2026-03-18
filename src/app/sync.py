@@ -2196,33 +2196,22 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        # Prefer tator_modified_at (normalize to datetime if stored as string/float)
-        if TATOR_MODIFIED_AT_FIELD in sample or hasattr(
-            sample, TATOR_MODIFIED_AT_FIELD
-        ):
-            modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
-            if was_fixed:
-                sample.save()
-        else:
-            modified_at = (
-                sample["modified_datetime"] if "modified_datetime" in sample else None
-            )
-            if isinstance(modified_at, float):
-                modified_at = datetime.fromtimestamp(modified_at)
-        created_at = (
-            sample["created_datetime"] if "created_datetime" in sample else None
-        )
-        # Allow push when we have no timestamps (our samples use tator_modified_at only), or when modified >= created
-        mod_ts = _normalize_modified_at(modified_at)
-        created_ts = _normalize_modified_at(created_at)
-        allow_push = (mod_ts is None and created_ts is None) or (
-            mod_ts is not None and (created_ts is None or mod_ts >= created_ts)
+        # Only push if FiftyOne's last_modified_at is more than 1 minute after created_at
+        last_modified_at = getattr(sample, "last_modified_at", None)
+        created_at_fo = getattr(sample, "created_at", None)
+        mod_ts = _normalize_modified_at(last_modified_at)
+        created_ts = _normalize_modified_at(created_at_fo)
+        allow_push = (
+            mod_ts is not None
+            and created_ts is not None
+            and (mod_ts - created_ts) > 60
         )
         if allow_push:
             try:
                 _update_localization_attributes(
                     api, project_id, version_id, elemental_id, attrs
                 )
+                sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
                 sample.save()
                 updated += 1
             except Exception as e:
@@ -2231,7 +2220,10 @@ def sync_edits_to_tator(
         else:
             skipped += 1
             if _debug:
-                logger.info(f"SKIP elem={elemental_id} unchanged since creation")
+                logger.info(
+                    f"SKIP elem={elemental_id} last_modified_at={last_modified_at} "
+                    f"created_at={created_at_fo} (need >1min diff)"
+                )
             continue
 
     logger.info(
