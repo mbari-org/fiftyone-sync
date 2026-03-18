@@ -1669,24 +1669,30 @@ def reconcile_dataset_with_tator(
         media_id_to_stem = _media_id_to_stem_from_crops(crops_dir)
 
     # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator)
+    # Use values() to fetch only id and elemental_id in one MongoDB aggregation (avoids loading full samples)
     logger.info("Reconcile: Remove samples deleted in Tator")
-    if tator_eids:
-        # Use list comprehension for faster collection of IDs to remove
-        # Access sample values directly without checking "in sample" each time
-        # This assumes elemental_id is always present - if not guaranteed, keep the original check
-        to_remove = [
-            s.id
-            for s in dataset
-            if getattr(s, "elemental_id", None) is not None
-            and str(s.elemental_id) not in tator_eids
-        ]
+    vals = list(
+        dataset.values(["id", "elemental_id"], _enforce_natural_order=False)
+    )
+    to_remove: list[str] = []
+    dataset_eids: set[str] = set()
+    for v in vals:
+        sample_id = v.get("id") or v.get("value0")
+        eid = v.get("elemental_id") or v.get("value1")
+        if eid:
+            eid_str = str(eid)
+            if eid_str in tator_eids:
+                dataset_eids.add(eid_str)
+            elif tator_eids:
+                to_remove.append(sample_id)
 
-        if to_remove:
-            # Delete in batches if dataset is large (FiftyOne might handle this internally)
-            dataset.delete_samples(to_remove)
-            logger.info(
-                f"Reconcile: removed {len(to_remove)} samples (deleted in Tator)"
-            )
+    if to_remove:
+        dataset.delete_samples(to_remove)
+        logger.info(
+            f"Reconcile: removed {len(to_remove)} samples (deleted in Tator)"
+        )
+    elif tator_eids:
+        logger.info("Reconcile: no samples to remove (all present in Tator)")
     else:
         logger.info(
             "Reconcile: 0 localizations from Tator; skipping delete step (keeping existing samples)"
@@ -1766,11 +1772,7 @@ def reconcile_dataset_with_tator(
         logger.info(f"Reconcile: updated {updated} samples (box changed)")
 
     # 3. Add new samples (elemental_id in Tator but not in dataset)
-    # Use set for O(1) lookups
-    dataset_eids = {
-        str(s.elemental_id) for s in dataset if getattr(s, "elemental_id", None)
-    }
-
+    # dataset_eids already computed in step 1 (from values() aggregation)
     # Find new EIDs efficiently
     new_eids = tator_eids - dataset_eids if tator_eids else set()
 
@@ -1986,6 +1988,7 @@ def build_fiftyone_dataset_from_crops(
 def _ensure_field_indexes(dataset: fo.Dataset) -> None:
     """Create MongoDB indexes on classification and primitive fields for faster queries."""
     for field_path in (
+        "elemental_id",  # Used by reconcile (values aggregation) and sync-to-tator
         "ground_truth.label",
         "ground_truth.confidence",
         "top1_prediction.label",
