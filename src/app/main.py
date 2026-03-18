@@ -598,6 +598,10 @@ async def sync_to_tator(
         False,
         description="Print per-sample SKIP/UPDATE debug (or set FIFTYONE_SYNC_DEBUG=1)",
     ),
+    force_sync: bool = Query(
+        False,
+        description="When False (default), only push samples whose last_modified_at is >1 min after created_at; when True, push all samples regardless of timestamps",
+    ),
 ) -> dict:
     """
     Push FiftyOne dataset edits (labels, confidence) back to Tator localizations.
@@ -628,6 +632,7 @@ async def sync_to_tator(
             score_attr=score_attr,
             debug=debug,
             project_name=project_name.strip(),
+            force_sync=force_sync,
         )
         return result
     except Exception as e:

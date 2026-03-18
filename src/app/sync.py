@@ -2080,11 +2080,15 @@ def sync_edits_to_tator(
     score_attr: str | None = DEFAULT_SCORE_ATTR,
     debug: bool = False,
     project_name: str | None = None,
+    force_sync: bool = False,
 ) -> dict[str, Any]:
     """
     Push FiftyOne dataset edits (labels, confidence) back to Tator localizations.
     Matches samples by elemental_id; looks up localization id via get_localization_list,
     then updates attributes via update_localization(id, localization_update).
+    When force_sync=False (default), only samples whose last_modified_at is more than
+    1 minute after created_at are pushed, and tator_modified_at is set to last_modified_at.
+    When force_sync=True, all samples with attrs are pushed regardless of timestamps.
     Returns {"status": "ok", "updated": int, "failed": int, "errors": list} or raises.
     """
     db_entry = get_database_entry_or_enterprise_default(
@@ -2196,35 +2200,37 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        # Only push if FiftyOne's last_modified_at is more than 1 minute after created_at
+        # By default, only push samples modified more than 1 minute after creation;
+        # force_sync=True bypasses this check and updates all samples.
         last_modified_at = getattr(sample, "last_modified_at", None)
-        created_at_fo = getattr(sample, "created_at", None)
-        mod_ts = _normalize_modified_at(last_modified_at)
-        created_ts = _normalize_modified_at(created_at_fo)
-        allow_push = (
-            mod_ts is not None
-            and created_ts is not None
-            and (mod_ts - created_ts) > 60
-        )
-        if allow_push:
-            try:
-                _update_localization_attributes(
-                    api, project_id, version_id, elemental_id, attrs
-                )
-                sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
-                sample.save()
-                updated += 1
-            except Exception as e:
-                failed += 1
-                errors.append(f"Sample {sample.id}: {e}")
-        else:
-            skipped += 1
-            if _debug:
-                logger.info(
-                    f"SKIP elem={elemental_id} last_modified_at={last_modified_at} "
-                    f"created_at={created_at_fo} (need >1min diff)"
-                )
-            continue
+        if not force_sync:
+            created_at_fo = getattr(sample, "created_at", None)
+            mod_ts = _normalize_modified_at(last_modified_at)
+            created_ts = _normalize_modified_at(created_at_fo)
+            allow_push = (
+                mod_ts is not None
+                and created_ts is not None
+                and (mod_ts - created_ts) > 60
+            )
+            if not allow_push:
+                skipped += 1
+                if _debug:
+                    logger.info(
+                        f"SKIP elem={elemental_id} last_modified_at={last_modified_at} "
+                        f"created_at={created_at_fo} (need >1min diff)"
+                    )
+                continue
+
+        try:
+            _update_localization_attributes(
+                api, project_id, version_id, elemental_id, attrs
+            )
+            sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
+            sample.save()
+            updated += 1
+        except Exception as e:
+            failed += 1
+            errors.append(f"Sample {sample.id}: {e}")
 
     logger.info(
         f"sync_edits_to_tator: updated={updated} skipped={skipped} failed={failed}"
