@@ -1677,8 +1677,13 @@ def reconcile_dataset_with_tator(
     to_remove: list[str] = []
     dataset_eids: set[str] = set()
     for v in vals:
-        sample_id = v.get("id") or v.get("value0")
-        eid = v.get("elemental_id") or v.get("value1")
+        if isinstance(v, (list, tuple)) and len(v) >= 2:
+            sample_id, eid = v[0], v[1]
+        elif isinstance(v, dict):
+            sample_id = v.get("id") or v.get("value0")
+            eid = v.get("elemental_id") or v.get("value1")
+        else:
+            continue
         if eid:
             eid_str = str(eid)
             if eid_str in tator_eids:

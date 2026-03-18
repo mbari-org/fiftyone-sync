@@ -550,6 +550,9 @@ LAUNCHER_TEMPLATE = r"""
                       }
                       if (s.status === 'finished' && s.result) {
                         var res = s.result;
+                        if (!res || typeof res !== 'object' || Array.isArray(res)) {
+                          res = {};
+                        }
                         if (res.status === 'busy' || res.status === 'error') {
                           syncStatus.textContent = res.message || 'Sync failed. Please try again in a few minutes.';
                           syncStatus.classList.add('error');
@@ -595,10 +598,11 @@ LAUNCHER_TEMPLATE = r"""
                 poll();
                 return;
               }
-              syncStatus.textContent = data.sample_count != null
-                ? 'Sync done. ' + data.sample_count + ' samples.'
+              var dataObj = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+              syncStatus.textContent = dataObj.sample_count != null
+                ? 'Sync done. ' + dataObj.sample_count + ' samples.'
                 : 'Sync done.';
-              var baseUrl = (data.app_url || 'http://localhost:' + port).replace(/\/$/, '');
+              var baseUrl = (dataObj.app_url || 'http://localhost:' + port).replace(/\/$/, '');
               var openUrl = baseUrl + '/';
               if (fiftyoneAppLink) {
                 fiftyoneAppLink.href = openUrl;
