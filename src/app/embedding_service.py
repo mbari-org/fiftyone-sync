@@ -206,3 +206,44 @@ async def get_or_poll_embedding_result(job_id: str) -> dict[str, Any] | None:
     clients poll GET /embed/{job_id} until status is not pending.
     """
     return _queue_results.get(job_id)
+
+
+# Minimal 1x1 PNG for WebSocket connectivity test (67 bytes)
+_FAKE_IMAGE_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00"
+    b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+_WS_TEST_TIMEOUT = 30.0
+_WS_TEST_POLL_INTERVAL = 0.5
+
+
+async def test_embedding_websocket(project: str = "default") -> tuple[bool, str | None]:
+    """
+    Send a fake 1x1 image to the embedding service and verify the WebSocket pipeline works.
+    Returns (success, error_message). Used by the launcher to gate the Load from Tator button.
+    """
+    if not FASTVSS_BASE_URL:
+        return False, "FASTVSS_API_URL is not set"
+    try:
+        job_id = await queue_embedding_job(
+            [_FAKE_IMAGE_PNG],
+            ["test_1x1.png"],
+            project=project,
+        )
+        deadline = time.monotonic() + _WS_TEST_TIMEOUT
+        while time.monotonic() < deadline:
+            result = _queue_results.get(job_id)
+            if result is None:
+                await asyncio.sleep(_WS_TEST_POLL_INTERVAL)
+                continue
+            status = result.get("status")
+            if status == "completed":
+                return True, None
+            if status == "failed":
+                return False, result.get("error") or "Job failed"
+            await asyncio.sleep(_WS_TEST_POLL_INTERVAL)
+        return False, "WebSocket test timed out"
+    except Exception as e:
+        return False, str(e)

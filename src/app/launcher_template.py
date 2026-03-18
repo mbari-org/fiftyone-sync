@@ -160,6 +160,7 @@ LAUNCHER_TEMPLATE = r"""
       var datasetExists = false;
       var vssProjectKey = '';
       var vssProjectsData = [];  // full list from /vss-projects: [{key, name}]; embedding service URL is global
+      var embeddingServiceReady = false;  // true when WS test passed or service not configured
       function getToken() {
         return tokenInput ? tokenInput.value.trim() : '';
       }
@@ -186,19 +187,21 @@ LAUNCHER_TEMPLATE = r"""
           var selOpt = versionSelect.options[versionSelect.selectedIndex];
           versionSelect.title = selOpt ? (selOpt.getAttribute('data-description') || '') : '';
         }
-        if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry;
-        if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
+        updateSyncButtonsState();
         datasetExists = false;
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = true;
         if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
+      }
+      function updateSyncButtonsState() {
+        if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry || !embeddingServiceReady;
+        if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
+        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
       }
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
         if (versionSelect) versionSelect.disabled = !enabled;
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
-        if (syncBtn) syncBtn.disabled = !enabled || !hasDatabaseEntry;
-        if (syncToTatorBtn) syncToTatorBtn.disabled = !enabled || !hasDatabaseEntry || !versionId;
-        if (deleteDatasetBtn) deleteDatasetBtn.disabled = !enabled || !hasDatabaseEntry || !versionId || !datasetExists;
+        updateSyncButtonsState();
       }
       function checkDatasetExists() {
         var token = getToken();
@@ -212,7 +215,7 @@ LAUNCHER_TEMPLATE = r"""
             if (!data) return;
             if (versionId !== v) return;
             datasetExists = !!data.exists;
-            if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
+            updateSyncButtonsState();
           })
           .catch(function() {});
       }
@@ -397,9 +400,25 @@ LAUNCHER_TEMPLATE = r"""
         var base = syncServiceUrl || window.location.origin;
         var url = base.replace(/\/$/, '') + '/vss-embedding';
         var checkName = getSelectedVssProjectName();
+        embeddingServiceReady = false;
+        updateSyncButtonsState();
         fetch(url)
           .then(function(r) {
-            if (!r.ok) throw new Error(r.status === 503 ? (r.statusText || 'Service unavailable') : (r.status + ' ' + r.statusText));
+            if (!r.ok) {
+              return r.json().catch(function() { return { detail: r.statusText }; }).then(function(d) {
+                var detail = (d && d.detail) ? d.detail : '';
+                if (detail.indexOf('not set') !== -1) {
+                  embeddingServiceReady = true;
+                  el.textContent = 'Not configured (Load from Tator works without embeddings)';
+                  el.classList.remove('error');
+                } else {
+                  el.textContent = detail || 'Service unavailable';
+                  el.classList.add('error');
+                }
+                updateSyncButtonsState();
+                throw null;
+              });
+            }
             return r.json();
           })
           .then(function(data) {
@@ -407,19 +426,39 @@ LAUNCHER_TEMPLATE = r"""
             if (checkName) {
               var inList = projects.indexOf(checkName) !== -1;
               el.textContent = inList
-                ? 'Available, project registered'
-                : 'Available, but project not registered; cannot compute embeddings or UMAP but you can still edit the localizations';
+                ? 'Checking WebSocket…'
+                : 'Available, but project not registered; checking WebSocket…';
               if (!inList) el.classList.add('error');
               else el.classList.remove('error');
             } else {
-              el.textContent = 'Available (' + (projects.length || 0) + ' project(s)); set project_name tparam (vss_project) to check this project';
+              el.textContent = 'Checking WebSocket…';
               el.classList.remove('error');
             }
+            var wsTestUrl = base.replace(/\/$/, '') + '/vss-embedding/ws-test?project=' + encodeURIComponent(checkName || 'default');
+            return fetch(wsTestUrl).then(function(wsR) {
+              if (wsR.ok) {
+                embeddingServiceReady = true;
+                if (checkName) {
+                  var inList = projects.indexOf(checkName) !== -1;
+                  el.textContent = inList
+                    ? 'Available, project registered'
+                    : 'Available, but project not registered; cannot compute embeddings or UMAP but you can still edit the localizations';
+                  if (!inList) el.classList.add('error');
+                  else el.classList.remove('error');
+                } else {
+                  el.textContent = 'Available (' + (projects.length || 0) + ' project(s)); set project_name tparam (vss_project) to check this project';
+                  el.classList.remove('error');
+                }
+              } else {
+                return wsR.json().catch(function() { return { detail: 'WebSocket test failed' }; }).then(function(d) {
+                  el.textContent = (d && d.detail) ? d.detail : 'WebSocket test failed';
+                  el.classList.add('error');
+                });
+              }
+            });
           })
-          .catch(function(err) {
-            el.textContent = err.message || 'Network error';
-            el.classList.add('error');
-          });
+          .then(function() { updateSyncButtonsState(); })
+          .catch(function(err) { if (err) { el.textContent = err.message || 'Network error'; el.classList.add('error'); updateSyncButtonsState(); } });
       }
       checkEmbeddingService();
       if (syncBtn && syncStatus && syncServiceUrl && apiUrl) {

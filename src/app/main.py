@@ -39,6 +39,7 @@ from src.app.embedding_service import (
     FASTVSS_BASE_URL,
     get_or_poll_embedding_result,
     queue_embedding_job,
+    test_embedding_websocket,
 )
 from src.app.launcher_template import LAUNCHER_TEMPLATE
 from src.app.sync_lock import LOCK_KEY_PREFIX
@@ -228,6 +229,27 @@ async def get_vss_embedding() -> dict:
             status_code=503,
             detail=f"Embedding service unavailable: {e!s}",
         ) from e
+
+
+@router.get("/vss-embedding/ws-test")
+async def get_vss_embedding_ws_test(
+    project: str = Query(
+        "default",
+        description="Project name for Fast-VSS /embeddings/{project}/",
+    ),
+) -> dict:
+    """
+    Send a fake image to the embedding service and verify the WebSocket pipeline works.
+    Returns {"ok": true} on success, 503 with {"detail": "..."} on failure.
+    Used by the launcher to gate the Load from Tator button.
+    """
+    ok, error = await test_embedding_websocket(project=project)
+    if ok:
+        return {"ok": True}
+    raise HTTPException(
+        status_code=503,
+        detail=error or "WebSocket test failed",
+    ) from None
 
 
 # --- Launcher (HostedTemplate) ---
