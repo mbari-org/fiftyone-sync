@@ -5,8 +5,7 @@ and downstream model iteration.
 
 See https://docs.mbari.org/internal/ai/videos/voxel51demo.gif for demo of the community Voxel51 tool.
 
-Supports both Voxel51 Community and Enterprise sync.  Syncing is done by version
-through a simple applet.
+Supports both [Voxel51 Community](https://github.com/voxel51/fiftyone) and Voxel51 Enterprise sync.  Syncing is done by version through a simple applet.
 
 ### Applet for Tator dashboard to sync to Voxel51. When syncing is done, a clickable link is provided.
 ![template_applet.png](docs/imgs/template_applet.png)
@@ -14,6 +13,8 @@ through a simple applet.
 ![embedding_grid.png](docs/imgs/embedding_grid.png)
 ### Example Voxel51 similarity search view
 ![sim_search.png](docs/imgs/sim_search.png)
+### FastAPI
+![fastapi.png](docs/imgs/fastapi.png)
 
 ## Architecture
 
