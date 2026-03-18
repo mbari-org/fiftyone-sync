@@ -1669,22 +1669,15 @@ def reconcile_dataset_with_tator(
         media_id_to_stem = _media_id_to_stem_from_crops(crops_dir)
 
     # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator)
-    # Use values() to fetch only id and elemental_id in one MongoDB aggregation (avoids loading full samples)
+    # values() with a single field returns a flat list; calling it twice and zipping avoids the
+    # multi-field return format (which yields one list-per-field, not one tuple-per-sample).
     logger.info("Reconcile: Remove samples deleted in Tator")
-    vals = list(
-        dataset.values(["id", "elemental_id"], _enforce_natural_order=False)
-    )
+    all_sample_ids = dataset.values("id", _enforce_natural_order=False)
+    all_eids = dataset.values("elemental_id", _enforce_natural_order=False)
     to_remove: list[str] = []
     dataset_eids: set[str] = set()
-    for v in vals:
-        if isinstance(v, (list, tuple)) and len(v) >= 2:
-            sample_id, eid = v[0], v[1]
-        elif isinstance(v, dict):
-            sample_id = v.get("id") or v.get("value0")
-            eid = v.get("elemental_id") or v.get("value1")
-        else:
-            continue
-        if eid:
+    for sample_id, eid in zip(all_sample_ids, all_eids):
+        if eid is not None:
             eid_str = str(eid)
             if eid_str in tator_eids:
                 dataset_eids.add(eid_str)
@@ -1777,8 +1770,7 @@ def reconcile_dataset_with_tator(
         logger.info(f"Reconcile: updated {updated} samples (box changed)")
 
     # 3. Add new samples (elemental_id in Tator but not in dataset)
-    # dataset_eids already computed in step 1 (from values() aggregation)
-    # Find new EIDs efficiently
+    # dataset_eids was built in step 1 via per-field values() calls
     new_eids = tator_eids - dataset_eids if tator_eids else set()
 
     # Apply max_samples limit
