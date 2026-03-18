@@ -129,7 +129,12 @@ async def prometheus_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def cleanup_locks_on_startup():
-    """Clean all sync lock keys from Redis on startup to prevent stale locks."""
+    """Configure logging from LOG_LEVEL env and clean sync locks."""
+    log_level = os.environ.get("LOG_LEVEL", "").strip().upper()
+    if log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+        level = getattr(logging, log_level)
+        logging.getLogger("src.app").setLevel(level)
+        logger.info("Set src.app logging level to %s", log_level)
     try:
         from src.app.sync_lock import cleanup_all_sync_locks
 

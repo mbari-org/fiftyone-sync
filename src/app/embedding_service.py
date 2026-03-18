@@ -82,7 +82,7 @@ async def queue_embedding_job(
                     ("files", (os.path.basename(fp), data))
                     for fp, data in zip(local_filepaths, image_bytes_list)
                 ]
-                url = f"{FASTVSS_BASE_URL}/embeddings/{project}/"
+                url = f"{FASTVSS_BASE_URL}/embed/{project}"
                 logger.info(
                     "[embedding_service] POST %s project=%r files=%d sizes=%s",
                     url,
