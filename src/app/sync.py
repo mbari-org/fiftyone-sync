@@ -2200,7 +2200,7 @@ def sync_edits_to_tator(
         if not attrs:
             continue
 
-        # By default, only push samples modified more than 1 minute after creation;
+        # By default, only push samples modified more than 30 seconds after creation;
         # force_sync=True bypasses this check and updates all samples.
         last_modified_at = getattr(sample, "last_modified_at", None)
         if not force_sync:
@@ -2210,7 +2210,7 @@ def sync_edits_to_tator(
             allow_push = (
                 mod_ts is not None
                 and created_ts is not None
-                and (mod_ts - created_ts) > 60
+                and (mod_ts - created_ts) > 30
             )
             if not allow_push:
                 skipped += 1
