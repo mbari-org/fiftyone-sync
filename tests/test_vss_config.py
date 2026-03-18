@@ -149,6 +149,13 @@ projects:
     databases:
       - uri: "mongodb://localhost:27017/test"
         port: 5151
+  CFEProject:
+    vss_projects:
+      902111-CFE:
+        vss_project: "CFE"
+    databases:
+      - uri: "mongodb://localhost:27017/cfe"
+        port: 5151
 """
 
     # Write temp config file
@@ -178,12 +185,16 @@ projects:
         high_mag_item = [v for v in vss_list if v["key"] == "high-mag"][0]
         assert high_mag_item["name"] == "Test-HighMag"
 
-        # Test get_vss_project_config with specific key (no vss_service; global embeddings.service_url)
+        # Test get_vss_project_config: vss_project is always vss_project_key when provided (no fallback)
         high_mag_config = get_vss_project_config("TestProject", "high-mag")
         assert high_mag_config is not None
-        assert high_mag_config["vss_project"] == "Test-HighMag"
+        assert high_mag_config["vss_project"] == "high-mag"
         assert high_mag_config["s3_bucket"] == "test-highmag"
         assert high_mag_config["s3_prefix"] == "fiftyone"
+
+        cfe_config = get_vss_project_config("CFEProject", "902111-CFE")
+        assert cfe_config is not None
+        assert cfe_config["vss_project"] == "902111-CFE"
 
         # Test get_vss_project_config without key (should not return anything since there are 2 projects)
         default_config = get_vss_project_config("TestProject", None)

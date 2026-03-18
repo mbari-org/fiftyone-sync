@@ -234,8 +234,8 @@ async def get_vss_embedding() -> dict:
 @router.get("/vss-embedding/ws-test")
 async def get_vss_embedding_ws_test(
     project: str = Query(
-        "default",
-        description="Project name for Fast-VSS /embeddings/{project}/",
+        ...,
+        description="VSS project key for Fast-VSS /embeddings/{project}/ (required, no fallback)",
     ),
 ) -> dict:
     """
@@ -243,7 +243,12 @@ async def get_vss_embedding_ws_test(
     Returns {"ok": true} on success, 503 with {"detail": "..."} on failure.
     Used by the launcher to gate the Load from Tator button.
     """
-    ok, error = await test_embedding_websocket(project=project)
+    if not project or not project.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="project (vss_project_key) is required",
+        ) from None
+    ok, error = await test_embedding_websocket(project=project.strip())
     if ok:
         return {"ok": True}
     raise HTTPException(

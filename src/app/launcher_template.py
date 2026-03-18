@@ -165,12 +165,16 @@ LAUNCHER_TEMPLATE = r"""
         return tokenInput ? tokenInput.value.trim() : '';
       }
       function getSelectedVssProjectName() {
-        // Returns the vss_project name (e.g. "902004-Planktivore-HighMag") for the selected key, or falls back to static projectName tparam.
+        // Returns the vss_project name for the selected key. No fallback; must have vss_project_key.
         if (vssProjectKey && vssProjectsData.length) {
           var found = vssProjectsData.find(function(vp) { return vp.key === vssProjectKey; });
           if (found && found.name) return found.name;
         }
-        return projectName;
+        return '';
+      }
+      function getEmbeddingProject() {
+        // Returns the project for the embedding API. Always uses vss_project_key (no fallback).
+        return vssProjectKey || '';
       }
       function setVssProjectFromDropdown() {
         vssProjectKey = vssProjectSelect && vssProjectSelect.value ? vssProjectSelect.value : '';
@@ -423,6 +427,13 @@ LAUNCHER_TEMPLATE = r"""
           })
           .then(function(data) {
             var projects = (data && data.projects) ? data.projects : [];
+            var embeddingProject = getEmbeddingProject();
+            if (!embeddingProject) {
+              el.textContent = 'Select a VSS project (Verify Token first)';
+              el.classList.add('error');
+              updateSyncButtonsState();
+              return;
+            }
             if (checkName) {
               var inList = projects.indexOf(checkName) !== -1;
               el.textContent = inList
@@ -434,7 +445,7 @@ LAUNCHER_TEMPLATE = r"""
               el.textContent = 'Checking WebSocket…';
               el.classList.remove('error');
             }
-            var wsTestUrl = base.replace(/\/$/, '') + '/vss-embedding/ws-test?project=' + encodeURIComponent(checkName || 'default');
+            var wsTestUrl = base.replace(/\/$/, '') + '/vss-embedding/ws-test?project=' + encodeURIComponent(embeddingProject);
             return fetch(wsTestUrl).then(function(wsR) {
               if (wsR.ok) {
                 embeddingServiceReady = true;
