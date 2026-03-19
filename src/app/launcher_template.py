@@ -42,6 +42,7 @@ LAUNCHER_TEMPLATE = r"""
   </style>
 </head>
 <body>
+  <p id="app-version" style="margin:0 0 0.5rem;font-size:0.75rem;color:#888;"></p>
   <div class="applet-header">
     <table>
       <tbody>
@@ -472,6 +473,16 @@ LAUNCHER_TEMPLATE = r"""
           .catch(function(err) { if (err) { el.textContent = err.message || 'Network error'; el.classList.add('error'); updateSyncButtonsState(); } });
       }
       checkEmbeddingService();
+      (function fetchAppVersion() {
+        var base = syncServiceUrl || window.location.origin;
+        fetch(base.replace(/\/$/, '') + '/version')
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .then(function(d) {
+            var el = document.getElementById('app-version');
+            if (el && d && d.version) el.textContent = 'v' + d.version;
+          })
+          .catch(function() {});
+      })();
       if (syncBtn && syncStatus && syncServiceUrl && apiUrl) {
         syncBtn.addEventListener('click', function() {
           var token = getToken();

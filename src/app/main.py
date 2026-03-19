@@ -41,6 +41,7 @@ from src.app.embedding_service import (
     queue_embedding_job,
     test_embedding_websocket,
 )
+from src.app import __version__
 from src.app.launcher_template import LAUNCHER_TEMPLATE
 from src.app.sync_lock import LOCK_KEY_PREFIX
 
@@ -99,7 +100,7 @@ REQUEST_LATENCY = Histogram(
 app = FastAPI(
     title="FiftyOne Sync Service",
     description="Embedding API and FiftyOne launcher for Tator dashboards",
-    version="0.1.0",
+    version=__version__,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -755,6 +756,12 @@ async def metrics() -> Response:
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/version")
+async def version_info() -> dict:
+    """Return the running service version."""
+    return {"version": __version__}
 
 
 # Include routers after routes are defined
