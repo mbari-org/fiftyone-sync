@@ -363,6 +363,8 @@ embeddings:
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
 
+To recompute dimensionality reduction without re-embedding, use the launcher `Recompute Dimreduce` button (or `POST /dimreduce`). UMAP is stored under `${brain_key}_umap`; PCA and t-SNE are stored under `${brain_key}_pca` and `${brain_key}_tsne`.
+
 **Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
 
 ```bash
