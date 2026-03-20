@@ -2305,6 +2305,67 @@ def run_sync_job(
                 pass
 
 
+def run_dimreduce_job(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str | None,
+    method: str,
+    num_dims: int = 2,
+    force: bool = True,
+) -> dict[str, Any]:
+    """
+    Entrypoint for RQ worker: recompute dimensionality reduction from existing embeddings.
+
+    When run in RQ worker context, attaches a handler that writes log lines to job.meta
+    for the applet progress display.
+    """
+    from src.app.database_manager import register_project_id_name
+
+    logger.info(
+        "run_dimreduce_job received project_id=%s version_id=%s method=%r num_dims=%s",
+        project_id,
+        version_id,
+        method,
+        num_dims,
+    )
+
+    job_meta_handler: logging.Handler | None = None
+    try:
+        from rq import get_current_job
+
+        job = get_current_job()
+        if job is not None:
+            job_meta_handler = _JobMetaLogHandler(job)
+            job_meta_handler.setLevel(logging.DEBUG)
+            logger.addHandler(job_meta_handler)
+    except Exception:  # rq not installed or no worker context
+        pass
+
+    try:
+        register_project_id_name(project_id, project_name)
+        return recompute_dimensionality_for_version(
+            project_id=project_id,
+            version_id=version_id,
+            api_url=api_url,
+            token=token,
+            port=port,
+            project_name=project_name,
+            method=method,
+            num_dims=num_dims,
+            force=force,
+        )
+    finally:
+        if job_meta_handler is not None:
+            try:
+                logger.removeHandler(job_meta_handler)
+                job_meta_handler.close()
+            except Exception:
+                pass
+
+
 def sync_project_to_fiftyone(
     project_id: int,
     version_id: int | None,
@@ -2622,11 +2683,14 @@ def sync_project_to_fiftyone(
                 logger.info(f"Using VSS project from config: {vss_project}")
 
         if vss_project:
+            base_brain_key = embeddings_config.get("brain_key", "umap_viz")
             model_info = {
                 "embeddings_field": embeddings_config.get(
                     "embeddings_field", "embeddings"
                 ),
-                "brain_key": embeddings_config.get("brain_key", "umap_viz"),
+                # Store UMAP under `${brain_key}_umap` so other methods can live alongside
+                # without overwriting the default key.
+                "brain_key": f"{base_brain_key}_umap",
                 "similarity_brain_key": embeddings_config.get("similarity_brain_key")
                 or "",
                 "similarity_metric": embeddings_config.get(
@@ -2913,6 +2977,110 @@ def check_dataset_exists_for_version(
         "exists": target is not None,
         "dataset_name": target,
         "database_name": resolved_db,
+    }
+
+
+_embeddings_config_cache: dict[str, Any] | None = None
+
+
+def _load_embeddings_config_from_sync_yaml() -> dict[str, Any]:
+    """
+    Load the `embeddings` section from the YAML pointed to by FIFTYONE_SYNC_CONFIG_PATH.
+    """
+    global _embeddings_config_cache
+    if _embeddings_config_cache is not None:
+        return _embeddings_config_cache
+
+    path = os.environ.get("FIFTYONE_SYNC_CONFIG_PATH", "").strip()
+    if not path:
+        raise RuntimeError(
+            "FIFTYONE_SYNC_CONFIG_PATH is not set; cannot read embeddings config"
+        )
+
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    embeddings_cfg = cfg.get("embeddings") or {}
+    if not isinstance(embeddings_cfg, dict):
+        embeddings_cfg = {}
+
+    _embeddings_config_cache = embeddings_cfg
+    return embeddings_cfg
+
+
+def recompute_dimensionality_for_version(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str | None = None,
+    method: str = "umap",
+    num_dims: int = 2,
+    force: bool = True,
+) -> dict[str, Any]:
+    """
+    Recompute ONLY the dimensionality reduction visualization using cached embeddings.
+
+    This deletes and recreates the FiftyOne brain run at the configured `brain_key`.
+    """
+    embeddings_cfg = _load_embeddings_config_from_sync_yaml()
+    embeddings_field = embeddings_cfg.get("embeddings_field", "embeddings")
+    base_brain_key = embeddings_cfg.get("brain_key", "umap_viz")
+    seed = int(embeddings_cfg.get("umap_seed", 51))
+
+    method_norm = (method or "").strip().lower()
+    brain_key = (
+        f"{base_brain_key}_umap"
+        if method_norm == "umap"
+        else f"{base_brain_key}_{method_norm}"
+    )
+
+    logger.info(
+        "Recomputing dimensionality reduction: method=%r brain_key=%r embeddings_field=%r dataset=(project_id=%s version_id=%s port=%s)",
+        method,
+        brain_key,
+        embeddings_field,
+        project_id,
+        version_id,
+        port,
+    )
+
+    ds_info = check_dataset_exists_for_version(
+        project_id=project_id,
+        version_id=version_id,
+        port=port,
+        api_url=api_url,
+        token=token,
+        project_name=project_name,
+    )
+    ds_name = ds_info.get("dataset_name")
+    if not ds_info.get("exists") or not ds_name:
+        raise ValueError(
+            f"FiftyOne dataset not found for project_id={project_id}, version_id={version_id}, port={port}"
+        )
+
+    dataset = fo.load_dataset(ds_name)
+    dataset.reload()
+
+    from src.app.embeddings_viz import compute_dimensionality_reduction
+
+    compute_dimensionality_reduction(
+        dataset,
+        embeddings_field=embeddings_field,
+        brain_key=brain_key,
+        method=method_norm,
+        seed=seed,
+        num_dims=num_dims,
+        force=force,
+    )
+
+    return {
+        "status": "ok",
+        "dataset_name": ds_name,
+        "database_name": ds_info.get("database_name"),
+        "method": method_norm,
+        "brain_key": brain_key,
     }
 
 

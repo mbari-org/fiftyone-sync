@@ -9,6 +9,7 @@ is_enterprise: true
 
 embeddings:
   embeddings_field: "embeddings"
+  # base brain key; UMAP is stored under `${brain_key}_umap`
   brain_key: "umap_viz"
   umap_seed: 51
   force_embeddings: false

@@ -579,6 +579,87 @@ async def sync_logs(job_id: str) -> dict:
         raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}") from e
 
 
+@app_launch.post("/dimreduce")
+async def dimreduce(
+    project_id: int = Query(..., description="Tator project ID"),
+    version_id: int = Query(..., description="Tator version ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    token: str = Query(..., description="Tator API token"),
+    port: int = Query(..., description="Port for this project"),
+    method: str = Query(
+        "umap",
+        description="Dimensionality reduction method: 'pca', 'tsne', or 'umap'",
+    ),
+    force: bool = Query(
+        True, description="If True, delete any existing brain run and recompute"
+    ),
+) -> dict:
+    """
+    Enqueue a job that recomputes dimensionality reduction (PCA/t-SNE/UMAP)
+    from existing embeddings without re-running the embedding service.
+    """
+    from src.app.sync_queue import enqueue_dimreduce
+
+    # Best-effort project_name resolution (used only for fallback naming in worker)
+    project_name: str | None = None
+    try:
+        import tator
+
+        api = tator.get_api(_resolve_api_url(api_url), token)
+        proj = api.get_project(project_id)
+        project_name = getattr(proj, "name", None) or str(project_id)
+    except Exception as e:
+        logger.warning(f"dimreduce get_project({project_id}) failed: {e}")
+
+    if not project_name or not str(project_name).strip():
+        project_name = str(project_id)
+
+    job_id = enqueue_dimreduce(
+        project_id=project_id,
+        version_id=version_id,
+        api_url=_resolve_api_url(api_url),
+        token=token,
+        port=port,
+        project_name=project_name.strip(),
+        method=method,
+        force=force,
+    )
+    return {"job_id": job_id, "status": "queued", "port": port, "method": method}
+
+
+@app_launch.get("/dimreduce/status/{job_id}")
+async def dimreduce_status(job_id: str) -> dict:
+    """
+    Poll status of an enqueued dimreduce job.
+    """
+    from src.app.sync_queue import get_job_status
+
+    try:
+        return get_job_status(job_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Redis unavailable: {e}"
+        ) from e
+
+
+@app_launch.get("/dimreduce/logs/{job_id}")
+async def dimreduce_logs(job_id: str) -> dict:
+    """
+    Return log lines from the dimreduce worker job (job.meta['log_lines']).
+    """
+    from rq.exceptions import NoSuchJobError
+    from src.app.sync_queue import get_job_logs
+
+    try:
+        return get_job_logs(job_id)
+    except NoSuchJobError:
+        raise HTTPException(status_code=404, detail="Job not found") from None
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Redis unavailable: {e}"
+        ) from e
+
+
 @app_launch.post("/sync-to-tator")
 async def sync_to_tator(
     project_id: int = Query(..., description="Tator project ID"),

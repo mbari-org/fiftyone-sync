@@ -433,3 +433,71 @@ def compute_embeddings_and_viz(
                 brain_key=similarity_brain_key,
             )
             logger.info(f"Similarity stored with brain key: {similarity_brain_key}")
+
+
+def compute_dimensionality_reduction(
+    dataset: "fo.Dataset",
+    *,
+    embeddings_field: str,
+    brain_key: str,
+    method: str,
+    seed: int = 51,
+    num_dims: int = 2,
+    force: bool = True,
+) -> None:
+    """
+    Compute (or recompute) a dimensionality reduction visualization from existing embeddings.
+
+    This intentionally does *not* touch embeddings or similarity indexes; it only deletes/recomputes
+    the FiftyOne brain run specified by ``brain_key``.
+    """
+    import fiftyone.brain as fob
+
+    method = (method or "").strip().lower()
+    if method not in {"pca", "tsne", "umap"}:
+        raise ValueError(
+            f"Unsupported dimensionality reduction method={method!r}. Expected one of: 'pca', 'tsne', 'umap'."
+        )
+
+    if not dataset.has_field(embeddings_field):
+        raise ValueError(
+            f"Dataset does not have embeddings field: {embeddings_field!r}"
+        )
+
+    # Use a view with only samples that actually have embeddings (avoid empty-array errors)
+    view_with_emb = dataset.exists(embeddings_field)
+    n_with_emb = view_with_emb.count()
+    if n_with_emb == 0:
+        raise ValueError(
+            f"No samples in dataset have non-empty embeddings in field: {embeddings_field!r}"
+        )
+
+    brain_run_exists = has_brain_run(dataset, brain_key)
+    if brain_run_exists and not force:
+        logger.info(
+            f"Dimensionality reduction already cached (brain_key={brain_key!r}); skipping (set force=True to recompute)"
+        )
+        return
+
+    if brain_run_exists and force:
+        logger.info(f"Deleting existing brain run brain_key={brain_key!r}")
+        dataset.delete_brain_run(brain_key)
+
+    logger.info(
+        "Computing dimensionality reduction "
+        f"(method={method!r}, brain_key={brain_key!r}, embeddings_field={embeddings_field!r}, n_samples={n_with_emb}, num_dims={num_dims})"
+    )
+
+    compute_kwargs = dict(
+        embeddings=embeddings_field,
+        brain_key=brain_key,
+        method=method,
+        verbose=True,
+        num_dims=num_dims,
+    )
+
+    # FiftyOne's compute_visualization accepts seed for methods that rely on randomness.
+    if method in {"tsne", "umap"}:
+        compute_kwargs["seed"] = seed
+
+    fob.compute_visualization(view_with_emb, **compute_kwargs)

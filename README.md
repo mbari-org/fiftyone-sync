@@ -350,7 +350,7 @@ You can optionally compute **embeddings**, a **UMAP** 2D visualization, and a **
 ```yaml
 embeddings:
   embeddings_field: embeddings         # field to store embedding vectors
-  brain_key: umap_viz                 # FiftyOne brain key for UMAP
+  brain_key: umap_viz                 # base FiftyOne brain key; UMAP is stored under `${brain_key}_umap`
   umap_seed: 51
   force_embeddings: false             # set true to recompute embeddings
   force_umap: false                   # set true to recompute UMAP
@@ -362,6 +362,8 @@ embeddings:
   service_url: null                   # optional; default FASTVSS_API_URL or http://localhost:8000
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
+
+To recompute dimensionality reduction without re-embedding, use the launcher `Recompute Dimreduce` button (or `POST /dimreduce`). UMAP is stored under `${brain_key}_umap`; PCA and t-SNE are stored under `${brain_key}_pca` and `${brain_key}_tsne`.
 
 **Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
 
