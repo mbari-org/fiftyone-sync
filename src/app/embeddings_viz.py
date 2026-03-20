@@ -33,7 +33,7 @@ EMBED_SERVICE_BASE_URL = os.environ.get(
 EMBEDDING_FETCH_MAX_RETRIES = 3
 
 # Max time to wait for one job over WebSocket (align with Fast-VSS WS_MAX_WAIT)
-_WS_JOB_TIMEOUT = 300.0
+_WS_JOB_TIMEOUT = 10.0
 
 
 def _service_base_to_ws(base: str) -> str:
@@ -111,7 +111,7 @@ def _compute_embeddings_via_service(
     embeddings_field: str,
     service_url: str,
     batch_size: int = 32,
-    poll_timeout: float = 300.0,
+    poll_timeout: float = 10.0,
 ) -> None:
     """
     Compute embeddings by sending sample images to the embed service and writing results to the dataset.
@@ -158,7 +158,7 @@ def _compute_embeddings_via_service(
     processed = 0
 
     # Use a generous timeout for the HTTP POST: 512 images at several KB–MB each can take well over 5s.
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=10.0) as client:
         for batch_num in range(num_batches):
             start = batch_num * batch_size
             end = min(start + batch_size, num_valid)
