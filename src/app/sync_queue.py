@@ -93,6 +93,43 @@ def enqueue_sync(
     return job.id
 
 
+def enqueue_dimreduce(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str | None,
+    method: str,
+    num_dims: int = 2,
+    force: bool = True,
+) -> str:
+    """
+    Enqueue a job that recomputes a dimensionality reduction visualization
+    (PCA/t-SNE/UMAP) from existing embeddings.
+    """
+    from rq import Queue
+
+    conn = get_connection()
+    queue = Queue(QUEUE_NAME, connection=conn)
+    job = queue.enqueue(
+        "src.app.sync.run_dimreduce_job",
+        project_id=project_id,
+        version_id=version_id,
+        api_url=api_url,
+        token=token,
+        port=port,
+        project_name=project_name,
+        method=method,
+        num_dims=num_dims,
+        force=force,
+        job_timeout=3600 * 6,  # up to 6h for very large t-SNE runs
+        result_ttl=3600 * 12,
+        failure_ttl=3600,
+    )
+    return job.id
+
+
 def get_job_status(job_id: str) -> dict[str, Any]:
     """
     Return status and result for a sync job.

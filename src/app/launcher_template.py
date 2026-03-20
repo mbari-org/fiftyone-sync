@@ -99,6 +99,12 @@ LAUNCHER_TEMPLATE = r"""
                 <input type="checkbox" id="force-sync-checkbox" name="force_sync" value="1"> Force sync
               </label>
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
+              <select id="dimreduce-method-select" aria-label="dimreduce-method" disabled>
+                <option value="umap">UMAP</option>
+                <option value="pca">PCA</option>
+                <option value="tsne">t-SNE</option>
+              </select>
+              <button type="button" id="dimreduce-btn" disabled title="Recompute dimensionality reduction using cached embeddings (does not recompute embeddings)">Recompute Dimreduce</button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
               <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Dataset</button>
@@ -152,6 +158,8 @@ LAUNCHER_TEMPLATE = r"""
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
       var deleteDatasetBtn = document.getElementById('delete-dataset-btn');
+      var dimreduceMethodSelect = document.getElementById('dimreduce-method-select');
+      var dimreduceBtn = document.getElementById('dimreduce-btn');
       var tokenInput = document.getElementById('user-token');
       var testTokenBtn = document.getElementById('test-token-btn');
       var tokenVerified = false;
@@ -201,6 +209,8 @@ LAUNCHER_TEMPLATE = r"""
         if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry || !embeddingServiceReady;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
+        if (dimreduceMethodSelect) dimreduceMethodSelect.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
+        if (dimreduceBtn) dimreduceBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
       }
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
@@ -722,6 +732,118 @@ LAUNCHER_TEMPLATE = r"""
               datasetExists = false;
               deleteDatasetBtn.disabled = true;
               checkDatasetExists();
+            });
+        });
+      }
+      if (dimreduceBtn && syncStatus && syncServiceUrl && apiUrl) {
+        dimreduceBtn.addEventListener('click', function() {
+          var token = getToken();
+          if (!token || !tokenVerified) return;
+          var v = versionSelect && versionSelect.value ? versionSelect.value : '';
+          if (!v) {
+            syncStatus.textContent = 'Select a version first.';
+            syncStatus.classList.add('error');
+            return;
+          }
+          var method = dimreduceMethodSelect && dimreduceMethodSelect.value ? dimreduceMethodSelect.value : 'umap';
+          dimreduceBtn.disabled = true;
+          syncStatus.textContent = 'Recomputing dimensionality reduction…';
+          syncStatus.classList.remove('error');
+
+          var params = new URLSearchParams({
+            project_id: String(project),
+            version_id: v,
+            api_url: apiUrl,
+            token: token,
+            port: String(port),
+            method: method
+          });
+          var fullUrl = syncServiceUrl + '/dimreduce?' + params.toString();
+          fetch(fullUrl, { method: 'POST' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(result) {
+              if (!result.ok) {
+                syncStatus.textContent = 'Dimreduce failed: ' + (result.data.detail || result.data.message || 'Unknown error');
+                syncStatus.classList.add('error');
+                dimreduceBtn.disabled = false;
+                return;
+              }
+              var data = result.data || {};
+              if (data.job_id) {
+                syncStatus.textContent = 'Dimreduce queued. Waiting for worker…';
+                var syncLogPanel = document.getElementById('sync-log-panel');
+                if (syncLogPanel) { syncLogPanel.classList.remove('visible'); syncLogPanel.textContent = ''; }
+                var statusUrl = syncServiceUrl + '/dimreduce/status/' + encodeURIComponent(data.job_id);
+                var logsUrl = syncServiceUrl + '/dimreduce/logs/' + encodeURIComponent(data.job_id);
+                function updateLogPanel(cb) {
+                  fetch(logsUrl).then(function(r) { return r.ok ? r.json() : null; }).then(function(logData) {
+                    if (syncLogPanel && logData && logData.log_lines && logData.log_lines.length) {
+                      syncLogPanel.textContent = logData.log_lines.join('\\n');
+                      syncLogPanel.scrollTop = syncLogPanel.scrollHeight;
+                    }
+                    if (cb) cb();
+                  }).catch(function() { if (cb) cb(); });
+                }
+                var logPanelHideTimeout = null;
+                function hideLogPanelAfterDelay() {
+                  if (logPanelHideTimeout) clearTimeout(logPanelHideTimeout);
+                  logPanelHideTimeout = setTimeout(function() {
+                    if (syncLogPanel) syncLogPanel.classList.remove('visible');
+                    logPanelHideTimeout = null;
+                  }, 30000);
+                }
+                var poll = function() {
+                  fetch(statusUrl)
+                    .then(function(r) { return r.json(); })
+                    .then(function(s) {
+                      if (s.status === 'queued' || s.status === 'started' || s.status === 'deferred') {
+                        syncStatus.textContent = 'Dimreduce in progress…';
+                        if (syncLogPanel) syncLogPanel.classList.add('visible');
+                        updateLogPanel(function() { setTimeout(poll, 2500); });
+                        return;
+                      }
+                      if (s.status === 'failed') {
+                        syncStatus.textContent = 'Dimreduce failed: ' + (s.error || 'Unknown error');
+                        syncStatus.classList.add('error');
+                        dimreduceBtn.disabled = false;
+                        if (syncLogPanel) syncLogPanel.classList.add('visible');
+                        updateLogPanel(hideLogPanelAfterDelay);
+                        return;
+                      }
+                      if (s.status === 'finished' && s.result) {
+                        var res = s.result;
+                        var m = res && res.method ? res.method : method;
+                        syncStatus.textContent = 'Dimreduce done (' + m + ').';
+                        syncStatus.classList.remove('error');
+                        dimreduceBtn.disabled = false;
+                        if (syncLogPanel) syncLogPanel.classList.add('visible');
+                        updateLogPanel(hideLogPanelAfterDelay);
+                        setTimeout(function() { syncStatus.textContent = ''; }, 5000);
+                        return;
+                      }
+                      syncStatus.textContent = 'Dimreduce: ' + (s.status || 'unknown');
+                      if (syncLogPanel) syncLogPanel.classList.add('visible');
+                      updateLogPanel(function() { setTimeout(poll, 2500); });
+                    })
+                    .catch(function(err) {
+                      syncStatus.textContent = 'Dimreduce status check failed: ' + (err.message || 'Network error');
+                      syncStatus.classList.add('error');
+                      dimreduceBtn.disabled = false;
+                      if (syncLogPanel) syncLogPanel.classList.remove('visible');
+                    });
+                };
+                poll();
+                return;
+              }
+              // Fallback: if no job_id is returned, just show completion state
+              syncStatus.textContent = 'Dimreduce started.';
+              setTimeout(function() { syncStatus.textContent = ''; }, 3000);
+              dimreduceBtn.disabled = false;
+            })
+            .catch(function(err) {
+              syncStatus.textContent = 'Dimreduce error: ' + (err.message || 'Network error');
+              syncStatus.classList.add('error');
+              dimreduceBtn.disabled = false;
             });
         });
       }

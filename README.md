@@ -350,7 +350,7 @@ You can optionally compute **embeddings**, a **UMAP** 2D visualization, and a **
 ```yaml
 embeddings:
   embeddings_field: embeddings         # field to store embedding vectors
-  brain_key: umap_viz                 # FiftyOne brain key for UMAP
+  brain_key: umap_viz                 # base FiftyOne brain key; UMAP is stored under `${brain_key}_umap`
   umap_seed: 51
   force_embeddings: false             # set true to recompute embeddings
   force_umap: false                   # set true to recompute UMAP
