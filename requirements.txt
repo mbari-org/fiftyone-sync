@@ -19,7 +19,7 @@ requests>=2.32.0
 # No local model deps; set FASTVSS_API_URL to embedding service URL
 
 # FiftyOne - for sync and launch_app (requires MongoDB)
-fiftyone==1.12.0
+fiftyone==1.13.5
 strawberry-graphql==0.291.0
 
 # Caching - Fast-VSS handles its own cache
