@@ -1573,6 +1573,7 @@ def _apply_loc_to_sample(
     # Primitive sample-level attributes
     _PRIMITIVE_ATTR_MAP = (
         ("anomaly_score", "anomaly_score", float),
+        ("noise_score", "noise_score", float),
         ("depth", "depth", float),
         ("altitude", "altitude", float),
         ("saliency", "saliency", int),
@@ -1580,6 +1581,8 @@ def _apply_loc_to_sample(
         ("cluster", "cluster", str),
         ("comment", "comment", str),
         ("verified", "verified", bool),
+        ("latitude", "latitude", float),
+        ("longitude", "longitude", float)
     )
     applied = {}
     missing = []
