@@ -412,6 +412,114 @@ def _is_video_name(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
 
+def _as_http_url(val: Any) -> str | None:
+    """Return val as an http(s) URL string, else None."""
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    return None
+
+
+def _get_attr_or_key(obj: Any, name: str) -> Any:
+    """Best-effort getter for object attribute or dict key."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _first_http_url_in_list(items: Any) -> str | None:
+    """Extract the first http(s) URL from a list-like of dict/objects/strings."""
+    if not items:
+        return None
+    if not isinstance(items, (list, tuple)):
+        items = [items]
+    for it in items:
+        u = _as_http_url(it)
+        if u:
+            return u
+        u = _as_http_url(_get_attr_or_key(it, "path"))
+        if u:
+            return u
+        u = _as_http_url(_get_attr_or_key(it, "url"))
+        if u:
+            return u
+        u = _as_http_url(_get_attr_or_key(it, "href"))
+        if u:
+            return u
+    return None
+
+
+def _iter_all_strings(obj: Any, *, _depth: int = 0, _max_depth: int = 6) -> list[str]:
+    """Collect all strings found in nested dict/list/object structures (bounded depth)."""
+    if obj is None or _depth > _max_depth:
+        return []
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        out: list[str] = []
+        for v in obj.values():
+            out.extend(_iter_all_strings(v, _depth=_depth + 1, _max_depth=_max_depth))
+        return out
+    if isinstance(obj, (list, tuple, set)):
+        out = []
+        for v in obj:
+            out.extend(_iter_all_strings(v, _depth=_depth + 1, _max_depth=_max_depth))
+        return out
+    # Fallback: introspect public attributes (works for simple model objects)
+    out = []
+    try:
+        for k, v in vars(obj).items():
+            if k.startswith("_"):
+                continue
+            out.extend(_iter_all_strings(v, _depth=_depth + 1, _max_depth=_max_depth))
+    except Exception:
+        pass
+    return out
+
+
+def _resolve_video_source_url_for_ffmpeg(m: Any) -> str | None:
+    """
+    Return the best available http(s) URL for video frame extraction.
+
+    Priority is: streaming -> download -> archive -> any http(s) URL found inside media_files.
+    This supports object-storage-backed media where the URL may not live in the single
+    `media_files.streaming[0].path` slot expected by the original implementation.
+    """
+    media_files = _get_attr_or_key(m, "media_files")
+    if not media_files:
+        return None
+
+    # 1) Keep existing behavior (streaming) as first-priority fallback
+    streaming = _get_attr_or_key(media_files, "streaming")
+    u = _first_http_url_in_list(streaming)
+    if u:
+        return u
+
+    # 2) Common alternates
+    for key in ("download", "downloads", "archive", "archives", "source", "sources", "path", "url"):
+        u = _first_http_url_in_list(_get_attr_or_key(media_files, key))
+        if u:
+            return u
+
+    # 3) Last resort: scan everything under media_files for an http(s) URL
+    candidates = []
+    for s in _iter_all_strings(media_files):
+        u = _as_http_url(s)
+        if u:
+            candidates.append(u)
+    if not candidates:
+        return None
+    # Prefer URLs that look like video assets
+    for u in candidates:
+        if any(ext in u.lower() for ext in VIDEO_EXTENSIONS):
+            return u
+    return candidates[0]
+
+
 def _is_streaming_video(m: Any) -> bool:
     """True if Media has a single HTTP streaming URL (video, no download)."""
     if not hasattr(m, "media_files") or m.media_files is None:
@@ -856,10 +964,11 @@ def crop_localizations_parallel(
                     except ValueError:
                         pass
 
-    # Video: media_id -> streaming URL, stem, Media, and resolution from Tator metadata
+    # Video: media_id -> video URL, stem, Media from Tator metadata
     media_id_to_video_url: dict[int, str] = {}
     media_id_to_stem: dict[int, str] = {}
     media_id_to_media: dict[int, Any] = {}
+    video_url_misses = 0
     for m in (media_objects or []):
         if not isinstance(m, tator.models.Media):
             continue
@@ -869,14 +978,21 @@ def crop_localizations_parallel(
         media_id_to_media[mid] = m
         stem = f"{mid}_{getattr(m, 'name', '') or ''}"
         media_id_to_stem[mid] = stem
-        if _is_streaming_video(m):
-            s = m.media_files.streaming[0]
-            path = getattr(s, "path", None)
-            if path and isinstance(path, str) and path.startswith("http"):
-                media_id_to_video_url[mid] = path
-        else:
-            if mid in media_id_to_image_path:
-                media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+        name = getattr(m, "name", None) or ""
+        if _is_video_name(name):
+            url = _resolve_video_source_url_for_ffmpeg(m)
+            if url:
+                media_id_to_video_url[mid] = url
+            else:
+                video_url_misses += 1
+        elif mid in media_id_to_image_path:
+            media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+
+    if video_url_misses:
+        logger.info(
+            "Video source URL unresolved for %s Media object(s); video crops may be skipped",
+            video_url_misses,
+        )
 
     if locs_to_crop is not None:
         loc_list = locs_to_crop
@@ -921,8 +1037,12 @@ def crop_localizations_parallel(
 
     # Video tasks: (video_url, frame_index, media, [(loc, out_path), ...]) one per (media_id, frame)
     video_tasks: list[tuple[str, int, Any, list[tuple[dict, Path]]]] = []
+    skipped_video_media = 0
     for mid, locs in locs_by_media.items():
         if mid not in media_id_to_video_url:
+            # Only log/track skips for media that look like video (frame present)
+            if any(loc.get("frame") is not None for loc in locs):
+                skipped_video_media += 1
             continue
         video_url = media_id_to_video_url[mid]
         media = media_id_to_media.get(mid)
@@ -946,6 +1066,12 @@ def crop_localizations_parallel(
         for frame_idx, group in by_frame.items():
             if group:
                 video_tasks.append((video_url, frame_idx, media, group))
+
+    if skipped_video_media:
+        logger.info(
+            "Skipping video crops for %s media_id(s): no usable video URL found in media_files",
+            skipped_video_media,
+        )
 
     total_tasks = len(image_tasks) + len(video_tasks)
     if total_tasks == 0:
