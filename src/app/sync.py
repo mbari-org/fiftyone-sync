@@ -695,6 +695,135 @@ def _extract_video_frame(
         return None
 
 
+def _extract_video_frames_batch(
+    input_str: str,
+    frame_indices: list[int],
+    media: Any,
+    crop_timeout: int,
+    *,
+    render_format: str = "png",
+) -> dict[int, Path]:
+    """
+    Extract multiple frames in one ffmpeg invocation.
+
+    Uses one input per frame (`-ss ... -i <input>`) and maps each input video stream
+    to a single output image via `-map {idx}:v -frames:v 1`.
+    """
+    if not frame_indices:
+        return {}
+
+    frames = [int(f) for f in frame_indices]
+    tmp_paths: dict[int, Path] = {}
+    out_files: list[str] = []
+
+    for frame_idx in frames:
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=f".{render_format}", prefix=f"frame_{frame_idx}_"
+        )
+        os.close(fd)
+        p = Path(tmp_path)
+        tmp_paths[frame_idx] = p
+        out_files.append(tmp_path)
+
+    args: list[str] = ["ffmpeg", "-y"]
+
+    # Inputs: one per frame, each with its own seek.
+    for frame_idx in frames:
+        args.extend(["-ss", frame_to_timestamp(media, frame_idx)])
+        args.extend(["-i", input_str])
+
+    # Outputs: map each input to exactly one frame.
+    for batch_idx, _frame_idx in enumerate(frames):
+        args.extend(["-map", f"{batch_idx}:v", "-frames:v", "1"])
+        args.append(out_files[batch_idx])
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=crop_timeout,
+        )
+        if result.returncode != 0:
+            logger.info(
+                f"ffmpeg batch extract failed for {input_str}: {(result.stderr or '')[:500]}"
+            )
+            for p in tmp_paths.values():
+                _safe_unlink(p)
+            return {}
+
+        ok: dict[int, Path] = {}
+        for frame_idx, p in tmp_paths.items():
+            if p.exists() and p.stat().st_size > 0:
+                ok[frame_idx] = p
+            else:
+                _safe_unlink(p)
+        return ok
+    except subprocess.TimeoutExpired as e:
+        logger.info(
+            f"ffmpeg batch extract timeout ({crop_timeout}s) for {input_str}: {e}"
+        )
+    except FileNotFoundError as e:
+        logger.info(f"ffmpeg not found during batch extract for {input_str}: {e}")
+    except Exception as e:
+        logger.info(f"ffmpeg batch extract error for {input_str}: {e}")
+
+    for p in tmp_paths.values():
+        _safe_unlink(p)
+    return {}
+
+
+def _crop_image_group(
+    image_path: str | Path,
+    locs_with_out_paths: list[tuple[dict, Path]],
+    *,
+    size: int,
+) -> tuple[int, int]:
+    """Crop a set of localizations from a single image file."""
+    if not locs_with_out_paths:
+        return (0, 0)
+    try:
+        img = Image.open(str(image_path))
+        img.load()
+        width, height = img.size
+
+        total_ok = 0
+        total_fail = 0
+        for loc, out_path in locs_with_out_paths:
+            x = float(loc.get("x", 0))
+            y = float(loc.get("y", 0))
+            w = float(loc.get("width", 0))
+            h = float(loc.get("height", 0))
+            if w <= 0 or h <= 0:
+                total_fail += 1
+                continue
+            x1 = int(width * x)
+            y1 = int(height * y)
+            x2 = int(width * (x + w))
+            y2 = int(height * (y + h))
+            x1 = max(0, min(x1, width - 1))
+            y1 = max(0, min(y1, height - 1))
+            x2 = max(1, min(x2, width))
+            y2 = max(1, min(y2, height))
+
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                crop = img.crop((x1, y1, x2, y2))
+                crop = crop.resize((size, size), _PIL_RESAMPLE)
+                crop.save(out_path, format="PNG")
+                total_ok += 1
+            except Exception as e:
+                logger.debug(f"PIL crop failed for {out_path}: {e}")
+                total_fail += 1
+
+        img.close()
+        return (total_ok, total_fail)
+
+    except Exception as e:
+        logger.info(f"Could not open source for cropping ({image_path}): {e}")
+        return (0, len(locs_with_out_paths))
+
+
 def _safe_unlink(path: str | Path) -> None:
     """Remove a file, ignoring errors if it doesn't exist."""
     try:
@@ -790,34 +919,32 @@ def _crop_video_media_group(
     Crop one video's localizations, grouped by frame.
 
     This keeps scheduling at media granularity (one task per video) while still
-    processing frames concurrently within that video.
+    reducing ffmpeg overhead by extracting multiple frames per ffmpeg invocation.
     """
     if not frame_groups:
         return (0, 0)
-    workers = max(1, min(frame_workers, len(frame_groups)))
     ok_total = 0
     fail_total = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [
-            ex.submit(
-                _crop_media_group,
-                video_url,
-                group,
-                frame_idx,
-                size,
-                crop_timeout,
-                media,
-            )
-            for frame_idx, group in frame_groups
-        ]
-        for fut in as_completed(futures):
-            try:
-                ok, fail = fut.result()
-                ok_total += ok
-                fail_total += fail
-            except Exception as e:
-                fail_total += 1
-                logger.info(f"Video crop task error: {e}")
+
+    # One ffmpeg process per batch of frames, then crop each extracted frame image.
+    batch_size = max(1, _FRAME_BATCH_SIZE)
+    for start in range(0, len(frame_groups), batch_size):
+        batch = frame_groups[start : start + batch_size]
+        frame_indices = [int(fidx) for fidx, _ in batch]
+        extracted = _extract_video_frames_batch(
+            video_url, frame_indices, media, crop_timeout
+        )
+        for frame_idx, group in batch:
+            img_path = extracted.get(int(frame_idx))
+            if img_path is None:
+                fail_total += len(group)
+                continue
+            ok, fail = _crop_image_group(img_path, group, size=size)
+            ok_total += ok
+            fail_total += fail
+        for p in extracted.values():
+            _safe_unlink(p)
+
     return (ok_total, fail_total)
 
 
