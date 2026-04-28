@@ -520,6 +520,64 @@ def _resolve_video_source_url_for_ffmpeg(m: Any) -> str | None:
     return candidates[0]
 
 
+def _presign_video_media_sources(
+    api: Any,
+    media_objects: list[Any],
+    *,
+    expires_seconds: int = 3600,
+    no_cache: bool = True,
+) -> list[Any]:
+    """
+    Best-effort: replace video Media objects with presigned-path variants.
+
+    Tator can generate presigned URLs via GET /rest/Media/{id}?presigned=... which
+    rewrites all `path` fields in `media_files` to downloadable http(s) URLs.
+
+    We only call this for videos that do not already resolve to an http(s) URL, to
+    minimize API calls.
+    """
+    if not media_objects:
+        return media_objects
+
+    updated: list[Any] = []
+    attempted = 0
+    replaced = 0
+    for m in media_objects:
+        try:
+            mid = getattr(m, "id", None)
+            name = getattr(m, "name", None) or ""
+            if mid is None or not _is_video_name(name):
+                updated.append(m)
+                continue
+
+            # If we already have an ffmpeg-usable URL, keep original object.
+            if _resolve_video_source_url_for_ffmpeg(m):
+                updated.append(m)
+                continue
+
+            attempted += 1
+            presigned_m = api.get_media(
+                int(mid), presigned=int(expires_seconds), no_cache=bool(no_cache)
+            )
+            if presigned_m is not None:
+                updated.append(presigned_m)
+                replaced += 1
+            else:
+                updated.append(m)
+        except Exception:
+            updated.append(m)
+
+    if attempted:
+        logger.info(
+            "Presign video sources: attempted=%s replaced=%s (expires=%ss no_cache=%s)",
+            attempted,
+            replaced,
+            expires_seconds,
+            no_cache,
+        )
+    return updated
+
+
 def _is_streaming_video(m: Any) -> bool:
     """True if Media has a single HTTP streaming URL (video, no download)."""
     if not hasattr(m, "media_files") or m.media_files is None:
@@ -2674,6 +2732,10 @@ def sync_project_to_fiftyone(
                         f"No Media objects returned for {len(needed_ids)} ids; skipping download"
                     )
                 else:
+                    # For object-storage-backed videos, request presigned URLs so ffmpeg can read http(s).
+                    all_media = _presign_video_media_sources(
+                        api, all_media, expires_seconds=3600, no_cache=True
+                    )
                     logger.info(f"Saving {len(all_media)} media images to tmp (videos skipped)...")
                     dl_dir = save_media_to_tmp(
                         api, project_id, all_media, media_ids_filter=media_ids_needed
