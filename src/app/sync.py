@@ -778,6 +778,49 @@ def _crop_media_group(
             _safe_unlink(frame_path)
 
 
+def _crop_video_media_group(
+    video_url: str,
+    media: Any,
+    frame_groups: list[tuple[int, list[tuple[dict, Path]]]],
+    size: int,
+    frame_workers: int,
+    crop_timeout: int,
+) -> tuple[int, int]:
+    """
+    Crop one video's localizations, grouped by frame.
+
+    This keeps scheduling at media granularity (one task per video) while still
+    processing frames concurrently within that video.
+    """
+    if not frame_groups:
+        return (0, 0)
+    workers = max(1, min(frame_workers, len(frame_groups)))
+    ok_total = 0
+    fail_total = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [
+            ex.submit(
+                _crop_media_group,
+                video_url,
+                group,
+                frame_idx,
+                size,
+                crop_timeout,
+                media,
+            )
+            for frame_idx, group in frame_groups
+        ]
+        for fut in as_completed(futures):
+            try:
+                ok, fail = fut.result()
+                ok_total += ok
+                fail_total += fail
+            except Exception as e:
+                fail_total += 1
+                logger.info(f"Video crop task error: {e}")
+    return (ok_total, fail_total)
+
+
 def save_media_to_tmp(
     api: Any,
     project_id: int,
@@ -1093,8 +1136,8 @@ def crop_localizations_parallel(
         if group:
             image_tasks.append((image_path, group))
 
-    # Video tasks: (video_url, frame_index, media, [(loc, out_path), ...]) one per (media_id, frame)
-    video_tasks: list[tuple[str, int, Any, list[tuple[dict, Path]]]] = []
+    # Video tasks grouped by media: (video_url, media, [(frame_idx, [(loc, out_path), ...]), ...])
+    video_tasks: list[tuple[str, Any, list[tuple[int, list[tuple[dict, Path]]]]]] = []
     skipped_video_media = 0
     for mid, locs in locs_by_media.items():
         if mid not in media_id_to_video_url:
@@ -1121,9 +1164,13 @@ def crop_localizations_parallel(
             if frame_idx not in by_frame:
                 by_frame[frame_idx] = []
             by_frame[frame_idx].append((loc, out_path))
-        for frame_idx, group in by_frame.items():
-            if group:
-                video_tasks.append((video_url, frame_idx, media, group))
+        frame_groups = [
+            (frame_idx, group)
+            for frame_idx, group in sorted(by_frame.items(), key=lambda kv: kv[0])
+            if group
+        ]
+        if frame_groups:
+            video_tasks.append((video_url, media, frame_groups))
 
     if skipped_video_media:
         logger.info(
@@ -1135,8 +1182,17 @@ def crop_localizations_parallel(
     if total_tasks == 0:
         logger.info("No localization crops to process")
         return (0, 0)
-    total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, _, g in video_tasks)
+    total_locs = sum(len(g) for _, g in image_tasks) + sum(
+        len(group) for _, _, frame_groups in video_tasks for _, group in frame_groups
+    )
+    total_video_frames = sum(len(frame_groups) for _, _, frame_groups in video_tasks)
     logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
+    if video_tasks:
+        logger.info(
+            "Video crop grouping: %s media task(s), %s frame group(s)",
+            len(video_tasks),
+            total_video_frames,
+        )
 
     image_workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
     video_workers = min(_DEFAULT_VIDEO_WORKERS, len(video_tasks)) if video_tasks else 0
@@ -1176,18 +1232,17 @@ def crop_localizations_parallel(
         logger.info(f"Image crops done: {num_ok} ok, {num_fail} failed")
 
     if video_tasks:
-        for batch_start in range(0, len(video_tasks), batch_size):
-            batch = video_tasks[batch_start : batch_start + batch_size]
-            with ThreadPoolExecutor(max_workers=video_workers) as ex:
-                futures = [
-                    ex.submit(
-                        _crop_media_group, video_url, group, frame_idx, size, None, media,
-                    )
-                    for video_url, frame_idx, media, group in batch
-                ]
-                ok, fail = _collect(futures)
-                num_ok += ok
-                num_fail += fail
+        for video_url, media, frame_groups in video_tasks:
+            ok, fail = _crop_video_media_group(
+                video_url,
+                media,
+                frame_groups,
+                size,
+                video_workers,
+                _DEFAULT_CROP_TIMEOUT,
+            )
+            num_ok += ok
+            num_fail += fail
         logger.info(f"Video crops done: {num_ok} ok, {num_fail} failed")
 
     logger.info(f"Crops done: {num_ok} saved to {crops_path}, {num_fail} failed")
