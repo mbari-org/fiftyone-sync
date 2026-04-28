@@ -412,186 +412,6 @@ def _is_video_name(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
 
-def _as_http_url(val: Any) -> str | None:
-    """Return val as an http(s) URL string, else None."""
-    if not isinstance(val, str):
-        return None
-    s = val.strip()
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-    return None
-
-
-def _get_attr_or_key(obj: Any, name: str) -> Any:
-    """Best-effort getter for object attribute or dict key."""
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj.get(name)
-    return getattr(obj, name, None)
-
-
-def _first_http_url_in_list(items: Any) -> str | None:
-    """Extract the first http(s) URL from a list-like of dict/objects/strings."""
-    if not items:
-        return None
-    if not isinstance(items, (list, tuple)):
-        items = [items]
-    for it in items:
-        u = _as_http_url(it)
-        if u:
-            return u
-        u = _as_http_url(_get_attr_or_key(it, "path"))
-        if u:
-            return u
-        u = _as_http_url(_get_attr_or_key(it, "url"))
-        if u:
-            return u
-        u = _as_http_url(_get_attr_or_key(it, "href"))
-        if u:
-            return u
-    return None
-
-
-def _iter_all_strings(obj: Any, *, _depth: int = 0, _max_depth: int = 6) -> list[str]:
-    """Collect all strings found in nested dict/list/object structures (bounded depth)."""
-    if obj is None or _depth > _max_depth:
-        return []
-    if isinstance(obj, str):
-        return [obj]
-    if isinstance(obj, dict):
-        out: list[str] = []
-        for v in obj.values():
-            out.extend(_iter_all_strings(v, _depth=_depth + 1, _max_depth=_max_depth))
-        return out
-    if isinstance(obj, (list, tuple, set)):
-        out = []
-        for v in obj:
-            out.extend(_iter_all_strings(v, _depth=_depth + 1, _max_depth=_max_depth))
-        return out
-    # Fallback: introspect public attributes (works for simple model objects)
-    out = []
-    try:
-        for k, v in vars(obj).items():
-            if k.startswith("_"):
-                continue
-            out.extend(_iter_all_strings(v, _depth=_depth + 1, _max_depth=_max_depth))
-    except Exception:
-        pass
-    return out
-
-
-def _resolve_video_source_url_for_ffmpeg(m: Any) -> str | None:
-    """
-    Return the best available http(s) URL for video frame extraction.
-
-    Priority is: streaming -> download -> archive -> any http(s) URL found inside media_files.
-    This supports object-storage-backed media where the URL may not live in the single
-    `media_files.streaming[0].path` slot expected by the original implementation.
-    """
-    media_files = _get_attr_or_key(m, "media_files")
-    if not media_files:
-        return None
-
-    # 1) Keep existing behavior (streaming) as first-priority fallback
-    streaming = _get_attr_or_key(media_files, "streaming")
-    u = _first_http_url_in_list(streaming)
-    if u:
-        return u
-
-    # 2) Common alternates
-    for key in ("download", "downloads", "archive", "archives", "source", "sources", "path", "url"):
-        u = _first_http_url_in_list(_get_attr_or_key(media_files, key))
-        if u:
-            return u
-
-    # 3) Last resort: scan everything under media_files for an http(s) URL
-    candidates = []
-    for s in _iter_all_strings(media_files):
-        u = _as_http_url(s)
-        if u:
-            candidates.append(u)
-    if not candidates:
-        return None
-    # Prefer URLs that look like video assets
-    for u in candidates:
-        if any(ext in u.lower() for ext in VIDEO_EXTENSIONS):
-            return u
-    return candidates[0]
-
-
-def _presign_video_media_sources(
-    api: Any,
-    media_objects: list[Any],
-    *,
-    expires_seconds: int = 3600,
-    no_cache: bool = True,
-) -> list[Any]:
-    """
-    Best-effort: replace video Media objects with presigned-path variants.
-
-    Tator can generate presigned URLs via GET /rest/Media/{id}?presigned=... which
-    rewrites all `path` fields in `media_files` to downloadable http(s) URLs.
-
-    We only call this for videos that do not already resolve to an http(s) URL, to
-    minimize API calls.
-    """
-    if not media_objects:
-        return media_objects
-
-    updated: list[Any] = []
-    attempted = 0
-    replaced = 0
-    for m in media_objects:
-        try:
-            mid = getattr(m, "id", None)
-            name = getattr(m, "name", None) or ""
-            if mid is None or not _is_video_name(name):
-                updated.append(m)
-                continue
-
-            # If we already have an ffmpeg-usable URL, keep original object.
-            if _resolve_video_source_url_for_ffmpeg(m):
-                updated.append(m)
-                continue
-
-            attempted += 1
-            presigned_m = api.get_media(
-                int(mid), presigned=int(expires_seconds), no_cache=bool(no_cache)
-            )
-            if presigned_m is not None:
-                updated.append(presigned_m)
-                replaced += 1
-            else:
-                updated.append(m)
-        except Exception:
-            updated.append(m)
-
-    if attempted:
-        logger.info(
-            "Presign video sources: attempted=%s replaced=%s (expires=%ss no_cache=%s)",
-            attempted,
-            replaced,
-            expires_seconds,
-            no_cache,
-        )
-    return updated
-
-
-def _is_streaming_video(m: Any) -> bool:
-    """True if Media has a single HTTP streaming URL (video, no download)."""
-    if not hasattr(m, "media_files") or m.media_files is None:
-        return False
-    if not hasattr(m.media_files, "streaming") or not m.media_files.streaming:
-        return False
-    if len(m.media_files.streaming) != 1:
-        return False
-    path = getattr(m.media_files.streaming[0], "path", None) or (
-        m.media_files.streaming[0].get("path") if isinstance(m.media_files.streaming[0], dict) else None
-    )
-    return isinstance(path, str) and path.startswith("http")
-
-
 def frame_to_timestamp(media: Any, frame: int) -> str:
     """Convert frame number to timestamp string for ffmpeg -ss (accurate frame indexing)."""
     fps = getattr(media, "fps", None)
@@ -956,7 +776,7 @@ def save_media_to_tmp(
 ) -> str:
     """
     Download each media to an isolated download directory.
-    Videos are skipped (download not supported). Existing non-empty files are skipped.
+    Existing non-empty files are skipped.
     When media_ids_filter is provided, only media whose id is in the set are downloaded.
     Retries each download up to 3 times. Returns the download directory path.
     """
@@ -967,16 +787,13 @@ def save_media_to_tmp(
     total = len(valid)
     logger.info(f"Processing {total} media -> {out_dir}")
     downloaded = 0
-    videos_skipped = 0
+    video_downloaded = 0
     cached_skipped = 0
     failed = 0
     log_interval = max(1, total // 10)
     for idx, m in enumerate(valid, 1):
         safe_name = f"{m.id}_{m.name}"
         out_path = os.path.join(out_dir, safe_name)
-        if _is_video_name(m.name):
-            videos_skipped += 1
-            continue
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             cached_skipped += 1
             continue
@@ -988,6 +805,8 @@ def save_media_to_tmp(
                     pass
                 success = True
                 downloaded += 1
+                if _is_video_name(m.name):
+                    video_downloaded += 1
             except Exception as e:
                 logger.debug(
                     f"Download attempt {num_tries + 1}/3 failed for {m.id}: {e}"
@@ -999,10 +818,10 @@ def save_media_to_tmp(
         if idx % log_interval == 0 or idx == total:
             logger.info(
                 f"Download progress: {idx}/{total} processed "
-                f"({downloaded} saved, {videos_skipped} videos skipped, {cached_skipped} already cached, {failed} failed)"
+                f"({downloaded} saved, {video_downloaded} videos saved, {cached_skipped} already cached, {failed} failed)"
             )
     logger.info(
-        f"Download complete: {downloaded} saved, {videos_skipped} videos skipped, "
+        f"Download complete: {downloaded} saved, {video_downloaded} videos saved, "
         f"{cached_skipped} already cached, {failed} failed -> {out_dir}"
     )
     return out_dir
@@ -1151,13 +970,12 @@ def crop_localizations_parallel(
     with PIL, then the temp files are deleted. Image files are opened directly.
 
     Saves using elemental_id as filestem (e.g. elemental_id.png).
-    Image: local files from download_dir, grouped by media_id. Video: streaming URL from
-    media_objects (streaming attribute), grouped by (media_id, frame).
+    Image: local files from download_dir, grouped by media_id.
+    Video: local downloaded files from download_dir, grouped by (media_id, frame).
 
     When locs_to_crop is provided, only those localizations are cropped (cache-miss
     optimization). Otherwise falls back to reading all localizations from the JSONL.
-    media_objects: Tator Media list for cache-miss media; used to get video streaming URL
-    and stems for video (no file in download_dir).
+    media_objects: Tator Media list for cache-miss media; used for stems/fps metadata.
 
     Returns (num_cropped, num_failed).
     """
@@ -1192,11 +1010,21 @@ def crop_localizations_parallel(
                     except ValueError:
                         pass
 
-    # Video: media_id -> video URL, stem, Media from Tator metadata
-    media_id_to_video_url: dict[int, str] = {}
+    # Video: media_id -> local file path, stem, Media from Tator metadata
+    media_id_to_video_path: dict[int, str] = {}
     media_id_to_stem: dict[int, str] = {}
     media_id_to_media: dict[int, Any] = {}
-    video_url_misses = 0
+    if download_path.exists():
+        for f in download_path.iterdir():
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
+                stem = f.stem
+                if "_" in stem:
+                    try:
+                        mid = int(stem.split("_", 1)[0])
+                        media_id_to_video_path[mid] = str(f)
+                    except ValueError:
+                        pass
+    local_video_misses = 0
     for m in (media_objects or []):
         if not isinstance(m, tator.models.Media):
             continue
@@ -1208,18 +1036,18 @@ def crop_localizations_parallel(
         media_id_to_stem[mid] = stem
         name = getattr(m, "name", None) or ""
         if _is_video_name(name):
-            url = _resolve_video_source_url_for_ffmpeg(m)
-            if url:
-                media_id_to_video_url[mid] = url
+            local_video = media_id_to_video_path.get(mid)
+            if local_video:
+                media_id_to_stem[mid] = Path(local_video).stem
             else:
-                video_url_misses += 1
+                local_video_misses += 1
         elif mid in media_id_to_image_path:
             media_id_to_stem[mid] = media_id_to_image_path[mid].stem
 
-    if video_url_misses:
+    if local_video_misses:
         logger.info(
-            "Video source URL unresolved for %s Media object(s); video crops may be skipped",
-            video_url_misses,
+            "Local video file missing for %s Media object(s); video crops may be skipped",
+            local_video_misses,
         )
 
     if locs_to_crop is not None:
@@ -1263,16 +1091,16 @@ def crop_localizations_parallel(
         if group:
             image_tasks.append((image_path, group))
 
-    # Video tasks grouped by media: (video_url, media, [(frame_idx, [(loc, out_path), ...]), ...])
+    # Video tasks grouped by media: (video_path, media, [(frame_idx, [(loc, out_path), ...]), ...])
     video_tasks: list[tuple[str, Any, list[tuple[int, list[tuple[dict, Path]]]]]] = []
     skipped_video_media = 0
     for mid, locs in locs_by_media.items():
-        if mid not in media_id_to_video_url:
+        if mid not in media_id_to_video_path:
             # Only log/track skips for media that look like video (frame present)
             if any(loc.get("frame") is not None for loc in locs):
                 skipped_video_media += 1
             continue
-        video_url = media_id_to_video_url[mid]
+        video_path = media_id_to_video_path[mid]
         media = media_id_to_media.get(mid)
         stem = media_id_to_stem.get(mid) or str(mid)
         by_frame: dict[int, list[tuple[dict, Path]]] = {}
@@ -1297,11 +1125,11 @@ def crop_localizations_parallel(
             if group
         ]
         if frame_groups:
-            video_tasks.append((video_url, media, frame_groups))
+            video_tasks.append((video_path, media, frame_groups))
 
     if skipped_video_media:
         logger.info(
-            "Skipping video crops for %s media_id(s): no usable video URL found in media_files",
+            "Skipping video crops for %s media_id(s): no local downloaded video file found",
             skipped_video_media,
         )
 
@@ -1359,9 +1187,9 @@ def crop_localizations_parallel(
         logger.info(f"Image crops done: {num_ok} ok, {num_fail} failed")
 
     if video_tasks:
-        for video_url, media, frame_groups in video_tasks:
+        for video_path, media, frame_groups in video_tasks:
             ok, fail = _crop_video_media_group(
-                video_url,
+                video_path,
                 media,
                 frame_groups,
                 size,
@@ -1447,6 +1275,25 @@ def _cleanup_download_dir(project_id: int) -> None:
             logger.info(f"Removed download directory: {dl_dir}")
         except OSError as e:
             logger.info(f"Could not remove download directory {dl_dir}: {e}")
+
+
+def _cleanup_downloaded_videos(download_dir: str) -> None:
+    """Remove downloaded video files to reclaim space as soon as crops are done."""
+    if not download_dir or not os.path.isdir(download_dir):
+        return
+    removed = 0
+    for f in Path(download_dir).iterdir():
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info(f"Removed {removed} downloaded video file(s) from {download_dir}")
 
 
 def _ensure_s3_bucket_exists(bucket: str) -> None:
@@ -2914,11 +2761,9 @@ def sync_project_to_fiftyone(
                         f"No Media objects returned for {len(needed_ids)} ids; skipping download"
                     )
                 else:
-                    # For object-storage-backed videos, request presigned URLs so ffmpeg can read http(s).
-                    all_media = _presign_video_media_sources(
-                        api, all_media, expires_seconds=3600, no_cache=True
+                    logger.info(
+                        f"Saving {len(all_media)} media files to tmp (images + videos)..."
                     )
-                    logger.info(f"Saving {len(all_media)} media images to tmp (videos skipped)...")
                     dl_dir = save_media_to_tmp(
                         api, project_id, all_media, media_ids_filter=media_ids_needed
                     )
@@ -2933,6 +2778,7 @@ def sync_project_to_fiftyone(
                     locs_to_crop=locs_to_crop,
                     media_objects=all_media,
                 )
+                _cleanup_downloaded_videos(dl_dir)
             elif not locs_to_crop:
                 logger.info("No crop cache misses; skipping crop step")
 
@@ -3248,6 +3094,7 @@ def main() -> None:
                 locs_to_crop=locs_to_crop,
                 media_objects=all_media_cli,
             )
+            _cleanup_downloaded_videos(dl_dir)
 
         # Patch manifest stems from downloaded filenames and from Media (video)
         _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media_cli)
