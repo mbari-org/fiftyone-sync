@@ -746,7 +746,7 @@ def _crop_video_media_group(
     ok_total = 0
     fail_total = 0
 
-    # One ffmpeg process per batch of frames, then crop each extracted frame image.
+    # One ffmpeg process per batch of frames, then crop extracted frame images in parallel.
     batch_size = max(1, _FRAME_BATCH_SIZE)
     for start in range(0, len(frame_groups), batch_size):
         batch = frame_groups[start : start + batch_size]
@@ -754,14 +754,33 @@ def _crop_video_media_group(
         extracted = _extract_video_frames_batch(
             video_url, frame_indices, media, crop_timeout
         )
+
+        # Fan out crop work across CPUs for this batch
+        crop_tasks: list[tuple[Path, list[tuple[dict, Path]]]] = []
         for frame_idx, group in batch:
             img_path = extracted.get(int(frame_idx))
             if img_path is None:
                 fail_total += len(group)
                 continue
-            ok, fail = _crop_image_group(img_path, group, size=size)
-            ok_total += ok
-            fail_total += fail
+            crop_tasks.append((img_path, group))
+
+        if crop_tasks:
+            workers = max(1, min(frame_workers or 1, len(crop_tasks)))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [
+                    ex.submit(_crop_image_group, img_path, group, size=size)
+                    for img_path, group in crop_tasks
+                ]
+                for fut in as_completed(futures):
+                    try:
+                        ok, fail = fut.result()
+                        ok_total += ok
+                        fail_total += fail
+                    except Exception as e:
+                        # count as 1 failed crop group when unexpected
+                        fail_total += 1
+                        logger.info(f"Video crop group error: {e}")
+
         for p in extracted.values():
             _safe_unlink(p)
 
