@@ -593,6 +593,23 @@ def _extract_video_frames_batch(
     return {}
 
 
+def _crop_output_exists(out_path: Path) -> bool:
+    """True if crop file is already present and non-empty."""
+    try:
+        return out_path.is_file() and out_path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _video_frame_group_fully_cached(
+    group: list[tuple[dict, Path]],
+) -> bool:
+    """True when every localization in this frame already has a crop on disk."""
+    if not group:
+        return True
+    return all(_crop_output_exists(out_path) for _, out_path in group)
+
+
 def _crop_image_group(
     image_path: str | Path,
     locs_with_out_paths: list[tuple[dict, Path]],
@@ -610,6 +627,9 @@ def _crop_image_group(
         total_ok = 0
         total_fail = 0
         for loc, out_path in locs_with_out_paths:
+            if _crop_output_exists(out_path):
+                total_ok += 1
+                continue
             x = float(loc.get("x", 0))
             y = float(loc.get("y", 0))
             w = float(loc.get("width", 0))
@@ -746,10 +766,24 @@ def _crop_video_media_group(
     ok_total = 0
     fail_total = 0
 
+    pending_groups = [
+        (fidx, grp)
+        for fidx, grp in frame_groups
+        if not _video_frame_group_fully_cached(grp)
+    ]
+    skipped_frames = len(frame_groups) - len(pending_groups)
+    if skipped_frames:
+        logger.info(
+            "Skipping ffmpeg for %s frame(s): all crops already on disk",
+            skipped_frames,
+        )
+    if not pending_groups:
+        return (ok_total, fail_total)
+
     # One ffmpeg process per batch of frames, then crop extracted frame images in parallel.
     batch_size = max(1, _FRAME_BATCH_SIZE)
-    for start in range(0, len(frame_groups), batch_size):
-        batch = frame_groups[start : start + batch_size]
+    for start in range(0, len(pending_groups), batch_size):
+        batch = pending_groups[start : start + batch_size]
         frame_indices = [int(fidx) for fidx, _ in batch]
         extracted = _extract_video_frames_batch(
             video_url, frame_indices, media, crop_timeout
