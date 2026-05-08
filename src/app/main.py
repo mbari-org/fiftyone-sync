@@ -682,7 +682,7 @@ async def sync_to_tator(
     ),
     force_sync: bool = Query(
         False,
-        description="When False (default), only push samples whose last_modified_at is >1 min after created_at; when True, push all samples regardless of timestamps",
+        description="When False (default), only push samples whose last_modified_at is sufficiently after created_at; when True, push all samples regardless of timestamps",
     ),
 ) -> dict:
     """
