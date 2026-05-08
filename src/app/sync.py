@@ -8,6 +8,7 @@ Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping u
 
 from __future__ import annotations
 
+from collections import defaultdict
 import glob
 import json
 import logging
@@ -57,6 +58,10 @@ _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
+
+# sync_edits_to_tator: batch LocalizationList PUT/PATCH (elemental_ids / bulk update)
+_SYNC_TO_TATOR_ELEMENTAL_FETCH_CHUNK = 500
+_SYNC_TO_TATOR_BULK_PATCH_CHUNK = 500
 
 # Sample field storing Tator localization modified time (FiftyOne's last_modified_at is read-only)
 TATOR_MODIFIED_AT_FIELD = "tator_modified_at"
@@ -2050,26 +2055,101 @@ def _dataset_name_with_port(dataset_name: str, port: int) -> str:
     return name if name.endswith(suffix) else f"{name}{suffix}"
 
 
-def _update_localization_attributes(
+def _normalize_elemental_id_str(elemental_id: Any) -> str:
+    return str(elemental_id)
+
+
+def _chunk_list(items: list[Any], size: int):
+    if size <= 0:
+        raise ValueError("chunk size must be positive")
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _localization_type_id(loc: Any) -> int:
+    """Return localization type pk for bulk PATCH grouping (Tator requires one type per bulk update)."""
+    t = getattr(loc, "type", None)
+    if t is None:
+        raise ValueError("localization missing type")
+    if isinstance(t, int):
+        return t
+    tid = getattr(t, "id", None)
+    if tid is not None:
+        return int(tid)
+    raise ValueError(f"Cannot resolve localization type id from {type(t)!r}")
+
+
+def _attrs_group_key(attrs: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    return tuple(sorted(attrs.items(), key=lambda kv: kv[0]))
+
+
+def _fetch_localizations_by_elemental_ids(
     api: Any,
     project_id: int,
     version_id: int,
-    elemental_id: str,
-    attrs: dict[str, Any],
+    elemental_ids: list[str],
+    *,
+    chunk_size: int = _SYNC_TO_TATOR_ELEMENTAL_FETCH_CHUNK,
+) -> dict[str, Any]:
+    """Resolve elemental_ids to localization objects via LocalizationList PUT (by-id query body)."""
+    out: dict[str, Any] = {}
+    if not elemental_ids:
+        return out
+    unique = list(dict.fromkeys(elemental_ids))
+    for chunk in _chunk_list(unique, chunk_size):
+        locs = api.get_localization_list_by_id(
+            project_id,
+            localization_id_query={"elemental_ids": chunk},
+            version=[version_id],
+        )
+        locs_list = list(locs) if not isinstance(locs, list) else locs
+        for loc in locs_list:
+            eid = getattr(loc, "elemental_id", None)
+            if eid is None:
+                continue
+            out[str(eid)] = loc
+    return out
+
+
+def _bulk_patch_localizations_by_elemental_id(
+    api: Any,
+    project_id: int,
+    version_id: int,
+    elemental_id_to_attrs: dict[str, dict[str, Any]],
+    loc_by_eid: dict[str, Any],
 ) -> None:
     """
-    Update a localization's attributes by elemental_id.
-    Uses get_localization_list to resolve elemental_id to id, then
-    api.update_localization(id, localization_update) per Tator API.
+    Apply attribute updates using PATCH /rest/Localizations/{project} (bulk update).
+    Groups by (localization type id, attribute payload) so each request satisfies Tator's
+    single-type requirement for bulk patch.
     """
-    locs = api.get_localization_list(
-        project_id, version=[version_id], elemental_id=elemental_id
-    )
-    locs_list = list(locs) if not isinstance(locs, list) else locs
-    if not locs_list:
-        raise ValueError(f"No localization found for elemental_id={elemental_id}")
-    loc_id = locs_list[0].id
-    api.update_localization(loc_id, localization_update={"attributes": attrs})
+    groups: dict[tuple[int, tuple[tuple[str, Any], ...]], list[str]] = defaultdict(list)
+    missing: list[str] = []
+    for eid, attrs in elemental_id_to_attrs.items():
+        loc = loc_by_eid.get(eid)
+        if loc is None:
+            missing.append(eid)
+            continue
+        tid = _localization_type_id(loc)
+        groups[(tid, _attrs_group_key(attrs))].append(eid)
+
+    if missing:
+        preview = ", ".join(missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise ValueError(f"No localization found for elemental_id(s): {preview}{suffix}")
+
+    for (_tid, key), eids in groups.items():
+        attrs = dict(key)
+        for chunk in _chunk_list(eids, _SYNC_TO_TATOR_BULK_PATCH_CHUNK):
+            api.update_localization_list(
+                project_id,
+                localization_bulk_update={
+                    "attributes": attrs,
+                    "in_place": 1,
+                    "elemental_ids": chunk,
+                },
+                version=[version_id],
+            )
 
 
 def sync_edits_to_tator(
@@ -2087,10 +2167,10 @@ def sync_edits_to_tator(
 ) -> dict[str, Any]:
     """
     Push FiftyOne dataset edits (labels, confidence) back to Tator localizations.
-    Matches samples by elemental_id; looks up localization id via get_localization_list,
-    then updates attributes via update_localization(id, localization_update).
+    Matches samples by elemental_id. Fetches localizations in batches (PUT by elemental_ids),
+    then updates via bulk PATCH (update_localization_list) grouped by localization type.
     When force_sync=False (default), only samples whose last_modified_at is more than
-    1 minute after created_at are pushed, and tator_modified_at is set to last_modified_at.
+    a few seconds after created_at are pushed, and tator_modified_at is set to last_modified_at.
     When force_sync=True, all samples with attrs are pushed regardless of timestamps.
     Returns {"status": "ok", "updated": int, "failed": int, "errors": list} or raises.
     """
@@ -2180,12 +2260,15 @@ def sync_edits_to_tator(
         "yes",
     )
 
+    pending: list[tuple[Any, str, dict[str, Any], Any]] = []
+
     for sample in dataset.iter_samples(autosave=False):
         elemental_id = sample["elemental_id"] if "elemental_id" in sample else None
         if not elemental_id:
             failed += 1
             errors.append(f"Sample {sample.id}: missing elemental_id")
             continue
+        eid_str = _normalize_elemental_id_str(elemental_id)
         gt = sample["ground_truth"] if "ground_truth" in sample else None
         label = gt.label if gt else None
         confidence = sample["confidence"] if "confidence" in sample else None
@@ -2220,20 +2303,43 @@ def sync_edits_to_tator(
                 if _debug:
                     logger.info(
                         f"SKIP elem={elemental_id} last_modified_at={last_modified_at} "
-                        f"created_at={created_at_fo} (need >1min diff)"
+                        f"created_at={created_at_fo} (need >5s diff)"
                     )
                 continue
 
+        pending.append((sample, eid_str, attrs, last_modified_at))
+
+    if pending:
+        updates: dict[str, dict[str, Any]] = {}
+        for _sample, eid_str, attrs, _lm in pending:
+            updates[eid_str] = attrs
+
         try:
-            _update_localization_attributes(
-                api, project_id, version_id, elemental_id, attrs
+            loc_by_eid = _fetch_localizations_by_elemental_ids(
+                api, project_id, version_id, list(updates.keys())
             )
-            sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
-            sample.save()
-            updated += 1
+            logger.info(
+                "sync_edits_to_tator: bulk push samples=%s distinct_elemental_ids=%s "
+                "resolved_localizations=%s",
+                len(pending),
+                len(updates),
+                len(loc_by_eid),
+            )
+            _bulk_patch_localizations_by_elemental_id(
+                api, project_id, version_id, updates, loc_by_eid
+            )
         except Exception as e:
-            failed += 1
-            errors.append(f"Sample {sample.id}: {e}")
+            failed += len(pending)
+            errors.append(f"Batch update to Tator failed: {e}")
+        else:
+            for sample, _eid_str, _attrs, last_modified_at in pending:
+                try:
+                    sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
+                    sample.save()
+                    updated += 1
+                except Exception as e:
+                    failed += 1
+                    errors.append(f"Sample {sample.id}: {e}")
 
     logger.info(
         f"sync_edits_to_tator: updated={updated} skipped={skipped} failed={failed}"
