@@ -107,7 +107,7 @@ LAUNCHER_TEMPLATE = r"""
               <button type="button" id="dimreduce-btn" disabled title="Recompute dimensionality reduction using cached embeddings (does not recompute embeddings)">Recompute Dimreduce</button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
-              <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Dataset</button>
+              <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone. Not this only deletes the dataset from Voxel51, not Tator."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Voxel51 Dataset</button>
             </div>
             <div id="sync-log-panel" class="sync-log-panel" aria-live="polite" title="Sync progress log"></div>
           </td>
