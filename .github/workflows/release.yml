@@ -44,6 +44,12 @@ jobs:
           fi
 
       - if: steps.release-status.outputs.released == 'true'
+        name: Release
+        id: release
+        run: |
+          semantic-release version
+
+      - if: steps.release-status.outputs.released == 'true'
         name: Docker Build and Push
         run: |
           export RELEASE_VERSION=${{steps.release-status.outputs.tag}}
