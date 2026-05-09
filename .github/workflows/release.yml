@@ -50,7 +50,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           .venv/bin/pip install python-semantic-release
-          semantic-release version
+          .venv/bin/semantic-release version
 
       - if: steps.release-status.outputs.released == 'true'
         name: Docker Build and Push
