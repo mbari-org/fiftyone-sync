@@ -417,20 +417,6 @@ def _is_video_name(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
 
-def _is_streaming_video(m: Any) -> bool:
-    """True if Media has a single HTTP streaming URL (video, no download)."""
-    if not hasattr(m, "media_files") or m.media_files is None:
-        return False
-    if not hasattr(m.media_files, "streaming") or not m.media_files.streaming:
-        return False
-    if len(m.media_files.streaming) != 1:
-        return False
-    path = getattr(m.media_files.streaming[0], "path", None) or (
-        m.media_files.streaming[0].get("path") if isinstance(m.media_files.streaming[0], dict) else None
-    )
-    return isinstance(path, str) and path.startswith("http")
-
-
 def frame_to_timestamp(media: Any, frame: int) -> str:
     """Convert frame number to timestamp string for ffmpeg -ss (accurate frame indexing)."""
     fps = getattr(media, "fps", None)
@@ -534,6 +520,155 @@ def _extract_video_frame(
         return None
 
 
+def _extract_video_frames_batch(
+    input_str: str,
+    frame_indices: list[int],
+    media: Any,
+    crop_timeout: int,
+    *,
+    render_format: str = "png",
+) -> dict[int, Path]:
+    """
+    Extract multiple frames in one ffmpeg invocation.
+
+    Uses one input per frame (`-ss ... -i <input>`) and maps each input video stream
+    to a single output image via `-map {idx}:v -frames:v 1`.
+    """
+    if not frame_indices:
+        return {}
+
+    frames = [int(f) for f in frame_indices]
+    tmp_paths: dict[int, Path] = {}
+    out_files: list[str] = []
+
+    for frame_idx in frames:
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=f".{render_format}", prefix=f"frame_{frame_idx}_"
+        )
+        os.close(fd)
+        p = Path(tmp_path)
+        tmp_paths[frame_idx] = p
+        out_files.append(tmp_path)
+
+    args: list[str] = ["ffmpeg", "-y"]
+
+    # Inputs: one per frame, each with its own seek.
+    for frame_idx in frames:
+        args.extend(["-ss", frame_to_timestamp(media, frame_idx)])
+        args.extend(["-i", input_str])
+
+    # Outputs: map each input to exactly one frame.
+    for batch_idx, _frame_idx in enumerate(frames):
+        args.extend(["-map", f"{batch_idx}:v", "-frames:v", "1"])
+        args.append(out_files[batch_idx])
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=crop_timeout,
+        )
+        if result.returncode != 0:
+            logger.info(
+                f"ffmpeg batch extract failed for {input_str}: {(result.stderr or '')[:500]}"
+            )
+            for p in tmp_paths.values():
+                _safe_unlink(p)
+            return {}
+
+        ok: dict[int, Path] = {}
+        for frame_idx, p in tmp_paths.items():
+            if p.exists() and p.stat().st_size > 0:
+                ok[frame_idx] = p
+            else:
+                _safe_unlink(p)
+        return ok
+    except subprocess.TimeoutExpired as e:
+        logger.info(
+            f"ffmpeg batch extract timeout ({crop_timeout}s) for {input_str}: {e}"
+        )
+    except FileNotFoundError as e:
+        logger.info(f"ffmpeg not found during batch extract for {input_str}: {e}")
+    except Exception as e:
+        logger.info(f"ffmpeg batch extract error for {input_str}: {e}")
+
+    for p in tmp_paths.values():
+        _safe_unlink(p)
+    return {}
+
+
+def _crop_output_exists(out_path: Path) -> bool:
+    """True if crop file is already present and non-empty."""
+    try:
+        return out_path.is_file() and out_path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _video_frame_group_fully_cached(
+    group: list[tuple[dict, Path]],
+) -> bool:
+    """True when every localization in this frame already has a crop on disk."""
+    if not group:
+        return True
+    return all(_crop_output_exists(out_path) for _, out_path in group)
+
+
+def _crop_image_group(
+    image_path: str | Path,
+    locs_with_out_paths: list[tuple[dict, Path]],
+    *,
+    size: int,
+) -> tuple[int, int]:
+    """Crop a set of localizations from a single image file."""
+    if not locs_with_out_paths:
+        return (0, 0)
+    try:
+        img = Image.open(str(image_path))
+        img.load()
+        width, height = img.size
+
+        total_ok = 0
+        total_fail = 0
+        for loc, out_path in locs_with_out_paths:
+            if _crop_output_exists(out_path):
+                total_ok += 1
+                continue
+            x = float(loc.get("x", 0))
+            y = float(loc.get("y", 0))
+            w = float(loc.get("width", 0))
+            h = float(loc.get("height", 0))
+            if w <= 0 or h <= 0:
+                total_fail += 1
+                continue
+            x1 = int(width * x)
+            y1 = int(height * y)
+            x2 = int(width * (x + w))
+            y2 = int(height * (y + h))
+            x1 = max(0, min(x1, width - 1))
+            y1 = max(0, min(y1, height - 1))
+            x2 = max(1, min(x2, width))
+            y2 = max(1, min(y2, height))
+
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                crop = img.crop((x1, y1, x2, y2))
+                crop = crop.resize((size, size), _PIL_RESAMPLE)
+                crop.save(out_path, format="PNG")
+                total_ok += 1
+            except Exception as e:
+                logger.debug(f"PIL crop failed for {out_path}: {e}")
+                total_fail += 1
+
+        img.close()
+        return (total_ok, total_fail)
+
+    except Exception as e:
+        logger.info(f"Could not open source for cropping ({image_path}): {e}")
+        return (0, len(locs_with_out_paths))
+
+
 def _safe_unlink(path: str | Path) -> None:
     """Remove a file, ignoring errors if it doesn't exist."""
     try:
@@ -617,6 +752,80 @@ def _crop_media_group(
             _safe_unlink(frame_path)
 
 
+def _crop_video_media_group(
+    video_url: str,
+    media: Any,
+    frame_groups: list[tuple[int, list[tuple[dict, Path]]]],
+    size: int,
+    frame_workers: int,
+    crop_timeout: int,
+) -> tuple[int, int]:
+    """
+    Crop one video's localizations, grouped by frame.
+
+    This keeps scheduling at media granularity (one task per video) while still
+    reducing ffmpeg overhead by extracting multiple frames per ffmpeg invocation.
+    """
+    if not frame_groups:
+        return (0, 0)
+    ok_total = 0
+    fail_total = 0
+
+    pending_groups = [
+        (fidx, grp)
+        for fidx, grp in frame_groups
+        if not _video_frame_group_fully_cached(grp)
+    ]
+    skipped_frames = len(frame_groups) - len(pending_groups)
+    if skipped_frames:
+        logger.info(
+            "Skipping ffmpeg for %s frame(s): all crops already on disk",
+            skipped_frames,
+        )
+    if not pending_groups:
+        return (ok_total, fail_total)
+
+    # One ffmpeg process per batch of frames, then crop extracted frame images in parallel.
+    batch_size = max(1, _FRAME_BATCH_SIZE)
+    for start in range(0, len(pending_groups), batch_size):
+        batch = pending_groups[start : start + batch_size]
+        frame_indices = [int(fidx) for fidx, _ in batch]
+        extracted = _extract_video_frames_batch(
+            video_url, frame_indices, media, crop_timeout
+        )
+
+        # Fan out crop work across CPUs for this batch
+        crop_tasks: list[tuple[Path, list[tuple[dict, Path]]]] = []
+        for frame_idx, group in batch:
+            img_path = extracted.get(int(frame_idx))
+            if img_path is None:
+                fail_total += len(group)
+                continue
+            crop_tasks.append((img_path, group))
+
+        if crop_tasks:
+            workers = max(1, min(frame_workers or 1, len(crop_tasks)))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [
+                    ex.submit(_crop_image_group, img_path, group, size=size)
+                    for img_path, group in crop_tasks
+                ]
+                for fut in as_completed(futures):
+                    try:
+                        ok, fail = fut.result()
+                        ok_total += ok
+                        fail_total += fail
+                    except Exception as e:
+                        # count as 1 failed crop group when unexpected
+                        fail_total += 1
+                        logger.info(f"Video crop group error: {e}")
+
+        for p in extracted.values():
+            _safe_unlink(p)
+
+    return (ok_total, fail_total)
+
+
 def save_media_to_tmp(
     api: Any,
     project_id: int,
@@ -625,7 +834,7 @@ def save_media_to_tmp(
 ) -> str:
     """
     Download each media to an isolated download directory.
-    Videos are skipped (download not supported). Existing non-empty files are skipped.
+    Existing non-empty files are skipped.
     When media_ids_filter is provided, only media whose id is in the set are downloaded.
     Retries each download up to 3 times. Returns the download directory path.
     """
@@ -636,16 +845,13 @@ def save_media_to_tmp(
     total = len(valid)
     logger.info(f"Processing {total} media -> {out_dir}")
     downloaded = 0
-    videos_skipped = 0
+    video_downloaded = 0
     cached_skipped = 0
     failed = 0
     log_interval = max(1, total // 10)
     for idx, m in enumerate(valid, 1):
         safe_name = f"{m.id}_{m.name}"
         out_path = os.path.join(out_dir, safe_name)
-        if _is_video_name(m.name):
-            videos_skipped += 1
-            continue
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             cached_skipped += 1
             continue
@@ -657,6 +863,8 @@ def save_media_to_tmp(
                     pass
                 success = True
                 downloaded += 1
+                if _is_video_name(m.name):
+                    video_downloaded += 1
             except Exception as e:
                 logger.debug(
                     f"Download attempt {num_tries + 1}/3 failed for {m.id}: {e}"
@@ -668,10 +876,10 @@ def save_media_to_tmp(
         if idx % log_interval == 0 or idx == total:
             logger.info(
                 f"Download progress: {idx}/{total} processed "
-                f"({downloaded} saved, {videos_skipped} videos skipped, {cached_skipped} already cached, {failed} failed)"
+                f"({downloaded} saved, {video_downloaded} videos saved, {cached_skipped} already cached, {failed} failed)"
             )
     logger.info(
-        f"Download complete: {downloaded} saved, {videos_skipped} videos skipped, "
+        f"Download complete: {downloaded} saved, {video_downloaded} videos saved, "
         f"{cached_skipped} already cached, {failed} failed -> {out_dir}"
     )
     return out_dir
@@ -820,13 +1028,12 @@ def crop_localizations_parallel(
     with PIL, then the temp files are deleted. Image files are opened directly.
 
     Saves using elemental_id as filestem (e.g. elemental_id.png).
-    Image: local files from download_dir, grouped by media_id. Video: streaming URL from
-    media_objects (streaming attribute), grouped by (media_id, frame).
+    Image: local files from download_dir, grouped by media_id.
+    Video: local downloaded files from download_dir, grouped by (media_id, frame).
 
     When locs_to_crop is provided, only those localizations are cropped (cache-miss
     optimization). Otherwise falls back to reading all localizations from the JSONL.
-    media_objects: Tator Media list for cache-miss media; used to get video streaming URL
-    and stems for video (no file in download_dir).
+    media_objects: Tator Media list for cache-miss media; used for stems/fps metadata.
 
     Returns (num_cropped, num_failed).
     """
@@ -861,10 +1068,21 @@ def crop_localizations_parallel(
                     except ValueError:
                         pass
 
-    # Video: media_id -> streaming URL, stem, Media, and resolution from Tator metadata
-    media_id_to_video_url: dict[int, str] = {}
+    # Video: media_id -> local file path, stem, Media from Tator metadata
+    media_id_to_video_path: dict[int, str] = {}
     media_id_to_stem: dict[int, str] = {}
     media_id_to_media: dict[int, Any] = {}
+    if download_path.exists():
+        for f in download_path.iterdir():
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
+                stem = f.stem
+                if "_" in stem:
+                    try:
+                        mid = int(stem.split("_", 1)[0])
+                        media_id_to_video_path[mid] = str(f)
+                    except ValueError:
+                        pass
+    local_video_misses = 0
     for m in (media_objects or []):
         if not isinstance(m, tator.models.Media):
             continue
@@ -874,14 +1092,21 @@ def crop_localizations_parallel(
         media_id_to_media[mid] = m
         stem = f"{mid}_{getattr(m, 'name', '') or ''}"
         media_id_to_stem[mid] = stem
-        if _is_streaming_video(m):
-            s = m.media_files.streaming[0]
-            path = getattr(s, "path", None)
-            if path and isinstance(path, str) and path.startswith("http"):
-                media_id_to_video_url[mid] = path
-        else:
-            if mid in media_id_to_image_path:
-                media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+        name = getattr(m, "name", None) or ""
+        if _is_video_name(name):
+            local_video = media_id_to_video_path.get(mid)
+            if local_video:
+                media_id_to_stem[mid] = Path(local_video).stem
+            else:
+                local_video_misses += 1
+        elif mid in media_id_to_image_path:
+            media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+
+    if local_video_misses:
+        logger.info(
+            "Local video file missing for %s Media object(s); video crops may be skipped",
+            local_video_misses,
+        )
 
     if locs_to_crop is not None:
         loc_list = locs_to_crop
@@ -924,12 +1149,16 @@ def crop_localizations_parallel(
         if group:
             image_tasks.append((image_path, group))
 
-    # Video tasks: (video_url, frame_index, media, [(loc, out_path), ...]) one per (media_id, frame)
-    video_tasks: list[tuple[str, int, Any, list[tuple[dict, Path]]]] = []
+    # Video tasks grouped by media: (video_path, media, [(frame_idx, [(loc, out_path), ...]), ...])
+    video_tasks: list[tuple[str, Any, list[tuple[int, list[tuple[dict, Path]]]]]] = []
+    skipped_video_media = 0
     for mid, locs in locs_by_media.items():
-        if mid not in media_id_to_video_url:
+        if mid not in media_id_to_video_path:
+            # Only log/track skips for media that look like video (frame present)
+            if any(loc.get("frame") is not None for loc in locs):
+                skipped_video_media += 1
             continue
-        video_url = media_id_to_video_url[mid]
+        video_path = media_id_to_video_path[mid]
         media = media_id_to_media.get(mid)
         stem = media_id_to_stem.get(mid) or str(mid)
         by_frame: dict[int, list[tuple[dict, Path]]] = {}
@@ -948,16 +1177,35 @@ def crop_localizations_parallel(
             if frame_idx not in by_frame:
                 by_frame[frame_idx] = []
             by_frame[frame_idx].append((loc, out_path))
-        for frame_idx, group in by_frame.items():
-            if group:
-                video_tasks.append((video_url, frame_idx, media, group))
+        frame_groups = [
+            (frame_idx, group)
+            for frame_idx, group in sorted(by_frame.items(), key=lambda kv: kv[0])
+            if group
+        ]
+        if frame_groups:
+            video_tasks.append((video_path, media, frame_groups))
+
+    if skipped_video_media:
+        logger.info(
+            "Skipping video crops for %s media_id(s): no local downloaded video file found",
+            skipped_video_media,
+        )
 
     total_tasks = len(image_tasks) + len(video_tasks)
     if total_tasks == 0:
         logger.info("No localization crops to process")
         return (0, 0)
-    total_locs = sum(len(g) for _, g in image_tasks) + sum(len(g) for _, _, _, g in video_tasks)
+    total_locs = sum(len(g) for _, g in image_tasks) + sum(
+        len(group) for _, _, frame_groups in video_tasks for _, group in frame_groups
+    )
+    total_video_frames = sum(len(frame_groups) for _, _, frame_groups in video_tasks)
     logger.info(f"Cropping {total_locs} localizations in {total_tasks} tasks (size={size}x{size})")
+    if video_tasks:
+        logger.info(
+            "Video crop grouping: %s media task(s), %s frame group(s)",
+            len(video_tasks),
+            total_video_frames,
+        )
 
     image_workers = max_workers or min(128, (os.cpu_count() or 4) * 2)
     video_workers = min(_DEFAULT_VIDEO_WORKERS, len(video_tasks)) if video_tasks else 0
@@ -997,18 +1245,17 @@ def crop_localizations_parallel(
         logger.info(f"Image crops done: {num_ok} ok, {num_fail} failed")
 
     if video_tasks:
-        for batch_start in range(0, len(video_tasks), batch_size):
-            batch = video_tasks[batch_start : batch_start + batch_size]
-            with ThreadPoolExecutor(max_workers=video_workers) as ex:
-                futures = [
-                    ex.submit(
-                        _crop_media_group, video_url, group, frame_idx, size, None, media,
-                    )
-                    for video_url, frame_idx, media, group in batch
-                ]
-                ok, fail = _collect(futures)
-                num_ok += ok
-                num_fail += fail
+        for video_path, media, frame_groups in video_tasks:
+            ok, fail = _crop_video_media_group(
+                video_path,
+                media,
+                frame_groups,
+                size,
+                video_workers,
+                _DEFAULT_CROP_TIMEOUT,
+            )
+            num_ok += ok
+            num_fail += fail
         logger.info(f"Video crops done: {num_ok} ok, {num_fail} failed")
 
     logger.info(f"Crops done: {num_ok} saved to {crops_path}, {num_fail} failed")
@@ -1086,6 +1333,25 @@ def _cleanup_download_dir(project_id: int) -> None:
             logger.info(f"Removed download directory: {dl_dir}")
         except OSError as e:
             logger.info(f"Could not remove download directory {dl_dir}: {e}")
+
+
+def _cleanup_downloaded_videos(download_dir: str) -> None:
+    """Remove downloaded video files to reclaim space as soon as crops are done."""
+    if not download_dir or not os.path.isdir(download_dir):
+        return
+    removed = 0
+    for f in Path(download_dir).iterdir():
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info(f"Removed {removed} downloaded video file(s) from {download_dir}")
 
 
 def _ensure_s3_bucket_exists(bucket: str) -> None:
@@ -2654,7 +2920,9 @@ def sync_project_to_fiftyone(
                         f"No Media objects returned for {len(needed_ids)} ids; skipping download"
                     )
                 else:
-                    logger.info(f"Saving {len(all_media)} media images to tmp (videos skipped)...")
+                    logger.info(
+                        f"Saving {len(all_media)} media files to tmp (images + videos)..."
+                    )
                     dl_dir = save_media_to_tmp(
                         api, project_id, all_media, media_ids_filter=media_ids_needed
                     )
@@ -2669,6 +2937,7 @@ def sync_project_to_fiftyone(
                     locs_to_crop=locs_to_crop,
                     media_objects=all_media,
                 )
+                _cleanup_downloaded_videos(dl_dir)
             elif not locs_to_crop:
                 logger.info("No crop cache misses; skipping crop step")
 
@@ -2984,6 +3253,7 @@ def main() -> None:
                 locs_to_crop=locs_to_crop,
                 media_objects=all_media_cli,
             )
+            _cleanup_downloaded_videos(dl_dir)
 
         # Patch manifest stems from downloaded filenames and from Media (video)
         _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media_cli)
