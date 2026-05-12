@@ -62,6 +62,20 @@ def get_sync_lock_key(resolved_db: str, project_id: int, version_id: int | None)
     return f"{LOCK_KEY_PREFIX}:{resolved_db}:{project_id}:{_version_slug(version_id)}"
 
 
+def get_sync_to_tator_lock_key(
+    resolved_db: str, project_id: int, version_id: int | None
+) -> str:
+    """Return a unique key for a sync-to-tator (push) target.
+
+    Separate from ingest lock so an in-flight ingest does not block a push for the
+    same version (and vice versa); two pushes for the same target are mutually
+    exclusive. Shares the same prefix so `cleanup_all_sync_locks()` covers it.
+    """
+    return (
+        f"{LOCK_KEY_PREFIX}:push:{resolved_db}:{project_id}:{_version_slug(version_id)}"
+    )
+
+
 def try_acquire_sync_lock(
     lock_key: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,

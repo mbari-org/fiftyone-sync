@@ -93,6 +93,48 @@ def enqueue_sync(
     return job.id
 
 
+def enqueue_sync_to_tator(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str,
+    dataset_name: str | None = None,
+    label_attr: str = "Label",
+    score_attr: str | None = None,
+    debug: bool = False,
+    force_sync: bool = False,
+) -> str:
+    """
+    Enqueue a sync-to-tator job (push FiftyOne edits back to Tator). Returns RQ job id.
+    Heavy bulk-patch work runs in the RQ worker so the HTTP handler is non-blocking
+    and a slow push cannot starve the API. Requires Redis.
+    """
+    from rq import Queue
+
+    conn = get_connection()
+    queue = Queue(QUEUE_NAME, connection=conn)
+    job = queue.enqueue(
+        "src.app.sync.run_sync_to_tator_job",
+        project_id=project_id,
+        version_id=version_id,
+        api_url=api_url,
+        token=token,
+        port=port,
+        project_name=project_name,
+        dataset_name=dataset_name,
+        label_attr=label_attr,
+        score_attr=score_attr,
+        debug=debug,
+        force_sync=force_sync,
+        job_timeout=3600 * 6,  # up to 6h for very large pushes
+        result_ttl=3600 * 24,
+        failure_ttl=3600,
+    )
+    return job.id
+
+
 def enqueue_dimreduce(
     project_id: int,
     version_id: int,

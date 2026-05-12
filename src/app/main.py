@@ -686,10 +686,15 @@ async def sync_to_tator(
     ),
 ) -> dict:
     """
-    Push FiftyOne dataset edits (labels, confidence) back to Tator localizations.
-    Requires the dataset to exist (run POST /sync first). Uses elemental_id to match samples.
+    Enqueue a job that pushes FiftyOne dataset edits (labels, confidence) back to Tator
+    localizations. Returns immediately with {"job_id": ..., "status": "queued"}; poll
+    GET /sync-to-tator/status/{job_id} for progress. Requires the dataset to exist
+    (run POST /sync first) and Redis (REDIS_HOST or REDIS_URL).
+
+    Running async keeps the FastAPI worker free so a long bulk PATCH loop against
+    Tator cannot block other HTTP requests.
     """
-    from src.app.sync import sync_edits_to_tator
+    from src.app.sync_queue import enqueue_sync_to_tator
 
     project_name = None
     try:
@@ -702,23 +707,56 @@ async def sync_to_tator(
         logger.warning(f"sync_to_tator get_project({project_id}) failed: {e}")
     if not project_name or not str(project_name).strip():
         project_name = str(project_id)
+
     try:
-        result = sync_edits_to_tator(
+        job_id = enqueue_sync_to_tator(
             project_id=project_id,
             version_id=version_id,
-            port=port,
             api_url=_resolve_api_url(api_url),
             token=token,
+            port=port,
+            project_name=project_name.strip(),
             dataset_name=dataset_name,
             label_attr=label_attr,
             score_attr=score_attr,
             debug=debug,
-            project_name=project_name.strip(),
             force_sync=force_sync,
         )
-        return result
+        return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}") from e
+
+
+@app_launch.get("/sync-to-tator/status/{job_id}")
+async def sync_to_tator_status(job_id: str) -> dict:
+    """
+    Poll status of an enqueued sync-to-tator job. Returns status
+    (queued|started|finished|failed) and, when finished, the worker result
+    (status, updated, skipped, failed, errors). Requires Redis.
+    """
+    from src.app.sync_queue import get_job_status
+
+    try:
+        return get_job_status(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}") from e
+
+
+@app_launch.get("/sync-to-tator/logs/{job_id}")
+async def sync_to_tator_logs(job_id: str) -> dict:
+    """
+    Return log lines from the sync-to-tator worker for the given job (from job metadata).
+    Returns {"log_lines": list[str]}. Use while polling status to show progress in the applet.
+    """
+    from rq.exceptions import NoSuchJobError
+    from src.app.sync_queue import get_job_logs
+
+    try:
+        return get_job_logs(job_id)
+    except NoSuchJobError:
+        raise HTTPException(status_code=404, detail="Job not found") from None
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}") from e
 
 
 @app_launch.get("/dataset-exists")
