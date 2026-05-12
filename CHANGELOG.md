@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.1.2 (2026-05-12)
+
+### Performance Improvements
+
+- Run pushes via RQ with backpressure and locking (#11)
+  ([#11](https://github.com/mbari-org/fiftyone-sync/pull/11),
+  [`6124c12`](https://github.com/mbari-org/fiftyone-sync/commit/6124c126f373b0dc59954eb553083f1c4b94beb7))
+
+
 ## v0.1.1 (2026-05-12)
 
 ### Performance Improvements
