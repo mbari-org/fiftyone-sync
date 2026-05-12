@@ -385,19 +385,44 @@ Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 
 `POST /sync-to-tator` pushes FiftyOne dataset edits (labels, confidence) back to Tator localizations. Run after editing in the FiftyOne app.
 
+The endpoint is **asynchronous**: it enqueues an RQ job and returns immediately so a long bulk PATCH loop against Tator cannot block other HTTP requests. The RQ worker (`python -m src.app.sync_worker`) executes the push. Requires Redis (set `REDIS_HOST` or `REDIS_URL`).
+
 | Param | Required | Description |
 |-------|----------|-------------|
 | `project_id` | yes | Tator project ID |
 | `version_id` | yes | Tator version ID (localizations must be in this version) |
 | `api_url` | yes | Tator REST API base URL |
 | `token` | yes | Tator API token |
+| `port` | yes | Port for this project (resolves database) |
 | `dataset_name` | no | FiftyOne dataset name (default: `project_name_v{version_id}_{port}`) |
+| `label_attr` | no | Tator attribute name for label (default `Label`) |
+| `score_attr` | no | Tator attribute name for score/confidence; omit to skip |
+| `force_sync` | no | Push all samples regardless of timestamps |
 
 ```bash
-curl -X POST "http://localhost:8001/sync-to-tator?project_id=4&version_id=1&api_url=https://tator.example.com&token=YOUR_TOKEN"
+# 1. Enqueue
+curl -X POST "http://localhost:8001/sync-to-tator?project_id=4&version_id=1&port=5151&api_url=https://tator.example.com&token=YOUR_TOKEN"
+# {"job_id": "abc...", "status": "queued", "port": 5151}
+
+# 2. Poll status (queued|started|finished|failed)
+curl "http://localhost:8001/sync-to-tator/status/abc..."
+# when finished: {"status": "finished", "result": {"status": "ok", "updated": N, "skipped": K, "failed": M, "errors": [...]}}
+
+# 3. Tail logs while running
+curl "http://localhost:8001/sync-to-tator/logs/abc..."
 ```
 
-Returns `{"status": "ok", "updated": N, "failed": M, "errors": [...]}`.
+Only one push runs at a time per `(database, project, version)`; a second push for the same target returns `{"status": "busy", ...}` instead of competing for Tator writes.
+
+**Backpressure tuning** (set on the sync service; restart to apply):
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `FIFTYONE_SYNC_TO_TATOR_FETCH_CHUNK` | `100` | Elemental-id resolve chunk size (PUT by ids) |
+| `FIFTYONE_SYNC_TO_TATOR_PATCH_CHUNK` | `100` | Bulk PATCH chunk size (`update_localization_list`) |
+| `FIFTYONE_SYNC_TO_TATOR_CHUNK_DELAY_MS` | `0` | Sleep between PATCH chunks in milliseconds to smooth write bursts |
+
+If Tator becomes unresponsive during pushes, lower the chunk sizes and/or raise the inter-chunk delay (for example `FIFTYONE_SYNC_TO_TATOR_PATCH_CHUNK=50`, `FIFTYONE_SYNC_TO_TATOR_CHUNK_DELAY_MS=200`).
 
 ## Embedding API Usage
 

@@ -39,6 +39,7 @@ from src.app.database_manager import (
 )
 from src.app.sync_lock import (
     get_sync_lock_key,
+    get_sync_to_tator_lock_key,
     release_sync_lock,
     try_acquire_sync_lock,
 )
@@ -59,9 +60,48 @@ _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
 
-# sync_edits_to_tator: batch LocalizationList PUT/PATCH (elemental_ids / bulk update)
-_SYNC_TO_TATOR_ELEMENTAL_FETCH_CHUNK = 500
-_SYNC_TO_TATOR_BULK_PATCH_CHUNK = 500
+# sync_edits_to_tator: batch LocalizationList PUT/PATCH (elemental_ids / bulk update).
+# Chunk sizes are tunable via env vars so production can throttle bursts that would
+# otherwise overwhelm the Tator API (defaults reduced from 500 to 100/100).
+# FIFTYONE_SYNC_TO_TATOR_FETCH_CHUNK: elemental-id resolve chunk size (PUT by ids).
+# FIFTYONE_SYNC_TO_TATOR_PATCH_CHUNK: bulk PATCH chunk size (update_localization_list).
+# FIFTYONE_SYNC_TO_TATOR_CHUNK_DELAY_MS: optional sleep between PATCH chunks (smooths writes).
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """Parse positive int env var; fall back to default on missing/invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, val)
+
+
+def _sync_to_tator_fetch_chunk() -> int:
+    return _env_int("FIFTYONE_SYNC_TO_TATOR_FETCH_CHUNK", 100, minimum=1)
+
+
+def _sync_to_tator_patch_chunk() -> int:
+    return _env_int("FIFTYONE_SYNC_TO_TATOR_PATCH_CHUNK", 100, minimum=1)
+
+
+def _sync_to_tator_chunk_delay_seconds() -> float:
+    """Inter-chunk sleep in seconds for bulk PATCH (0 disables)."""
+    raw = os.environ.get("FIFTYONE_SYNC_TO_TATOR_CHUNK_DELAY_MS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        ms = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, ms) / 1000.0
+
+
+_SYNC_TO_TATOR_ELEMENTAL_FETCH_CHUNK = 100
+_SYNC_TO_TATOR_BULK_PATCH_CHUNK = 100
 
 # Sample field storing Tator localization modified time (FiftyOne's last_modified_at is read-only)
 TATOR_MODIFIED_AT_FIELD = "tator_modified_at"
@@ -2355,14 +2395,15 @@ def _fetch_localizations_by_elemental_ids(
     version_id: int,
     elemental_ids: list[str],
     *,
-    chunk_size: int = _SYNC_TO_TATOR_ELEMENTAL_FETCH_CHUNK,
+    chunk_size: int | None = None,
 ) -> dict[str, Any]:
     """Resolve elemental_ids to localization objects via LocalizationList PUT (by-id query body)."""
     out: dict[str, Any] = {}
     if not elemental_ids:
         return out
+    effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_fetch_chunk()
     unique = list(dict.fromkeys(elemental_ids))
-    for chunk in _chunk_list(unique, chunk_size):
+    for chunk in _chunk_list(unique, effective_chunk):
         locs = api.get_localization_list_by_id(
             project_id,
             localization_id_query={"elemental_ids": chunk},
@@ -2383,11 +2424,15 @@ def _bulk_patch_localizations_by_elemental_id(
     version_id: int,
     elemental_id_to_attrs: dict[str, dict[str, Any]],
     loc_by_eid: dict[str, Any],
+    *,
+    chunk_size: int | None = None,
+    inter_chunk_delay_seconds: float | None = None,
 ) -> None:
     """
     Apply attribute updates using PATCH /rest/Localizations/{project} (bulk update).
     Groups by (localization type id, attribute payload) so each request satisfies Tator's
-    single-type requirement for bulk patch.
+    single-type requirement for bulk patch. Adds a small inter-chunk sleep (configurable
+    via FIFTYONE_SYNC_TO_TATOR_CHUNK_DELAY_MS) to smooth write bursts against Tator.
     """
     groups: dict[tuple[int, tuple[tuple[str, Any], ...]], list[str]] = defaultdict(list)
     missing: list[str] = []
@@ -2404,9 +2449,30 @@ def _bulk_patch_localizations_by_elemental_id(
         suffix = "..." if len(missing) > 10 else ""
         raise ValueError(f"No localization found for elemental_id(s): {preview}{suffix}")
 
+    effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_patch_chunk()
+    effective_delay = (
+        inter_chunk_delay_seconds
+        if inter_chunk_delay_seconds is not None
+        else _sync_to_tator_chunk_delay_seconds()
+    )
+    total_chunks = sum(
+        max(1, (len(eids) + effective_chunk - 1) // effective_chunk)
+        for _g, eids in groups.items()
+    )
+    logger.info(
+        "sync_edits_to_tator: bulk PATCH groups=%s total_chunks=%s chunk_size=%s "
+        "inter_chunk_delay_ms=%s",
+        len(groups),
+        total_chunks,
+        effective_chunk,
+        int(effective_delay * 1000),
+    )
+
+    sent_chunks = 0
     for (_tid, key), eids in groups.items():
         attrs = dict(key)
-        for chunk in _chunk_list(eids, _SYNC_TO_TATOR_BULK_PATCH_CHUNK):
+        chunks = list(_chunk_list(eids, effective_chunk))
+        for i, chunk in enumerate(chunks):
             api.update_localization_list(
                 project_id,
                 localization_bulk_update={
@@ -2416,6 +2482,9 @@ def _bulk_patch_localizations_by_elemental_id(
                 },
                 version=[version_id],
             )
+            sent_chunks += 1
+            if effective_delay > 0 and (i + 1) < len(chunks):
+                time.sleep(effective_delay)
 
 
 def sync_edits_to_tator(
@@ -2514,6 +2583,59 @@ def sync_edits_to_tator(
         )
     ds_name = resolved
 
+    push_lock_key = get_sync_to_tator_lock_key(db_name, project_id, version_id)
+    logger.info(
+        f"Acquiring sync-to-tator lock: key={push_lock_key} "
+        f"(db={db_name}, project_id={project_id}, version_id={version_id})"
+    )
+    if not try_acquire_sync_lock(push_lock_key):
+        logger.warning(
+            f"Failed to acquire sync-to-tator lock: key={push_lock_key} - "
+            "another push is in progress"
+        )
+        return {
+            "status": "busy",
+            "message": (
+                "Another sync-to-tator push is already running for this version. "
+                "Please try again in a few minutes."
+            ),
+            "updated": 0,
+            "skipped": 0,
+            "failed": 0,
+            "errors": [],
+        }
+
+    try:
+        return _do_sync_edits_to_tator(
+            api=api,
+            project_id=project_id,
+            version_id=version_id,
+            ds_name=ds_name,
+            label_attr=label_attr,
+            score_attr=score_attr,
+            debug=debug,
+            force_sync=force_sync,
+        )
+    finally:
+        logger.info(f"Releasing sync-to-tator lock: key={push_lock_key}")
+        try:
+            release_sync_lock(push_lock_key)
+        except Exception as e:  # pragma: no cover - best-effort release
+            logger.warning(f"Failed to release sync-to-tator lock {push_lock_key}: {e}")
+
+
+def _do_sync_edits_to_tator(
+    *,
+    api: Any,
+    project_id: int,
+    version_id: int,
+    ds_name: str,
+    label_attr: str | None,
+    score_attr: str | None,
+    debug: bool,
+    force_sync: bool,
+) -> dict[str, Any]:
+    """Inner push routine; the public wrapper handles DB selection and locking."""
     dataset = fo.load_dataset(ds_name)
 
     updated = 0
@@ -2670,6 +2792,74 @@ def run_sync_job(
             vss_project_key=vss_project_key,
             s3_bucket=s3_bucket,
             s3_prefix=s3_prefix,
+        )
+    finally:
+        if job_meta_handler is not None:
+            try:
+                logger.removeHandler(job_meta_handler)
+                job_meta_handler.close()
+            except Exception:
+                pass
+
+
+def run_sync_to_tator_job(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str,
+    dataset_name: str | None = None,
+    label_attr: str = "Label",
+    score_attr: str | None = None,
+    debug: bool = False,
+    force_sync: bool = False,
+) -> dict[str, Any]:
+    """
+    Entrypoint for RQ worker: push FiftyOne edits back to Tator.
+
+    Running in the worker keeps long bulk PATCH loops off the HTTP event loop so the
+    FastAPI service stays responsive even when pushing thousands of localizations.
+    Attaches a job.meta log handler so the launcher applet can poll for progress.
+    """
+    from src.app.database_manager import register_project_id_name
+
+    logger.info(
+        "run_sync_to_tator_job received project_id=%s version_id=%s port=%s "
+        "dataset_name=%r force_sync=%s",
+        project_id,
+        version_id,
+        port,
+        dataset_name,
+        force_sync,
+    )
+
+    job_meta_handler: logging.Handler | None = None
+    try:
+        from rq import get_current_job
+
+        job = get_current_job()
+        if job is not None:
+            job_meta_handler = _JobMetaLogHandler(job)
+            job_meta_handler.setLevel(logging.DEBUG)
+            logger.addHandler(job_meta_handler)
+    except Exception:  # rq not installed or no worker context
+        pass
+
+    try:
+        register_project_id_name(project_id, project_name)
+        return sync_edits_to_tator(
+            project_id=project_id,
+            version_id=version_id,
+            port=port,
+            api_url=api_url,
+            token=token,
+            dataset_name=dataset_name,
+            label_attr=label_attr,
+            score_attr=score_attr,
+            debug=debug,
+            project_name=project_name,
+            force_sync=force_sync,
         )
     finally:
         if job_meta_handler is not None:
