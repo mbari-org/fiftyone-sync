@@ -660,6 +660,104 @@ async def dimreduce_logs(job_id: str) -> dict:
         ) from e
 
 
+@app_launch.post("/recompute-crops")
+async def recompute_crops(
+    project_id: int = Query(..., description="Tator project ID"),
+    version_id: int = Query(..., description="Tator version ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    token: str = Query(..., description="Tator API token"),
+    port: int = Query(..., description="Port for this project"),
+    force: bool = Query(
+        False,
+        description="When True, recompute all crops (overwrite existing files and refresh manifest)",
+    ),
+    force_sync: bool = Query(
+        False,
+        description="When True, refetch localizations instead of using recent local JSONL cache",
+    ),
+    vss_project_key: str | None = Query(
+        None, description="Optional VSS project key (for multi-VSS projects)"
+    ),
+    s3_bucket: str | None = Query(
+        None,
+        description="Optional S3 bucket for crop image sync (crops dir only, not full images)",
+    ),
+    s3_prefix: str | None = Query(
+        None, description="Optional S3 prefix (folder) for crop image sync"
+    ),
+) -> dict:
+    """
+    Enqueue a crop-recompute job for this project/version.
+    Returns immediately with {"job_id": ..., "status": "queued"}; poll
+    GET /recompute-crops/status/{job_id} and /recompute-crops/logs/{job_id}.
+    """
+    from src.app.sync_queue import enqueue_recompute_crops
+
+    project_name: str | None = None
+    try:
+        import tator
+
+        api = tator.get_api(_resolve_api_url(api_url), token)
+        proj = api.get_project(project_id)
+        project_name = getattr(proj, "name", None) or str(project_id)
+    except Exception as e:
+        logger.warning(f"recompute_crops get_project({project_id}) failed: {e}")
+    if not project_name or not str(project_name).strip():
+        project_name = str(project_id)
+
+    try:
+        job_id = enqueue_recompute_crops(
+            project_id=project_id,
+            version_id=version_id,
+            api_url=_resolve_api_url(api_url),
+            token=token,
+            port=port,
+            project_name=project_name.strip(),
+            force=force,
+            force_sync=force_sync,
+            vss_project_key=vss_project_key,
+            s3_bucket=s3_bucket,
+            s3_prefix=s3_prefix,
+        )
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "port": port,
+            "version_id": version_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}") from e
+
+
+@app_launch.get("/recompute-crops/status/{job_id}")
+async def recompute_crops_status(job_id: str) -> dict:
+    """Poll status of an enqueued crop-recompute job."""
+    from src.app.sync_queue import get_job_status
+
+    try:
+        return get_job_status(job_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Redis unavailable: {e}"
+        ) from e
+
+
+@app_launch.get("/recompute-crops/logs/{job_id}")
+async def recompute_crops_logs(job_id: str) -> dict:
+    """Return log lines from the crop-recompute worker job."""
+    from rq.exceptions import NoSuchJobError
+    from src.app.sync_queue import get_job_logs
+
+    try:
+        return get_job_logs(job_id)
+    except NoSuchJobError:
+        raise HTTPException(status_code=404, detail="Job not found") from None
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Redis unavailable: {e}"
+        ) from e
+
+
 @app_launch.post("/sync-to-tator")
 async def sync_to_tator(
     project_id: int = Query(..., description="Tator project ID"),

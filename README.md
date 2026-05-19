@@ -101,6 +101,9 @@ flowchart TD
   - `GET /launch` - Allocate port, return FiftyOne App URL
   - `POST /sync` - Enqueue Tator-to-FiftyOne sync (requires Redis): fetch media + localizations, crop, build FiftyOne dataset, launch app. Returns `job_id` immediately; poll `GET /sync/status/{job_id}` for completion.
   - `GET /sync/status/{job_id}` - Poll status of a queued sync job.
+  - `POST /recompute-crops` - Enqueue a crop-only recompute job for an existing project/version. With `force=true`, recompute all localizations (overwrite existing crop files) and refresh `crop_manifest.json`; with `force=false`, recompute cache misses only.
+  - `GET /recompute-crops/status/{job_id}` - Poll status of a queued crop-recompute job.
+  - `GET /recompute-crops/logs/{job_id}` - Return worker log lines for a crop-recompute job.
   - `POST /sync-to-tator` - Push FiftyOne dataset edits (labels, confidence) back to Tator localizations
   - `GET /versions` - Return Tator versions for a project (query params: `project_id`, `api_url`; token via `Authorization: Token <token>` header only)
   - FiftyOne opens in a **new browser tab** (not in an iframe). Set **`iframe_host`** to the host where the FiftyOne app runs so the Open FiftyOne URL is correct (e.g. same host as Tator or `localhost`).
