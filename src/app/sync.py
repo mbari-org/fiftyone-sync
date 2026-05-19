@@ -1725,6 +1725,287 @@ def _cleanup_deleted_crops(
     return removed
 
 
+def _resolve_localizations_jsonl(
+    api: Any,
+    *,
+    project_id: int,
+    version_id: int | None,
+    api_url: str,
+    token: str,
+    force_sync: bool,
+    media_id_batch_size: int,
+    localization_batch_size: int,
+) -> tuple[str, list[int], bool]:
+    """
+    Resolve localizations JSONL and media ids for crop work.
+
+    Returns (localizations_path, media_ids_list, use_cached_jsonl).
+    """
+    jsonl_path = _localizations_jsonl_path(project_id, version_id)
+    localizations_path = ""
+    media_ids_list: list[int] = []
+    use_cached_jsonl = False
+    if not force_sync and _file_newer_than_days(jsonl_path, days=1.0):
+        line_count, media_ids_from_jsonl = _localizations_jsonl_line_count_and_media_ids(
+            jsonl_path
+        )
+        api_count = _get_localization_count_from_api(
+            api,
+            project_id,
+            version_id,
+            media_ids_from_jsonl or None,
+            media_id_batch_size,
+        )
+        if api_count is not None and line_count == api_count:
+            use_cached_jsonl = True
+            localizations_path = jsonl_path
+            media_ids_list = media_ids_from_jsonl
+            logger.info(
+                "Bypassing media and localization fetch: JSONL is newer than 1 day and "
+                "line count (%s) matches get_localization_count",
+                line_count,
+            )
+
+    if not use_cached_jsonl:
+        logger.info(
+            "Fetching media IDs... host=%s project_id=%s api_url=%s",
+            api_url.rstrip("/"),
+            project_id,
+            api_url,
+        )
+        media_ids_list = fetch_project_media_ids(
+            api_url, token, project_id, version_id=version_id
+        )
+        logger.info("Fetching localizations...")
+        localizations_path = fetch_and_save_localizations(
+            api,
+            project_id,
+            version_id=version_id,
+            media_ids=media_ids_list or None,
+            localization_batch_size=localization_batch_size,
+            media_id_batch_size=media_id_batch_size,
+        )
+    return (localizations_path, media_ids_list, use_cached_jsonl)
+
+
+def _load_localizations_list_and_manifest(
+    localizations_jsonl_path: str,
+) -> tuple[list[dict], dict[str, dict], set[int]]:
+    """Load JSONL localizations and build a fresh manifest map."""
+    localizations: list[dict] = []
+    updated_manifest: dict[str, dict] = {}
+    media_ids: set[int] = set()
+    with open(localizations_jsonl_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                loc = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            eid = loc.get("elemental_id") or loc.get("id")
+            media_id = loc.get("media")
+            if eid is None or media_id is None:
+                continue
+            eid = str(eid)
+            mid = int(media_id)
+            modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
+            localizations.append(loc)
+            media_ids.add(mid)
+            updated_manifest[eid] = {
+                "modified_at": modified_at,
+                "media_id": mid,
+                "media_stem": str(mid),
+            }
+    return (localizations, updated_manifest, media_ids)
+
+
+def _delete_existing_crop_files(
+    locs_to_crop: list[dict], updated_manifest: dict[str, dict], crops_dir: str
+) -> int:
+    """Delete existing crop files for localizations to force overwrite."""
+    crops_path = Path(crops_dir)
+    removed = 0
+    for loc in locs_to_crop:
+        eid = loc.get("elemental_id") or loc.get("id")
+        if eid is None:
+            continue
+        entry = updated_manifest.get(str(eid)) or {}
+        media_stem = entry.get("media_stem")
+        if not media_stem:
+            media_id = loc.get("media")
+            if media_id is None:
+                continue
+            media_stem = str(int(media_id))
+        crop_file = crops_path / str(media_stem) / f"{eid}.png"
+        if crop_file.exists():
+            try:
+                crop_file.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info("Force crop recompute removed %s existing crop file(s)", removed)
+    return removed
+
+
+def _run_crop_pipeline(
+    api: Any,
+    *,
+    project_id: int,
+    version_id: int | None,
+    api_url: str,
+    token: str,
+    force_sync: bool,
+    force: bool,
+    media_id_batch_size: int,
+    localization_batch_size: int,
+    s3_bucket: str | None = None,
+    s3_crops_prefix: str | None = None,
+) -> dict[str, Any]:
+    """
+    Run crop refresh pipeline and return counts/paths/context.
+
+    This function is shared by full sync and crop-recompute jobs.
+    """
+    dl_dir = _download_dir(project_id)
+    crops = _crops_dir(project_id, version_id)
+    localizations_path = ""
+    localizations_count = 0
+    cache_misses = 0
+    cache_hits = 0
+    removed_existing = 0
+    num_cropped = 0
+    num_failed = 0
+    used_cached_jsonl = False
+    try:
+        (
+            localizations_path,
+            media_ids_list,
+            used_cached_jsonl,
+        ) = _resolve_localizations_jsonl(
+            api,
+            project_id=project_id,
+            version_id=version_id,
+            api_url=api_url,
+            token=token,
+            force_sync=force_sync,
+            media_id_batch_size=media_id_batch_size,
+            localization_batch_size=localization_batch_size,
+        )
+        if localizations_path:
+            logger.info("saved_localizations_path (JSONL): %s", localizations_path)
+        old_manifest = _load_crop_manifest(project_id, version_id)
+        if force:
+            (
+                all_locs,
+                updated_manifest,
+                media_ids_needed,
+            ) = _load_localizations_list_and_manifest(localizations_path)
+            locs_to_crop = all_locs
+            _cleanup_deleted_crops(old_manifest, updated_manifest, crops)
+            removed_existing = _delete_existing_crop_files(
+                locs_to_crop, updated_manifest, crops
+            )
+            logger.info(
+                "Force crop recompute enabled — scheduling all %s localizations",
+                len(locs_to_crop),
+            )
+        else:
+            media_ids_needed, locs_to_crop, updated_manifest = _find_crop_cache_misses(
+                localizations_jsonl_path=localizations_path,
+                crops_dir=crops,
+                manifest=old_manifest,
+                download_dir=dl_dir,
+            )
+            _cleanup_deleted_crops(old_manifest, updated_manifest, crops)
+
+        localizations_count = len(updated_manifest)
+        cache_misses = len(locs_to_crop)
+        cache_hits = max(0, localizations_count - cache_misses)
+
+        all_media: list[Any] = []
+        if not media_ids_list:
+            logger.info("No media IDs for project %s; skipping download", project_id)
+        elif not media_ids_needed:
+            logger.info(
+                "All %s crops are cached; skipping media download", localizations_count
+            )
+        else:
+            needed_ids = [mid for mid in media_ids_list if mid in media_ids_needed]
+            logger.info(
+                "Getting %s/%s media objects for cropping...",
+                len(needed_ids),
+                len(media_ids_list),
+            )
+            all_media = get_media_chunked(
+                api, project_id, needed_ids, media_id_batch_size=media_id_batch_size
+            )
+            if not all_media:
+                logger.info(
+                    "No Media objects returned for %s ids; skipping download",
+                    len(needed_ids),
+                )
+            else:
+                logger.info(
+                    "Saving %s media files to tmp (images + videos)...", len(all_media)
+                )
+                dl_dir = save_media_to_tmp(
+                    api, project_id, all_media, media_ids_filter=media_ids_needed
+                )
+
+        if locs_to_crop and localizations_path:
+            num_cropped, num_failed = crop_localizations_parallel(
+                dl_dir,
+                localizations_path,
+                crops,
+                size=224,
+                locs_to_crop=locs_to_crop,
+                media_objects=all_media,
+            )
+            _cleanup_downloaded_videos(dl_dir)
+        elif not locs_to_crop:
+            logger.info("No crop cache misses; skipping crop step")
+
+        _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
+        _save_crop_manifest(project_id, version_id, updated_manifest)
+
+        if s3_bucket and os.path.isdir(crops):
+            _sync_local_dir_with_s3(crops, s3_bucket, s3_crops_prefix)
+
+        _cleanup_download_dir(project_id)
+        return {
+            "status": "ok",
+            "saved_media_dir": dl_dir or None,
+            "saved_localizations_path": localizations_path or None,
+            "saved_crops_dir": crops or None,
+            "localizations_count": localizations_count,
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "num_cropped": num_cropped,
+            "num_failed": num_failed,
+            "removed_existing": removed_existing,
+            "used_cached_jsonl": used_cached_jsonl,
+        }
+    except Exception as e:
+        logger.error(f"Crop pipeline failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "saved_media_dir": dl_dir or None,
+            "saved_localizations_path": localizations_path or None,
+            "saved_crops_dir": crops or None,
+            "localizations_count": localizations_count,
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "num_cropped": num_cropped,
+            "num_failed": num_failed,
+            "removed_existing": removed_existing,
+            "used_cached_jsonl": used_cached_jsonl,
+        }
+
+
 def _tator_localization_url(
     api_url: str,
     project_id: int,
@@ -2927,6 +3208,159 @@ def run_sync_job(
                 pass
 
 
+def recompute_crops_for_version(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str | None = None,
+    force: bool = False,
+    force_sync: bool = False,
+    vss_project_key: str | None = None,
+    s3_bucket: str | None = None,
+    s3_prefix: str | None = None,
+    database_name: str | None = None,
+) -> dict[str, Any]:
+    """
+    Recompute crops for a project/version without building the dataset.
+
+    Uses the same crop pipeline as full sync; force=True recomputes all crops by
+    bypassing cache-hit checks and deleting existing crop files before recropping.
+    """
+    if not (s3_bucket and s3_bucket.strip()):
+        s3_cfg = get_s3_config(
+            project_id, project_name=project_name, vss_project_key=vss_project_key
+        )
+        if s3_cfg:
+            s3_bucket = s3_cfg.get("s3_bucket") or None
+            s3_prefix = s3_cfg.get("s3_prefix") or s3_prefix
+    if s3_bucket:
+        s3_bucket = s3_bucket.strip()
+        s3_prefix = (s3_prefix or "").strip() or None
+    s3_crops_prefix = (
+        _s3_crops_prefix(s3_prefix, project_id, version_id) if s3_bucket else None
+    )
+    resolved_db = (
+        database_name.strip() if database_name and database_name.strip() else None
+    ) or get_database_name(project_id, port, project_name=project_name)
+    lock_key = get_sync_lock_key(resolved_db, project_id, version_id)
+    logger.info(
+        "Acquiring crop-recompute lock: key=%s project_id=%s version_id=%s force=%s force_sync=%s",
+        lock_key,
+        project_id,
+        version_id,
+        force,
+        force_sync,
+    )
+    if not try_acquire_sync_lock(lock_key):
+        return {
+            "status": "busy",
+            "message": "This dataset is being updated by another sync. Please try again in a few minutes.",
+            "database_name": resolved_db,
+        }
+
+    config_path = os.getenv("FIFTYONE_SYNC_CONFIG_PATH")
+    config: dict[str, Any] = {}
+    if config_path and os.path.exists(config_path):
+        try:
+            config = _load_config(config_path)
+        except Exception as e:
+            logger.info(f"Failed to load config {config_path}: {e}")
+    media_id_batch_size = (
+        config.get("media_id_batch_size") or _DEFAULT_MEDIA_ID_BATCH_SIZE
+    )
+    localization_batch_size = (
+        config.get("localization_batch_size") or _DEFAULT_LOCALIZATION_BATCH_SIZE
+    )
+
+    try:
+        api = tator.get_api(api_url.rstrip("/"), token)
+        crop_result = _run_crop_pipeline(
+            api,
+            project_id=project_id,
+            version_id=version_id,
+            api_url=api_url,
+            token=token,
+            force_sync=force_sync,
+            force=force,
+            media_id_batch_size=media_id_batch_size,
+            localization_batch_size=localization_batch_size,
+            s3_bucket=s3_bucket,
+            s3_crops_prefix=s3_crops_prefix,
+        )
+        crop_result["database_name"] = resolved_db
+        crop_result["force"] = force
+        crop_result["force_sync"] = force_sync
+        crop_result["port"] = port
+        return crop_result
+    finally:
+        logger.info(f"Releasing crop-recompute lock: key={lock_key}")
+        release_sync_lock(lock_key)
+
+
+def run_recompute_crops_job(
+    project_id: int,
+    version_id: int,
+    api_url: str,
+    token: str,
+    port: int,
+    project_name: str,
+    force: bool = False,
+    force_sync: bool = False,
+    vss_project_key: str | None = None,
+    s3_bucket: str | None = None,
+    s3_prefix: str | None = None,
+    database_name: str | None = None,
+) -> dict[str, Any]:
+    """RQ entrypoint for queued crop recompute jobs."""
+    from src.app.database_manager import register_project_id_name
+
+    logger.info(
+        "run_recompute_crops_job received project_id=%s version_id=%s port=%s force=%s force_sync=%s",
+        project_id,
+        version_id,
+        port,
+        force,
+        force_sync,
+    )
+    job_meta_handler: logging.Handler | None = None
+    try:
+        from rq import get_current_job
+
+        job = get_current_job()
+        if job is not None:
+            job_meta_handler = _JobMetaLogHandler(job)
+            job_meta_handler.setLevel(logging.DEBUG)
+            logger.addHandler(job_meta_handler)
+    except Exception:  # rq not installed or no worker context
+        pass
+
+    try:
+        register_project_id_name(project_id, project_name)
+        return recompute_crops_for_version(
+            project_id=project_id,
+            version_id=version_id,
+            api_url=api_url,
+            token=token,
+            port=port,
+            project_name=project_name,
+            force=force,
+            force_sync=force_sync,
+            vss_project_key=vss_project_key,
+            s3_bucket=s3_bucket,
+            s3_prefix=s3_prefix,
+            database_name=database_name,
+        )
+    finally:
+        if job_meta_handler is not None:
+            try:
+                logger.removeHandler(job_meta_handler)
+                job_meta_handler.close()
+            except Exception:
+                pass
+
+
 def run_sync_to_tator_job(
     project_id: int,
     version_id: int,
@@ -3149,125 +3583,47 @@ def sync_project_to_fiftyone(
     )
 
     try:
-        dl_dir = _download_dir(project_id)
+        dl_dir = ""
         localizations_path = ""
         crops = _crops_dir(project_id, version_id)
+        use_cached_jsonl = False
         try:
             host = api_url.rstrip("/")
             api = tator.get_api(host, token)
-
-            # Bypass: skip expensive media + localization fetch when JSONL is fresh and count matches (unless force_sync)
-            jsonl_path = _localizations_jsonl_path(project_id, version_id)
-            use_cached_jsonl = False
-            if not force_sync and _file_newer_than_days(jsonl_path, days=1.0):
-                line_count, media_ids_from_jsonl = (
-                    _localizations_jsonl_line_count_and_media_ids(jsonl_path)
-                )
-                api_count = _get_localization_count_from_api(
-                    api,
-                    project_id,
-                    version_id,
-                    media_ids_from_jsonl or None,
-                    media_id_batch_size,
-                )
-                if api_count is not None and line_count == api_count:
-                    use_cached_jsonl = True
-                    localizations_path = jsonl_path
-                    media_ids_list = media_ids_from_jsonl
-                    logger.info(
-                        f"Bypassing media and localization fetch: JSONL is newer than 1 day and "
-                        f"line count ({line_count}) matches get_localization_count"
-                    )
-
-            if not use_cached_jsonl:
-                # 1. Fetch media IDs (lightweight metadata, needed for localization query)
-                logger.info(
-                    f"Fetching media IDs... host={host} project_id={project_id} api_url={api_url}"
-                )
-                media_ids_list = fetch_project_media_ids(
-                    api_url, token, project_id, version_id=version_id
-                )
-
-                # 2. Fetch localizations first (cheap metadata)
-                logger.info("Fetching localizations...")
-                localizations_path = fetch_and_save_localizations(
-                    api,
-                    project_id,
-                    version_id=version_id,
-                    media_ids=media_ids_list or None,
-                    localization_batch_size=localization_batch_size,
-                    media_id_batch_size=media_id_batch_size,
-                )
-
-            if localizations_path:
-                logger.info(f"saved_localizations_path (JSONL): {localizations_path}")
-
-            # 3. Determine which crops are missing or stale (cache miss)
-            old_manifest = _load_crop_manifest(project_id, version_id)
-            media_ids_needed, locs_to_crop, updated_manifest = _find_crop_cache_misses(
-                localizations_jsonl_path=localizations_path,
-                crops_dir=crops,
-                manifest=old_manifest,
-                download_dir=dl_dir,
+            crop_result = _run_crop_pipeline(
+                api,
+                project_id=project_id,
+                version_id=version_id,
+                api_url=api_url,
+                token=token,
+                force_sync=force_sync,
+                force=False,
+                media_id_batch_size=media_id_batch_size,
+                localization_batch_size=localization_batch_size,
+                s3_bucket=s3_bucket,
+                s3_crops_prefix=s3_crops_prefix,
             )
-
-            # 4. Clean up orphaned crop files for deleted localizations
-            _cleanup_deleted_crops(old_manifest, updated_manifest, crops)
-
-            # 5. Download only media that have cache misses; get Media objects for cropping
-            all_media: list[Any] = []
-            if not media_ids_list:
-                logger.info(f"No media IDs for project {project_id}; skipping download")
-            elif not media_ids_needed:
-                logger.info(
-                    f"All {len(updated_manifest)} crops are cached; skipping media download"
-                )
-            else:
-                needed_ids = [mid for mid in media_ids_list if mid in media_ids_needed]
-                logger.info(
-                    f"Getting {len(needed_ids)}/{len(media_ids_list)} media objects (cache misses)..."
-                )
-                all_media = get_media_chunked(
-                    api, project_id, needed_ids, media_id_batch_size=media_id_batch_size
-                )
-                if not all_media:
-                    logger.info(
-                        f"No Media objects returned for {len(needed_ids)} ids; skipping download"
-                    )
-                else:
-                    logger.info(
-                        f"Saving {len(all_media)} media files to tmp (images + videos)..."
-                    )
-                    dl_dir = save_media_to_tmp(
-                        api, project_id, all_media, media_ids_filter=media_ids_needed
-                    )
-
-            # 6. Crop only the cache-miss localizations (ffmpeg; image + video)
-            if locs_to_crop and localizations_path:
-                crop_localizations_parallel(
-                    dl_dir,
-                    localizations_path,
-                    crops,
-                    size=224,
-                    locs_to_crop=locs_to_crop,
-                    media_objects=all_media,
-                )
-                _cleanup_downloaded_videos(dl_dir)
-            elif not locs_to_crop:
-                logger.info("No crop cache misses; skipping crop step")
-
-            # 7. Patch manifest stems from downloaded filenames and from Media (video)
-            _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
-
-            # 8. Persist the updated manifest
-            _save_crop_manifest(project_id, version_id, updated_manifest)
-
-            # 9. Optional: two-way sync crop images with S3 (prefix = e.g. fiftyone/raw/12/v21/crops)
-            if s3_bucket and os.path.isdir(crops):
-                _sync_local_dir_with_s3(crops, s3_bucket, s3_crops_prefix)
-
-            # 10. Remove downloaded media to reclaim disk space
-            _cleanup_download_dir(project_id)
+            if crop_result.get("status") != "ok":
+                return {
+                    "status": "error",
+                    "message": crop_result.get("message") or "Crop pipeline failed",
+                    "database_name": resolved_db,
+                    "saved_media_dir": crop_result.get("saved_media_dir"),
+                    "saved_localizations_path": crop_result.get(
+                        "saved_localizations_path"
+                    ),
+                    "saved_crops_dir": crop_result.get("saved_crops_dir"),
+                }
+            dl_dir = str(crop_result.get("saved_media_dir") or "")
+            localizations_path = str(crop_result.get("saved_localizations_path") or "")
+            use_cached_jsonl = bool(crop_result.get("used_cached_jsonl"))
+            logger.info(
+                "Crop pipeline complete: cropped=%s failed=%s misses=%s hits=%s",
+                crop_result.get("num_cropped"),
+                crop_result.get("num_failed"),
+                crop_result.get("cache_misses"),
+                crop_result.get("cache_hits"),
+            )
 
         except Exception as e:
             logger.error(f"Sync failed: {e}")
