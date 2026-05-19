@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.2.0 (2026-05-19)
+
+### Features
+
+- Queue crop recompute and improve sync throughput (#13)
+  ([#13](https://github.com/mbari-org/fiftyone-sync/pull/13),
+  [`3a77370`](https://github.com/mbari-org/fiftyone-sync/commit/3a77370d6335b8ce067f22fea091bd481ea657ce))
+
+
 ## v0.1.2 (2026-05-12)
 
 ### Performance Improvements
