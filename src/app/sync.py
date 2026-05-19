@@ -655,6 +655,89 @@ def _video_frame_group_fully_cached(
     return all(_crop_output_exists(out_path) for _, out_path in group)
 
 
+def _compute_square_coordinates(
+    loc: dict[str, Any], image_width: int, image_height: int
+) -> tuple[int, int, int, int] | None:
+    """
+    Compute in-frame square crop coordinates for a normalized localization box.
+
+    Pads the shorter side to make a square, then shifts/clamps to keep the crop
+    fully inside the frame to avoid out-of-frame black bars.
+    """
+    x = float(loc.get("x", 0))
+    y = float(loc.get("y", 0))
+    w = float(loc.get("width", 0))
+    h = float(loc.get("height", 0))
+    if w <= 0 or h <= 0 or image_width <= 0 or image_height <= 0:
+        return None
+
+    x1 = int(image_width * x)
+    y1 = int(image_height * y)
+    x2 = int(image_width * (x + w))
+    y2 = int(image_height * (y + h))
+
+    x1 = max(0, min(x1, image_width - 1))
+    y1 = max(0, min(y1, image_height - 1))
+    x2 = max(x1 + 1, min(x2, image_width))
+    y2 = max(y1 + 1, min(y2, image_height))
+
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return None
+
+    shorter_side = min(height, width)
+    longer_side = max(height, width)
+    delta = longer_side - shorter_side
+    pad_before = delta // 2
+    pad_after = delta - pad_before
+
+    if width < height:
+        x1 -= pad_before
+        x2 += pad_after
+    elif height < width:
+        y1 -= pad_before
+        y2 += pad_after
+
+    if y1 < 0:
+        shift = -y1
+        y1 = 0
+        y2 = min(image_height, y2 + shift)
+    if y2 > image_height:
+        shift = y2 - image_height
+        y2 = image_height
+        y1 = max(0, y1 - shift)
+
+    if x1 < 0:
+        shift = -x1
+        x1 = 0
+        x2 = min(image_width, x2 + shift)
+    if x2 > image_width:
+        shift = x2 - image_width
+        x2 = image_width
+        x1 = max(0, x1 - shift)
+
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    if crop_w <= 0 or crop_h <= 0:
+        return None
+
+    # If frame bounds prevented perfect padding, enforce in-frame square by
+    # shrinking the longer side to the shorter one around the crop center.
+    if crop_w != crop_h:
+        side = min(crop_w, crop_h)
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        x1 = max(0, min(cx - (side // 2), image_width - side))
+        y1 = max(0, min(cy - (side // 2), image_height - side))
+        x2 = x1 + side
+        y2 = y1 + side
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
 def _crop_image_group(
     image_path: str | Path,
     locs_with_out_paths: list[tuple[dict, Path]],
@@ -675,21 +758,11 @@ def _crop_image_group(
             if _crop_output_exists(out_path):
                 total_ok += 1
                 continue
-            x = float(loc.get("x", 0))
-            y = float(loc.get("y", 0))
-            w = float(loc.get("width", 0))
-            h = float(loc.get("height", 0))
-            if w <= 0 or h <= 0:
+            square_coords = _compute_square_coordinates(loc, width, height)
+            if square_coords is None:
                 total_fail += 1
                 continue
-            x1 = int(width * x)
-            y1 = int(height * y)
-            x2 = int(width * (x + w))
-            y2 = int(height * (y + h))
-            x1 = max(0, min(x1, width - 1))
-            y1 = max(0, min(y1, height - 1))
-            x2 = max(1, min(x2, width))
-            y2 = max(1, min(y2, height))
+            x1, y1, x2, y2 = square_coords
 
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -755,21 +828,11 @@ def _crop_media_group(
         total_ok = 0
         total_fail = 0
         for loc, out_path in locs_with_out_paths:
-            x = float(loc.get("x", 0))
-            y = float(loc.get("y", 0))
-            w = float(loc.get("width", 0))
-            h = float(loc.get("height", 0))
-            if w <= 0 or h <= 0:
+            square_coords = _compute_square_coordinates(loc, width, height)
+            if square_coords is None:
                 total_fail += 1
                 continue
-            x1 = int(width * x)
-            y1 = int(height * y)
-            x2 = int(width * (x + w))
-            y2 = int(height * (y + h))
-            x1 = max(0, min(x1, width - 1))
-            y1 = max(0, min(y1, height - 1))
-            x2 = max(1, min(x2, width))
-            y2 = max(1, min(y2, height))
+            x1, y1, x2, y2 = square_coords
 
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2403,7 +2466,14 @@ def _fetch_localizations_by_elemental_ids(
         return out
     effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_fetch_chunk()
     unique = list(dict.fromkeys(elemental_ids))
-    for chunk in _chunk_list(unique, effective_chunk):
+    total_chunks = max(1, (len(unique) + effective_chunk - 1) // effective_chunk)
+    logger.info(
+        "sync_edits_to_tator: fetch_localizations chunks=%s chunk_size=%s unique_ids=%s",
+        total_chunks,
+        effective_chunk,
+        len(unique),
+    )
+    for i, chunk in enumerate(_chunk_list(unique, effective_chunk), start=1):
         locs = api.get_localization_list_by_id(
             project_id,
             localization_id_query={"elemental_ids": chunk},
@@ -2415,6 +2485,13 @@ def _fetch_localizations_by_elemental_ids(
             if eid is None:
                 continue
             out[str(eid)] = loc
+        logger.info(
+            "sync_edits_to_tator: fetch_localizations chunk %s/%s size=%s resolved_total=%s",
+            i,
+            total_chunks,
+            len(chunk),
+            len(out),
+        )
     return out
 
 
@@ -2469,7 +2546,7 @@ def _bulk_patch_localizations_by_elemental_id(
     )
 
     sent_chunks = 0
-    for (_tid, key), eids in groups.items():
+    for group_idx, ((_tid, key), eids) in enumerate(groups.items(), start=1):
         attrs = dict(key)
         chunks = list(_chunk_list(eids, effective_chunk))
         for i, chunk in enumerate(chunks):
@@ -2483,6 +2560,16 @@ def _bulk_patch_localizations_by_elemental_id(
                 version=[version_id],
             )
             sent_chunks += 1
+            logger.info(
+                "sync_edits_to_tator: bulk PATCH chunk %s/%s "
+                "(group %s/%s, type=%s, size=%s)",
+                sent_chunks,
+                total_chunks,
+                group_idx,
+                len(groups),
+                _tid,
+                len(chunk),
+            )
             if effective_delay > 0 and (i + 1) < len(chunks):
                 time.sleep(effective_delay)
 
@@ -2636,7 +2723,17 @@ def _do_sync_edits_to_tator(
     force_sync: bool,
 ) -> dict[str, Any]:
     """Inner push routine; the public wrapper handles DB selection and locking."""
+    logger.info(f"sync_edits_to_tator: loading dataset {ds_name!r}")
     dataset = fo.load_dataset(ds_name)
+    try:
+        total_samples = len(dataset)
+    except Exception:  # pragma: no cover - len() shouldn't fail for normal datasets
+        total_samples = -1
+    logger.info(
+        f"sync_edits_to_tator: dataset {ds_name!r} loaded; "
+        f"scanning {total_samples if total_samples >= 0 else '?'} samples "
+        f"(force_sync={force_sync})"
+    )
 
     updated = 0
     failed = 0
@@ -2649,8 +2746,20 @@ def _do_sync_edits_to_tator(
     )
 
     pending: list[tuple[Any, str, dict[str, Any], Any]] = []
+    scan_progress_every = _env_int("FIFTYONE_SYNC_TO_TATOR_SCAN_LOG_EVERY", 5000)
+    scanned = 0
 
     for sample in dataset.iter_samples(autosave=False):
+        scanned += 1
+        if scan_progress_every > 0 and scanned % scan_progress_every == 0:
+            logger.info(
+                "sync_edits_to_tator: scan progress %s/%s pending=%s skipped=%s failed=%s",
+                scanned,
+                total_samples if total_samples >= 0 else "?",
+                len(pending),
+                skipped,
+                failed,
+            )
         elemental_id = sample["elemental_id"] if "elemental_id" in sample else None
         if not elemental_id:
             failed += 1
@@ -2697,12 +2806,24 @@ def _do_sync_edits_to_tator(
 
         pending.append((sample, eid_str, attrs, last_modified_at))
 
+    logger.info(
+        "sync_edits_to_tator: scan complete scanned=%s pending=%s skipped=%s failed=%s",
+        scanned,
+        len(pending),
+        skipped,
+        failed,
+    )
+
     if pending:
         updates: dict[str, dict[str, Any]] = {}
         for _sample, eid_str, attrs, _lm in pending:
             updates[eid_str] = attrs
 
         try:
+            logger.info(
+                "sync_edits_to_tator: resolving %s elemental_ids -> localizations",
+                len(updates),
+            )
             loc_by_eid = _fetch_localizations_by_elemental_ids(
                 api, project_id, version_id, list(updates.keys())
             )
@@ -2720,6 +2841,10 @@ def _do_sync_edits_to_tator(
             failed += len(pending)
             errors.append(f"Batch update to Tator failed: {e}")
         else:
+            logger.info(
+                "sync_edits_to_tator: writing tator_modified_at to %s samples",
+                len(pending),
+            )
             for sample, _eid_str, _attrs, last_modified_at in pending:
                 try:
                     sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
