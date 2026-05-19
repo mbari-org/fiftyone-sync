@@ -8,13 +8,13 @@ See https://docs.mbari.org/internal/ai/videos/voxel51demo.gif for demo of the co
 Supports both [Voxel51 Community](https://github.com/voxel51/fiftyone) and Voxel51 Enterprise sync.  Syncing is done by version through a simple applet.
 
 ### Applet for Tator dashboard to sync to Voxel51. When syncing is done, a clickable link is provided.
-![template_applet.png](docs/imgs/template_applet.png)
+![template_applet.png](https://github.com/mbari-org/fiftyone-sync/raw/main/docs/imgs/template_applet.png)
 ### Example Voxel51 embedding/grid view. Samples can be refined by lassoing an embedding cluster, or by filtering onmetadata (e.g. depth, label, confidence):
-![embedding_grid.png](docs/imgs/embedding_grid.png)
+![embedding_grid.png](https://github.com/mbari-org/fiftyone-sync/raw/main/docs/imgs/embedding_grid.png)
 ### Example Voxel51 similarity search view
-![sim_search.png](docs/imgs/sim_search.png)
+![sim_search.png](https://github.com/mbari-org/fiftyone-sync/raw/main/docs/imgs/sim_search.png)
 ### FastAPI
-![fastapi.png](docs/imgs/fastapi.png)
+![fastapi.png](https://github.com/mbari-org/fiftyone-sync/raw/main/docs/imgs/fastapi.png)
 
 ## Architecture
 
@@ -90,25 +90,11 @@ flowchart TD
 - **Port isolation**: One FiftyOne App instance per Tator project (one port per project)
   - Port = 5151 + (project_id - 1)
 
-- **MongoDB database isolation**: A single MongoDB is launched by default (see `containers/fiftyone-sync`). **Project 1** uses database `fiftyone_project_1` on that instance; other projects use `fiftyone_project_2`, etc.
-  - Default: database name = `{FIFTYONE_DATABASE_DEFAULT}_{project_id}` (env `FIFTYONE_DATABASE_DEFAULT` defaults to `fiftyone_project`)
-  - Override (all projects): set env `FIFTYONE_DATABASE_NAME` to use a single shared database
-  - Override (per request): pass optional query param `database_name` on `GET /launch` and `POST /sync`
+- **MongoDB isolation**: One MongoDB (`containers/fiftyone-sync`); per-project DB `fiftyone_project_{id}` (override via `FIFTYONE_DATABASE_NAME` or `database_name` query param on `/launch` and `/sync`).
 
-- **Launcher**: HostedTemplate integration
-  - `GET /message` - Minimal template with single `{{ message }}` (for simple Hosted Template testing)
-  - `GET /render` - Launcher template with **Open FiftyOne** (opens app in new window) and **Sync from Tator** (tparams: project, iframe_host, base_port, sync_service_url, api_url; user enters API token in the applet and clicks "Verify Token" to enable sync)
-  - `GET /launch` - Allocate port, return FiftyOne App URL
-  - `POST /sync` - Enqueue Tator-to-FiftyOne sync (requires Redis): fetch media + localizations, crop, build FiftyOne dataset, launch app. Returns `job_id` immediately; poll `GET /sync/status/{job_id}` for completion.
-  - `GET /sync/status/{job_id}` - Poll status of a queued sync job.
-  - `POST /recompute-crops` - Enqueue a crop-only recompute job for an existing project/version. With `force=true`, recompute all localizations (overwrite existing crop files) and refresh `crop_manifest.json`; with `force=false`, recompute cache misses only.
-  - `GET /recompute-crops/status/{job_id}` - Poll status of a queued crop-recompute job.
-  - `GET /recompute-crops/logs/{job_id}` - Return worker log lines for a crop-recompute job.
-  - `POST /sync-to-tator` - Push FiftyOne dataset edits (labels, confidence) back to Tator localizations
-  - `GET /versions` - Return Tator versions for a project (query params: `project_id`, `api_url`; token via `Authorization: Token <token>` header only)
-  - FiftyOne opens in a **new browser tab** (not in an iframe). Set **`iframe_host`** to the host where the FiftyOne app runs so the Open FiftyOne URL is correct (e.g. same host as Tator or `localhost`).
+- **Launcher** (HostedTemplate): `/render` (Open FiftyOne + Sync from Tator), `/launch`, `/sync` + `/sync/status/{job_id}`, `/recompute-crops` (+ status/logs), `/sync-to-tator`, `/versions`. Token entered in applet via **Verify Token**; FiftyOne opens in a new tab (`iframe_host` = app host).
 
-- **Sync queue (Redis required)**: Sync runs in a background worker. Set `REDIS_HOST=redis` (or your Redis host) for the API; run the sync worker with the same Redis and env (MongoDB, etc.): `python -m src.app.sync_worker`. The launcher enqueues sync on click and polls until the worker finishes. Redis env: `REDIS_HOST`, `REDIS_PORT` (default `6379`), `REDIS_PASSWORD`, `REDIS_USE_SSL`; or a single `REDIS_URL` (e.g. `redis://host:6380/0`).
+- **Sync queue (Redis)**: Background worker: `python -m src.app.sync_worker`. Env: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_USE_SSL`, or `REDIS_URL`.
 
 ## Run (Docker)
 
@@ -133,15 +119,6 @@ uvicorn src.app.main:app --host 0.0.0.0 --port 8001
 
 Use a venv and install deps first: `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`. Start MongoDB separately (e.g. `docker compose -f containers/fiftyone-sync/compose.yaml up -d mongo`).
 
-## Setup (for development)
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
-
-```
-
 ## AWS S3 (crop image upload) Enterprise ONLY
 
 You can optionally sync **crop images** (localization crops, not full images) from a Tator sync to an S3 bucket and build a FiftyOne dataset. The sync worker uploads the crops directory to S3 (layout: `s3://bucket/prefix/media_stem/elemental_id.png`), then lists the bucket with FiftyOne storage and creates a second dataset (suffix `_raw`). Parent folder in S3 is used as the sample label.
@@ -162,24 +139,18 @@ projects:
         port: 5151
 ```
 
-- **`s3_bucket`** (optional): S3 bucket name. When set, the applet shows S3 bucket/prefix fields (only after the user has valid credentials). Sync will upload the **crops** directory (not full images) to this bucket and build a dataset from the listed S3 objects. The bucket is created automatically if it does not exist.
-- **`s3_prefix`** (optional): Key prefix (folder path) inside the bucket, e.g. `fiftyone/raw`. Omit or leave empty to use the bucket root.
+- **`s3_bucket`**: When set, sync uploads crops (not full images) and builds an `_raw` dataset from S3. Bucket is created if missing.
+- **`s3_prefix`**: Optional key prefix (e.g. `fiftyone/raw`).
 
-Project keys must match the **Tator project name** (from the API), not the project ID.
+Project keys must match the **Tator project name**, not the project ID.
 
 ### AWS credentials
 
-The sync worker (and any process that runs sync) needs AWS credentials with permission to **upload** to the bucket (`s3:PutObject`, and list if applicable). Use one of:
-
-- **Environment variables**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_DEFAULT_REGION` (or `AWS_REGION`). Set these in the environment of the sync worker (e.g. in Docker or your process manager).
-- **IAM role**: When the worker runs on AWS (EC2, ECS, Lambda, etc.), attach an IAM role with the same S3 permissions; no env vars needed.
-- **AWS CLI config**: If the worker runs in an environment where `aws configure` has been used, the default profile is used.
-
-Upload uses the most efficient path available: **`aws s3 sync`** when the AWS CLI is installed, otherwise **boto3** (upload per file). The bucket is created if it does not exist. Ensure credentials have access before running a sync with S3 enabled.
+Worker needs `s3:PutObject` (and list). Use env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`), IAM role on AWS, or AWS CLI default profile. Upload uses `aws s3 sync` when available, else boto3.
 
 ### Applet behavior
 
-When a project has `s3_bucket` set in config, the launcher applet shows **S3 bucket** and **S3 prefix** inputs only after the user has entered a valid token and passed **Verify Token** (and a database entry exists for the project). Values from config are pre-filled; the user can override them before clicking **Load from Tator**. Sync then uses the applet values or, if omitted, the config values.
+S3 bucket/prefix fields appear after **Verify Token** when `s3_bucket` is in config; values are pre-filled and overridable before **Load from Tator**.
 
 ## Testing
 
@@ -240,10 +211,9 @@ This service exposes a Jinja2 template for [Tator Hosted Templates](https://www.
    - **Headers**: Leave empty unless the service requires auth.
    - **Template parameters** (optional defaults):
      - `base_port`: `5151`
-     - `iframe_host`: host for the FiftyOne app URL when opening in a new tab. **Use the same host you use to open Tator.** If you open Tator at `http://134.89.17.13:8080`, set `iframe_host` to `134.89.17.13` so the app URL is `http://134.89.17.13:5181/...`. If you use `localhost`, the app will try to load from the user’s machine (connection refused when Tator is opened from another host). Do **not** use `host.docker.internal` (browsers cannot resolve it).
-     - `message`: optional header text (if set, replaces the default status line)
-     - `config_yaml`: optional YAML config string for FiftyOne; shown in the header and exposed as `window.FIFTYONE_CONFIG_YAML` for scripts
-     - **Sync from Tator / Sync to Tator**: set `sync_service_url` and `api_url` (do **not** set a token tparam). In the applet, the user enters their Tator API token in the password field and clicks **Verify Token**; once the token is verified, the Version dropdown is filled and **Sync from Tator** / **Sync to Tator** are enabled. Optionally set **version_id** to preselect a version. The token is used only in the browser for sync and is not stored.
+     - `iframe_host`: host for the FiftyOne app URL (same host you use for Tator; not `host.docker.internal`).
+     - `message`, `config_yaml`: optional header text / YAML exposed as `window.FIFTYONE_CONFIG_YAML`.
+     - **Sync**: set `sync_service_url` and `api_url` (no token tparam). User enters token in applet and clicks **Verify Token**; optional `version_id` to preselect.
 
 Click **Save**.
 
@@ -258,7 +228,7 @@ Click **Save**.
    - **name**: `project`
    - **value**: the project ID (same as this project’s ID).
 
-   Set **`iframe_host`** to the host you use to open Tator (e.g. `134.89.17.13`). If you use `localhost` but open Tator at a different host, the iframe will show "connection refused" because the browser will try to load FiftyOne from the user’s machine, not the server.
+   Set **`iframe_host`** to the host you use to open Tator.
 
 7. Click **Save**.
 
@@ -276,30 +246,9 @@ Go to the project, then **Analytics** → **Dashboards**. Open the applet. Click
 | **sync_service_url** | `http://localhost:8001` | Required for the "Sync from Tator" button; same machine as Tator from the user's perspective. |
 | **api_url** | `http://localhost:8080` | Sync service calls Tator's API; from the host, Tator is at localhost:8080. |
 
-There is no template parameter named **host**; the **URL** field is where Tator fetches the template from. Do **not** set a token tparam; users enter their Tator API token in the applet and click **Verify Token** to enable sync. The version list and sync requests use the token in the `Authorization` header (for `/versions`) or in the request (for sync); the token is not stored.
+### Tator in Docker
 
-### Tator in Docker: "Connection refused" and "host.docker.internal server IP address not found"
-
-The Hosted Template URL is **fetched by Tator’s backend** (gunicorn), not by the user’s browser. So the URL must be reachable from inside the container (or host) where gunicorn runs.
-
-- **Connection refused**: Hosted Template URL is fetched by gunicorn — use e.g. `http://host.docker.internal:8001/render`. **"host.docker.internal server IP address not found"**: Set template param **`iframe_host`** to `localhost` (not `host.docker.internal`) so the Open FiftyOne URL works in the browser.
-- **If Tator runs in Docker and this service runs on the host**
-  - Hosted Template URL: `http://host.docker.internal:8001/render`. Template params: `iframe_host`: `localhost`, `sync_service_url`: `http://localhost:8001`, `api_url`: `http://localhost:8080`.
-  - Start this service with `--host 0.0.0.0`. Ensure port 8001 is reachable.
-
-- **If both run in Docker**
-  - Put both services on the same Docker network and set the Hosted Template URL to the service name and port, e.g. `http://fiftyone-sync:8001/message`.
-
-## MongoDB (compose stack)
-
-The compose stack in **`containers/fiftyone-sync`** launches a single MongoDB for the service. **Project 1** uses database `fiftyone_project_1` by default; other projects use `fiftyone_project_2`, etc., on the same instance.
-
-```bash
-# From repo root
-docker compose -f containers/fiftyone-sync/compose.yaml up -d
-```
-
-Set `FIFTYONE_DATABASE_URI=mongodb://localhost:27017` when running the API on the host (or `mongodb://mongo:27017` from a container on the same network). See `containers/fiftyone-sync/.env.example`.
+Hosted Template **URL** is fetched by gunicorn (must be reachable from Tator’s container). Use `http://host.docker.internal:8001/render` when sync runs on the host; set **`iframe_host`** to `localhost` (browsers cannot resolve `host.docker.internal`). If both run in Docker, use the service name on a shared network (e.g. `http://fiftyone-sync:8001/render`).
 
 ## Database and port allocation
 
