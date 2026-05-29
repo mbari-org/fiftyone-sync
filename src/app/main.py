@@ -907,15 +907,14 @@ async def dataset_exists(
         return {"exists": False, "dataset_name": None}
 
 
-@app_launch.get("/datasets-for-version")
-async def datasets_for_version(
+@app_launch.get("/datasets")
+async def datasets(
     project_id: int = Query(..., description="Tator project ID"),
-    version_id: int = Query(..., description="Tator version ID"),
     api_url: str = Query(..., description="Tator REST API base URL"),
     port: int = Query(..., description="Port for this project"),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
-    """List likely FiftyOne dataset names for a selected version/port."""
+    """List available FiftyOne datasets for the selected project DB context."""
     token = _token_from_authorization(authorization)
     if not token:
         raise HTTPException(
@@ -929,7 +928,7 @@ async def datasets_for_version(
         proj = api.get_project(project_id)
         project_name = getattr(proj, "name", None) or str(project_id)
     except Exception as e:
-        logger.warning(f"datasets_for_version get_project({project_id}) failed: {e}")
+        logger.warning(f"datasets get_project({project_id}) failed: {e}")
     if not project_name or not project_name.strip():
         project_name = str(project_id)
     project_name = project_name.strip()
@@ -940,27 +939,22 @@ async def datasets_for_version(
     if database_entry is None:
         return {
             "datasets": [],
-            "selected_dataset_name": None,
             "database_name": None,
         }
 
     try:
-        from src.app.sync import list_datasets_for_version
+        from src.app.sync import list_available_datasets
 
-        return list_datasets_for_version(
+        return list_available_datasets(
             project_id=project_id,
-            version_id=version_id,
             port=database_entry.port,
-            api_url=_resolve_api_url(api_url),
-            token=token,
             project_name=project_name,
             database_name=database_name_from_uri(database_entry.uri),
         )
     except Exception as e:
-        logger.warning(f"datasets_for_version check failed: {e}")
+        logger.warning(f"datasets check failed: {e}")
         return {
             "datasets": [],
-            "selected_dataset_name": None,
             "database_name": None,
         }
 

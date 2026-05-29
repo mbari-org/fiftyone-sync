@@ -81,10 +81,20 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
-          <th>Version</th>
+          <th>Tator Version</th>
           <td>
             <div class="cell-controls">
               <select id="version-select" aria-label="version" disabled>
+                <option value="">Enter token and click Test</option>
+              </select>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <th>Voxel Dataset</th>
+          <td>
+            <div class="cell-controls">
+              <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator.">
                 <option value="">Enter token and click Test</option>
               </select>
             </div>
@@ -99,9 +109,6 @@ LAUNCHER_TEMPLATE = r"""
                 <input type="checkbox" id="force-sync-checkbox" name="force_sync" value="1"> Force sync
               </label>
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
-              <select id="sync-dataset-select" aria-label="sync-dataset" disabled title="Select the FiftyOne dataset to map back to this Tator version.">
-                <option value="">Select dataset mapping</option>
-              </select>
               <select id="dimreduce-method-select" aria-label="dimreduce-method" disabled>
                 <option value="umap">UMAP</option>
                 <option value="pca">PCA</option>
@@ -157,10 +164,10 @@ LAUNCHER_TEMPLATE = r"""
       var syncStatus = document.getElementById('sync-status');
       var fiftyoneAppLink = document.getElementById('fiftyone-app-link');
       var versionSelect = document.getElementById('version-select');
+      var voxelDatasetSelect = document.getElementById('voxel-dataset-select');
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
-      var syncDatasetSelect = document.getElementById('sync-dataset-select');
       var deleteDatasetBtn = document.getElementById('delete-dataset-btn');
       var dimreduceMethodSelect = document.getElementById('dimreduce-method-select');
       var dimreduceBtn = document.getElementById('dimreduce-btn');
@@ -209,50 +216,49 @@ LAUNCHER_TEMPLATE = r"""
         datasetExists = false;
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = true;
         if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
-        refreshSyncDatasetChoices();
       }
       function setSyncDatasetFromDropdown() {
-        selectedSyncDatasetName = syncDatasetSelect && syncDatasetSelect.value ? syncDatasetSelect.value : '';
-        if (syncDatasetSelect) {
-          var dsOpt = syncDatasetSelect.options[syncDatasetSelect.selectedIndex];
-          syncDatasetSelect.title = dsOpt ? dsOpt.textContent : '';
+        selectedSyncDatasetName = voxelDatasetSelect && voxelDatasetSelect.value ? voxelDatasetSelect.value : '';
+        if (voxelDatasetSelect) {
+          var dsOpt = voxelDatasetSelect.options[voxelDatasetSelect.selectedIndex];
+          voxelDatasetSelect.title = dsOpt ? dsOpt.textContent : '';
         }
         updateSyncButtonsState();
       }
       function resetSyncDatasetChoices(message) {
-        if (!syncDatasetSelect) return;
-        syncDatasetSelect.innerHTML = '';
+        if (!voxelDatasetSelect) return;
+        voxelDatasetSelect.innerHTML = '';
         var opt = document.createElement('option');
         opt.value = '';
-        opt.textContent = message || 'Select dataset mapping';
-        syncDatasetSelect.appendChild(opt);
-        syncDatasetSelect.disabled = true;
+        opt.textContent = message || 'Select Voxel dataset';
+        voxelDatasetSelect.appendChild(opt);
+        voxelDatasetSelect.disabled = true;
         selectedSyncDatasetName = '';
       }
       function refreshSyncDatasetChoices() {
         var token = getToken();
-        var v = versionId;
-        if (!syncDatasetSelect) return;
-        if (!syncServiceUrl || !apiUrl || !token || !v || !tokenVerified || !hasDatabaseEntry) {
-          resetSyncDatasetChoices(v ? 'Select dataset mapping' : 'Select a version first');
+        if (!voxelDatasetSelect) return;
+        if (!syncServiceUrl || !apiUrl || !token || !tokenVerified || !hasDatabaseEntry) {
+          resetSyncDatasetChoices('Select Voxel dataset');
           updateSyncButtonsState();
           return;
         }
-        syncDatasetSelect.disabled = true;
-        syncDatasetSelect.innerHTML = '<option value="">Loading datasets…</option>';
+        var currentSelection = selectedSyncDatasetName;
+        voxelDatasetSelect.disabled = true;
+        voxelDatasetSelect.innerHTML = '<option value="">Loading datasets…</option>';
         selectedSyncDatasetName = '';
         updateSyncButtonsState();
-        var listUrl = syncServiceUrl + '/datasets-for-version?project_id=' + project + '&version_id=' + encodeURIComponent(v) + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port;
+        var listUrl = syncServiceUrl + '/datasets?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port;
         fetch(listUrl, {
           headers: { 'Authorization': 'Token ' + token }
         })
           .then(function(r) { return r.ok ? r.json() : null; })
           .then(function(data) {
-            if (!data || versionId !== v) return;
+            if (!data) return;
             var datasets = Array.isArray(data.datasets) ? data.datasets : [];
-            syncDatasetSelect.innerHTML = '';
+            voxelDatasetSelect.innerHTML = '';
             if (!datasets.length) {
-              resetSyncDatasetChoices('No mapped datasets found');
+              resetSyncDatasetChoices('No datasets found');
               updateSyncButtonsState();
               return;
             }
@@ -260,13 +266,13 @@ LAUNCHER_TEMPLATE = r"""
               var opt = document.createElement('option');
               opt.value = name;
               opt.textContent = name;
-              syncDatasetSelect.appendChild(opt);
+              voxelDatasetSelect.appendChild(opt);
             });
-            var preferred = data.selected_dataset_name && datasets.indexOf(data.selected_dataset_name) !== -1
-              ? data.selected_dataset_name
+            var preferred = currentSelection && datasets.indexOf(currentSelection) !== -1
+              ? currentSelection
               : datasets[0];
-            syncDatasetSelect.value = preferred || '';
-            syncDatasetSelect.disabled = false;
+            voxelDatasetSelect.value = preferred || '';
+            voxelDatasetSelect.disabled = false;
             setSyncDatasetFromDropdown();
           })
           .catch(function() {
@@ -390,11 +396,11 @@ LAUNCHER_TEMPLATE = r"""
             vssProjectSelect.innerHTML = '<option value="">Enter token and click Test</option>';
             vssProjectRow.style.display = 'none';
           }
-          resetSyncDatasetChoices('Select dataset mapping');
+          resetSyncDatasetChoices('Enter token and click Test');
           if (syncStatus) { syncStatus.textContent = ''; syncStatus.classList.remove('error'); }
         });
       }
-      if (syncDatasetSelect) syncDatasetSelect.addEventListener('change', setSyncDatasetFromDropdown);
+      if (voxelDatasetSelect) voxelDatasetSelect.addEventListener('change', setSyncDatasetFromDropdown);
       if (vssProjectSelect) vssProjectSelect.addEventListener('change', setVssProjectFromDropdown);
       if (versionSelect) versionSelect.addEventListener('change', setVersionFromDropdown);
       function updateDatabaseInfo(token) {
