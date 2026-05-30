@@ -2912,15 +2912,18 @@ def sync_edits_to_tator(
     except Exception:
         project_prefix = f"project_{project_id}"
     port_suffix = f"_{port}"
+    version_part = f"_v{version_id}"
 
-    def _resolve_dataset(requested: str) -> str | None:
-        """Return the actual dataset name: exact match first, then name+port, then project+port match."""
+    def _resolve_dataset(requested: str, allow_project_fallback: bool) -> str | None:
+        """Return dataset name from exact/port matches, then project+port fallback."""
         available = fo.list_datasets()
         if requested in available:
             return requested
         # Default name has no port; stored name is base + port_suffix (e.g. project_v66_5151)
         if (requested + port_suffix) in available:
             return requested + port_suffix
+        if not allow_project_fallback:
+            return None
         matches = [
             d
             for d in available
@@ -2930,18 +2933,26 @@ def sync_edits_to_tator(
             return None
         if len(matches) == 1:
             return matches[0]
+        version_matches = [d for d in matches if version_part in d]
+        if len(version_matches) == 1:
+            return version_matches[0]
+        if version_matches:
+            matches = version_matches
         for candidate in matches:
             if candidate == f"{project_prefix}{port_suffix}":
                 return candidate
         return matches[0]
 
     fallback_db = f"{os.environ.get('FIFTYONE_DATABASE_DEFAULT', 'fiftyone_project')}_{project_id}"
-    resolved = _resolve_dataset(ds_name)
+    allow_project_fallback = dataset_name is None
+    resolved = _resolve_dataset(ds_name, allow_project_fallback=allow_project_fallback)
     if resolved is None and db_name != fallback_db:
         if not get_is_enterprise():
             fo.config.database_name = fallback_db
             os.environ["FIFTYONE_DATABASE_NAME"] = fallback_db
-        resolved = _resolve_dataset(ds_name)
+        resolved = _resolve_dataset(
+            ds_name, allow_project_fallback=allow_project_fallback
+        )
     if resolved is None:
         if not get_is_enterprise():
             fo.config.database_name = db_name
@@ -4005,8 +4016,9 @@ def check_dataset_exists_for_version(
     api = tator.get_api(host, token)
     ds_name = _default_dataset_name(api, project_id, version_id)
     ds_name_with_port = _dataset_name_with_port(ds_name, port)
-
-    project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
+    project_prefix = (
+        _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
+    )
     port_suffix = f"_{port}"
     version_part = f"_v{version_id}"
 
@@ -4026,6 +4038,42 @@ def check_dataset_exists_for_version(
     return {
         "exists": target is not None,
         "dataset_name": target,
+        "database_name": resolved_db,
+    }
+
+
+def list_available_datasets(
+    project_id: int,
+    port: int,
+    project_name: str | None = None,
+    database_uri: str | None = None,
+    database_name: str | None = None,
+) -> dict[str, Any]:
+    """List all FiftyOne dataset names for the current project DB context."""
+    resolved_db = (
+        database_name.strip() if database_name and database_name.strip() else None
+    ) or get_database_name(project_id, port, project_name=project_name)
+    resolved_uri = (
+        database_uri.strip() if database_uri and database_uri.strip() else None
+    ) or get_database_uri(project_id, port, project_name=project_name)
+
+    if not get_is_enterprise():
+        fo.config.database_uri = resolved_uri
+        fo.config.database_name = resolved_db
+        os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
+        os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
+
+    try:
+        if get_is_enterprise():
+            _test_fiftyone_connection()
+        else:
+            _test_mongodb_connection(resolved_uri)
+    except ConnectionError as exc:
+        raise RuntimeError(f"Connection check failed: {exc}") from exc
+
+    datasets = sorted(fo.list_datasets())
+    return {
+        "datasets": datasets,
         "database_name": resolved_db,
     }
 

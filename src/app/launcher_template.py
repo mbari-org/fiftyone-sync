@@ -81,10 +81,20 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
-          <th>Version</th>
+          <th>Tator Version</th>
           <td>
             <div class="cell-controls">
               <select id="version-select" aria-label="version" disabled>
+                <option value="">Enter token and click Test</option>
+              </select>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <th>Voxel Dataset</th>
+          <td>
+            <div class="cell-controls">
+              <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator.">
                 <option value="">Enter token and click Test</option>
               </select>
             </div>
@@ -154,6 +164,7 @@ LAUNCHER_TEMPLATE = r"""
       var syncStatus = document.getElementById('sync-status');
       var fiftyoneAppLink = document.getElementById('fiftyone-app-link');
       var versionSelect = document.getElementById('version-select');
+      var voxelDatasetSelect = document.getElementById('voxel-dataset-select');
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
@@ -167,6 +178,7 @@ LAUNCHER_TEMPLATE = r"""
       var isEnterprise = false;
       var versionId = '';
       var datasetExists = false;
+      var selectedSyncDatasetName = '';
       var vssProjectKey = '';
       var vssProjectsData = [];  // full list from /vss-projects: [{key, name}]; embedding service URL is global
       var embeddingServiceReady = false;  // true when WS test passed or service not configured
@@ -205,9 +217,72 @@ LAUNCHER_TEMPLATE = r"""
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = true;
         if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
       }
+      function setSyncDatasetFromDropdown() {
+        selectedSyncDatasetName = voxelDatasetSelect && voxelDatasetSelect.value ? voxelDatasetSelect.value : '';
+        if (voxelDatasetSelect) {
+          var dsOpt = voxelDatasetSelect.options[voxelDatasetSelect.selectedIndex];
+          voxelDatasetSelect.title = dsOpt ? dsOpt.textContent : '';
+        }
+        updateSyncButtonsState();
+      }
+      function resetSyncDatasetChoices(message) {
+        if (!voxelDatasetSelect) return;
+        voxelDatasetSelect.innerHTML = '';
+        var opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = message || 'Select Voxel dataset';
+        voxelDatasetSelect.appendChild(opt);
+        voxelDatasetSelect.disabled = true;
+        selectedSyncDatasetName = '';
+      }
+      function refreshSyncDatasetChoices() {
+        var token = getToken();
+        if (!voxelDatasetSelect) return;
+        if (!syncServiceUrl || !apiUrl || !token || !tokenVerified || !hasDatabaseEntry) {
+          resetSyncDatasetChoices('Select Voxel dataset');
+          updateSyncButtonsState();
+          return;
+        }
+        var currentSelection = selectedSyncDatasetName;
+        voxelDatasetSelect.disabled = true;
+        voxelDatasetSelect.innerHTML = '<option value="">Loading datasets…</option>';
+        selectedSyncDatasetName = '';
+        updateSyncButtonsState();
+        var listUrl = syncServiceUrl + '/datasets?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port;
+        fetch(listUrl, {
+          headers: { 'Authorization': 'Token ' + token }
+        })
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .then(function(data) {
+            if (!data) return;
+            var datasets = Array.isArray(data.datasets) ? data.datasets : [];
+            voxelDatasetSelect.innerHTML = '';
+            if (!datasets.length) {
+              resetSyncDatasetChoices('No datasets found');
+              updateSyncButtonsState();
+              return;
+            }
+            datasets.forEach(function(name) {
+              var opt = document.createElement('option');
+              opt.value = name;
+              opt.textContent = name;
+              voxelDatasetSelect.appendChild(opt);
+            });
+            var preferred = currentSelection && datasets.indexOf(currentSelection) !== -1
+              ? currentSelection
+              : datasets[0];
+            voxelDatasetSelect.value = preferred || '';
+            voxelDatasetSelect.disabled = false;
+            setSyncDatasetFromDropdown();
+          })
+          .catch(function() {
+            resetSyncDatasetChoices('Failed to load datasets');
+            updateSyncButtonsState();
+          });
+      }
       function updateSyncButtonsState() {
         if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry || !embeddingServiceReady;
-        if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId;
+        if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !selectedSyncDatasetName;
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
         if (dimreduceMethodSelect) dimreduceMethodSelect.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
         if (dimreduceBtn) dimreduceBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
@@ -321,9 +396,11 @@ LAUNCHER_TEMPLATE = r"""
             vssProjectSelect.innerHTML = '<option value="">Enter token and click Test</option>';
             vssProjectRow.style.display = 'none';
           }
+          resetSyncDatasetChoices('Enter token and click Test');
           if (syncStatus) { syncStatus.textContent = ''; syncStatus.classList.remove('error'); }
         });
       }
+      if (voxelDatasetSelect) voxelDatasetSelect.addEventListener('change', setSyncDatasetFromDropdown);
       if (vssProjectSelect) vssProjectSelect.addEventListener('change', setVssProjectFromDropdown);
       if (versionSelect) versionSelect.addEventListener('change', setVersionFromDropdown);
       function updateDatabaseInfo(token) {
@@ -358,6 +435,7 @@ LAUNCHER_TEMPLATE = r"""
             syncStatus.textContent = 'Token OK. Sync enabled.';
             syncStatus.classList.remove('error');
             setTimeout(function() { syncStatus.textContent = ''; }, 3000);
+            refreshSyncDatasetChoices();
           })
           .catch(function(err) {
             hasDatabaseEntry = false;
@@ -366,6 +444,7 @@ LAUNCHER_TEMPLATE = r"""
             setSyncControlsEnabled(true);
             syncStatus.textContent = 'Token OK but sync disabled: ' + (err.message || 'no database entry for this project');
             syncStatus.classList.add('error');
+            refreshSyncDatasetChoices();
           });
       }
       if (testTokenBtn && syncStatus && syncServiceUrl && apiUrl) {
@@ -596,6 +675,7 @@ LAUNCHER_TEMPLATE = r"""
                         if (syncLogPanel) syncLogPanel.classList.add('visible');
                         updateLogPanel(hideLogPanelAfterDelay);
                         checkDatasetExists();
+                        refreshSyncDatasetChoices();
                         return;
                       }
                       if (s.status === 'unknown') {
@@ -632,11 +712,13 @@ LAUNCHER_TEMPLATE = r"""
               setTimeout(function() { syncStatus.textContent = ''; }, 5000);
               syncBtn.disabled = false;
               checkDatasetExists();
+              refreshSyncDatasetChoices();
             })
             .catch(function(err) {
               syncStatus.textContent = 'Sync error: ' + (err.message || 'Network error');
               syncStatus.classList.add('error');
               syncBtn.disabled = false;
+              refreshSyncDatasetChoices();
             });
         });
       }
@@ -646,6 +728,12 @@ LAUNCHER_TEMPLATE = r"""
           if (!token || !tokenVerified) return;
           var v = versionSelect && versionSelect.value ? versionSelect.value : '';
           if (!v) return;
+          var dsName = selectedSyncDatasetName;
+          if (!dsName) {
+            syncStatus.textContent = 'Select a dataset mapping first.';
+            syncStatus.classList.add('error');
+            return;
+          }
           syncToTatorBtn.disabled = true;
           syncStatus.textContent = 'Pushing to Tator…';
           syncStatus.classList.remove('error');
@@ -655,7 +743,8 @@ LAUNCHER_TEMPLATE = r"""
             api_url: apiUrl,
             token: token,
             port: String(port),
-            database_name: databaseName
+            database_name: databaseName,
+            dataset_name: dsName
           });
           var fullUrl = syncServiceUrl + '/sync-to-tator?' + params.toString();
           fetch(fullUrl, { method: 'POST' })
@@ -732,6 +821,7 @@ LAUNCHER_TEMPLATE = r"""
               datasetExists = false;
               deleteDatasetBtn.disabled = true;
               checkDatasetExists();
+              refreshSyncDatasetChoices();
             });
         });
       }
