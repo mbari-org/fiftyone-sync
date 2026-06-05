@@ -91,6 +91,16 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
+          <th>Section</th>
+          <td>
+            <div class="cell-controls">
+              <select id="section-select" aria-label="section" disabled title="Optional media section filter (ANDed with query when both set).">
+                <option value="">All sections</option>
+              </select>
+            </div>
+          </td>
+        </tr>
+        <tr>
           <th>Voxel Dataset</th>
           <td>
             <div class="cell-controls">
@@ -160,10 +170,13 @@ LAUNCHER_TEMPLATE = r"""
       if (configYaml) window.FIFTYONE_CONFIG_YAML = configYaml;
       var apiUrl = "{{ api_url | default('') | e }}";
       var initialVersionId = "{{ version_id | default('') | e }}";
+      var initialSectionId = "{{ section_id | default('') | e }}";
+      var syncQuery = "{{ query | default('') | e }}";
       var syncBtn = document.getElementById('sync-from-tator-btn');
       var syncStatus = document.getElementById('sync-status');
       var fiftyoneAppLink = document.getElementById('fiftyone-app-link');
       var versionSelect = document.getElementById('version-select');
+      var sectionSelect = document.getElementById('section-select');
       var voxelDatasetSelect = document.getElementById('voxel-dataset-select');
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
@@ -290,6 +303,7 @@ LAUNCHER_TEMPLATE = r"""
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
         if (versionSelect) versionSelect.disabled = !enabled;
+        if (sectionSelect) sectionSelect.disabled = !enabled;
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
         updateSyncButtonsState();
       }
@@ -345,6 +359,41 @@ LAUNCHER_TEMPLATE = r"""
             vssProjectSelect.innerHTML = '<option value="">Failed to load VSS projects</option>';
           });
       }
+      function loadSections(token) {
+        if (!sectionSelect || !syncServiceUrl || !apiUrl || !token) return;
+        sectionSelect.innerHTML = '<option value="">Loading…</option>';
+        fetch(syncServiceUrl + '/sections?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl), {
+          headers: { 'Authorization': 'Token ' + token }
+        })
+          .then(function(r) {
+            if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || r.statusText); });
+            return r.json();
+          })
+          .then(function(sections) {
+            sectionSelect.innerHTML = '';
+            var allOpt = document.createElement('option');
+            allOpt.value = '';
+            allOpt.textContent = 'All sections';
+            sectionSelect.appendChild(allOpt);
+            (sections || []).forEach(function(s) {
+              var opt = document.createElement('option');
+              opt.value = String(s.id);
+              opt.textContent = s.name + (s.id != null ? ' (' + s.id + ')' : '');
+              sectionSelect.appendChild(opt);
+            });
+            if (initialSectionId && sectionSelect.querySelector('option[value="' + initialSectionId + '"]')) {
+              sectionSelect.value = initialSectionId;
+            }
+          })
+          .catch(function() {
+            sectionSelect.innerHTML = '';
+            var opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'All sections';
+            sectionSelect.appendChild(opt);
+            if (initialSectionId) sectionSelect.value = initialSectionId;
+          });
+      }
       function loadVersions(token) {
         if (!versionSelect || !syncServiceUrl || !apiUrl || !token) return;
         versionSelect.innerHTML = '<option value="">Loading…</option>';
@@ -391,6 +440,13 @@ LAUNCHER_TEMPLATE = r"""
             opt.value = '';
             opt.textContent = 'Enter token and click Test';
             versionSelect.appendChild(opt);
+          }
+          if (sectionSelect) {
+            sectionSelect.innerHTML = '';
+            var secOpt = document.createElement('option');
+            secOpt.value = '';
+            secOpt.textContent = 'Enter token and click Test';
+            sectionSelect.appendChild(secOpt);
           }
           if (vssProjectSelect && vssProjectRow) {
             vssProjectSelect.innerHTML = '<option value="">Enter token and click Test</option>';
@@ -468,6 +524,7 @@ LAUNCHER_TEMPLATE = r"""
             .then(function(versions) {
               setSyncControlsEnabled(true);
               loadVersions(token);
+              loadSections(token);
               loadVssProjects(token);
               syncStatus.textContent = 'Token OK. Resolving port/database…';
               updateDatabaseInfo(token);
@@ -583,6 +640,9 @@ LAUNCHER_TEMPLATE = r"""
           if (fiftyoneAppLink) fiftyoneAppLink.style.display = 'none';
           var params = new URLSearchParams({ project_id: String(project), api_url: apiUrl, token: token, launch_app: 'true', port: port });
           if (v) params.set('version_id', v);
+          var s = sectionSelect ? sectionSelect.value : '';
+          if (s) params.set('section_id', s);
+          if (syncQuery) params.set('query', syncQuery);
           if (vssProjectKey) params.set('vss_project_key', vssProjectKey);
           var forceSyncEl = document.getElementById('force-sync-checkbox');
           if (forceSyncEl && forceSyncEl.checked) {

@@ -37,6 +37,13 @@ from src.app.database_manager import (
     get_port_for_project,
     get_s3_config,
 )
+from src.app.sync_filters import (
+    filter_slug as _filter_slug,
+    localization_fetch_kwargs as _localization_fetch_kwargs,
+    media_fetch_kwargs as _media_fetch_kwargs,
+    scoped_data_dir,
+    version_slug as _version_slug_from_filters,
+)
 from src.app.sync_lock import (
     get_sync_lock_key,
     get_sync_to_tator_lock_key,
@@ -196,7 +203,7 @@ _SYNC_BASE = os.environ.get("FIFTYONE_SYNC_BASE", "/tmp/fiftyone_sync")
 
 
 def _version_slug(version_id: int | None) -> str:
-    return f"v{version_id}" if version_id is not None else "v_all"
+    return _version_slug_from_filters(version_id)
 
 
 def _download_dir(project_id: int) -> str:
@@ -206,23 +213,50 @@ def _download_dir(project_id: int) -> str:
     return path
 
 
-def _data_dir(project_id: int, version_id: int | None) -> str:
+def _data_dir(
+    project_id: int,
+    version_id: int | None,
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> str:
     """Per-project+version directory for JSONL, crops, and manifest."""
-    path = os.path.join(_SYNC_BASE, "data", str(project_id), _version_slug(version_id))
-    os.makedirs(path, exist_ok=True)
-    return path
+    return scoped_data_dir(
+        _SYNC_BASE,
+        project_id,
+        version_id,
+        section_id=section_id,
+        query=query,
+    )
 
 
-def _crops_dir(project_id: int, version_id: int | None) -> str:
+def _crops_dir(
+    project_id: int,
+    version_id: int | None,
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> str:
     """Per-project+version crops directory."""
-    path = os.path.join(_data_dir(project_id, version_id), "crops")
+    path = os.path.join(
+        _data_dir(project_id, version_id, section_id=section_id, query=query), "crops"
+    )
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def _localizations_jsonl_path(project_id: int, version_id: int | None) -> str:
-    """Per-project+version JSONL path."""
-    return os.path.join(_data_dir(project_id, version_id), "localizations.jsonl")
+def _localizations_jsonl_path(
+    project_id: int,
+    version_id: int | None,
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> str:
+    """Per-project+version JSONL path (optional section/query filter scope)."""
+    return os.path.join(
+        _data_dir(project_id, version_id, section_id=section_id, query=query),
+        "localizations.jsonl",
+    )
 
 
 def _file_newer_than_days(filepath: str, days: float = 1.0) -> bool:
@@ -270,6 +304,9 @@ def _get_localization_count_from_api(
     version_id: int | None,
     media_ids: list[int] | None,
     media_id_batch_size: int,
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> int | None:
     """
     Return total localization count from Tator API (same batching as fetch_and_save_localizations).
@@ -285,13 +322,14 @@ def _get_localization_count_from_api(
         else [None]
     )
 
-    def _version_kw() -> dict:
-        return {"version": [version_id]} if version_id is not None else {}
+    filter_kw = _localization_fetch_kwargs(
+        version_id=version_id, section_id=section_id, query=query
+    )
 
     try:
         loc_count = 0
         for batch in media_id_batches:
-            kw = _version_kw()
+            kw = dict(filter_kw)
             if batch:
                 kw["media_id"] = batch
             loc_count += api.get_localization_count(project_id, **kw)
@@ -307,20 +345,21 @@ def fetch_project_media_ids(
     project_id: int,
     media_ids_filter: list[int] | None = None,
     version_id: int | None = None,
+    section_id: int | None = None,
 ) -> list[int]:
     """
     Fetch all media in the project. Returns list of media ids.
     If media_ids_filter is set, only those media are returned (and must exist in the project).
     If version_id is set, filters media by that version via related_attribute.
+    If section_id is set, filters media to that Tator section.
     """
     logger.info(
-        f"fetch_project_media_ids: project_id={project_id} filter={media_ids_filter} version_id={version_id}"
+        f"fetch_project_media_ids: project_id={project_id} filter={media_ids_filter} "
+        f"version_id={version_id} section_id={section_id}"
     )
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
-    kwargs: dict = {}
-    if version_id is not None:
-        kwargs["related_attribute"] = [f"$version::{version_id}"]
+    kwargs = _media_fetch_kwargs(version_id=version_id, section_id=section_id)
     if media_ids_filter:
         # Chunk filter to avoid "Request Line is too large" from nginx (e.g. 4094 bytes).
         chunk = _MAX_SAFE_MEDIA_ID_BATCH_SIZE
@@ -995,6 +1034,8 @@ def fetch_and_save_localizations(
     media_ids: list[int] | None = None,
     localization_batch_size: int | None = None,
     media_id_batch_size: int | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> str:
     """
     Fetch all current localizations from Tator and write to a JSONL file.
@@ -1007,7 +1048,9 @@ def fetch_and_save_localizations(
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
     414 Request-URI Too Large errors from nginx when the project has many media.
     """
-    out_path = _localizations_jsonl_path(project_id, version_id)
+    out_path = _localizations_jsonl_path(
+        project_id, version_id, section_id=section_id, query=query
+    )
     logger.info(f"Localizations JSONL will be saved to: {out_path}")
     loc_batch = (
         localization_batch_size
@@ -1037,18 +1080,20 @@ def fetch_and_save_localizations(
         f"Media ID batches: {len(media_id_batches)} batch(es) of up to {effective_mid_batch}"
     )
 
-    def _version_kw() -> dict:
-        return {"version": [version_id]} if version_id is not None else {}
+    filter_kw = _localization_fetch_kwargs(
+        version_id=version_id, section_id=section_id, query=query
+    )
 
     try:
         loc_count = 0
         for mid_batch in media_id_batches:
-            kw = _version_kw()
+            kw = dict(filter_kw)
             if mid_batch:
                 kw["media_id"] = mid_batch
             loc_count += api.get_localization_count(project_id, **kw)
         logger.info(
-            f"get_localization_count(project_id={project_id}, media_ids={bool(media_ids)}, version={version_id}) = {loc_count}"
+            f"get_localization_count(project_id={project_id}, media_ids={bool(media_ids)}, "
+            f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}) = {loc_count}"
         )
         if loc_count == 0 and version_id is not None:
             count_no_ver = 0
@@ -1080,7 +1125,7 @@ def fetch_and_save_localizations(
                     kw = {"stop": loc_batch}
                     if mid_batch:
                         kw["media_id"] = mid_batch
-                    kw.update(_version_kw())
+                    kw.update(filter_kw)
                     if after_id is not None:
                         kw["after"] = after_id
                     try:
@@ -1392,17 +1437,34 @@ def _load_localizations_index(jsonl_path: str) -> dict[str, dict]:
     return index
 
 
-def _crop_manifest_path(project_id: int, version_id: int | None) -> str:
+def _crop_manifest_path(
+    project_id: int,
+    version_id: int | None,
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> str:
     """Path to the crop manifest JSON for a project+version."""
-    return os.path.join(_data_dir(project_id, version_id), "crop_manifest.json")
+    return os.path.join(
+        _data_dir(project_id, version_id, section_id=section_id, query=query),
+        "crop_manifest.json",
+    )
 
 
-def _load_crop_manifest(project_id: int, version_id: int | None) -> dict[str, dict]:
+def _load_crop_manifest(
+    project_id: int,
+    version_id: int | None,
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> dict[str, dict]:
     """
     Load the crop manifest from disk.
     Returns {elemental_id: {"media_id": int, "media_stem": str}} or empty dict.
     """
-    path = _crop_manifest_path(project_id, version_id)
+    path = _crop_manifest_path(
+        project_id, version_id, section_id=section_id, query=query
+    )
     if not os.path.exists(path):
         return {}
     try:
@@ -1414,10 +1476,17 @@ def _load_crop_manifest(project_id: int, version_id: int | None) -> dict[str, di
 
 
 def _save_crop_manifest(
-    project_id: int, version_id: int | None, manifest: dict[str, dict]
+    project_id: int,
+    version_id: int | None,
+    manifest: dict[str, dict],
+    *,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> None:
     """Atomically write the crop manifest to disk."""
-    path = _crop_manifest_path(project_id, version_id)
+    path = _crop_manifest_path(
+        project_id, version_id, section_id=section_id, query=query
+    )
     tmp_path = path + ".tmp"
     try:
         with open(tmp_path, "w") as f:
@@ -1735,16 +1804,21 @@ def _resolve_localizations_jsonl(
     force_sync: bool,
     media_id_batch_size: int,
     localization_batch_size: int,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> tuple[str, list[int], bool]:
     """
     Resolve localizations JSONL and media ids for crop work.
 
     Returns (localizations_path, media_ids_list, use_cached_jsonl).
     """
-    jsonl_path = _localizations_jsonl_path(project_id, version_id)
+    jsonl_path = _localizations_jsonl_path(
+        project_id, version_id, section_id=section_id, query=query
+    )
     localizations_path = ""
     media_ids_list: list[int] = []
     use_cached_jsonl = False
+    has_query = bool((query or "").strip())
     if not force_sync and _file_newer_than_days(jsonl_path, days=1.0):
         line_count, media_ids_from_jsonl = _localizations_jsonl_line_count_and_media_ids(
             jsonl_path
@@ -1753,8 +1827,10 @@ def _resolve_localizations_jsonl(
             api,
             project_id,
             version_id,
-            media_ids_from_jsonl or None,
+            None if has_query else (media_ids_from_jsonl or None),
             media_id_batch_size,
+            section_id=section_id,
+            query=query,
         )
         if api_count is not None and line_count == api_count:
             use_cached_jsonl = True
@@ -1767,24 +1843,41 @@ def _resolve_localizations_jsonl(
             )
 
     if not use_cached_jsonl:
-        logger.info(
-            "Fetching media IDs... host=%s project_id=%s api_url=%s",
-            api_url.rstrip("/"),
-            project_id,
-            api_url,
-        )
-        media_ids_list = fetch_project_media_ids(
-            api_url, token, project_id, version_id=version_id
-        )
+        loc_media_ids: list[int] | None = None
+        if not has_query:
+            logger.info(
+                "Fetching media IDs... host=%s project_id=%s api_url=%s",
+                api_url.rstrip("/"),
+                project_id,
+                api_url,
+            )
+            media_ids_list = fetch_project_media_ids(
+                api_url,
+                token,
+                project_id,
+                version_id=version_id,
+                section_id=section_id,
+            )
+            loc_media_ids = media_ids_list or None
+        else:
+            logger.info(
+                "Skipping media pre-fetch: encoded_search query filters localizations directly"
+            )
         logger.info("Fetching localizations...")
         localizations_path = fetch_and_save_localizations(
             api,
             project_id,
             version_id=version_id,
-            media_ids=media_ids_list or None,
+            media_ids=loc_media_ids,
             localization_batch_size=localization_batch_size,
             media_id_batch_size=media_id_batch_size,
+            section_id=section_id,
+            query=query,
         )
+        if has_query and localizations_path:
+            _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                localizations_path
+            )
     return (localizations_path, media_ids_list, use_cached_jsonl)
 
 
@@ -1863,6 +1956,8 @@ def _run_crop_pipeline(
     localization_batch_size: int,
     s3_bucket: str | None = None,
     s3_crops_prefix: str | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """
     Run crop refresh pipeline and return counts/paths/context.
@@ -1870,7 +1965,9 @@ def _run_crop_pipeline(
     This function is shared by full sync and crop-recompute jobs.
     """
     dl_dir = _download_dir(project_id)
-    crops = _crops_dir(project_id, version_id)
+    crops = _crops_dir(
+        project_id, version_id, section_id=section_id, query=query
+    )
     localizations_path = ""
     localizations_count = 0
     cache_misses = 0
@@ -1893,10 +1990,14 @@ def _run_crop_pipeline(
             force_sync=force_sync,
             media_id_batch_size=media_id_batch_size,
             localization_batch_size=localization_batch_size,
+            section_id=section_id,
+            query=query,
         )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
-        old_manifest = _load_crop_manifest(project_id, version_id)
+        old_manifest = _load_crop_manifest(
+            project_id, version_id, section_id=section_id, query=query
+        )
         if force:
             (
                 all_locs,
@@ -1969,7 +2070,13 @@ def _run_crop_pipeline(
             logger.info("No crop cache misses; skipping crop step")
 
         _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
-        _save_crop_manifest(project_id, version_id, updated_manifest)
+        _save_crop_manifest(
+            project_id,
+            version_id,
+            updated_manifest,
+            section_id=section_id,
+            query=query,
+        )
 
         if s3_bucket and os.path.isdir(crops):
             _sync_local_dir_with_s3(crops, s3_bucket, s3_crops_prefix)
@@ -3171,6 +3278,8 @@ def run_sync_job(
     vss_project_key: str | None = None,
     s3_bucket: str | None = None,
     s3_prefix: str | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """
     Entrypoint for RQ worker: all args are serializable. Calls sync_project_to_fiftyone.
@@ -3179,7 +3288,8 @@ def run_sync_job(
     from src.app.database_manager import register_project_id_name
 
     logger.info(
-        f"run_sync_job received project_id={project_id} version_id={version_id}"
+        f"run_sync_job received project_id={project_id} version_id={version_id} "
+        f"section_id={section_id} query={'set' if (query or '').strip() else 'none'}"
     )
 
     job_meta_handler: logging.Handler | None = None
@@ -3209,6 +3319,8 @@ def run_sync_job(
             vss_project_key=vss_project_key,
             s3_bucket=s3_bucket,
             s3_prefix=s3_prefix,
+            section_id=section_id,
+            query=query,
         )
     finally:
         if job_meta_handler is not None:
@@ -3514,6 +3626,8 @@ def sync_project_to_fiftyone(
     vss_project_key: str | None = None,
     s3_bucket: str | None = None,
     s3_prefix: str | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch Tator media and localizations, build FiftyOne dataset, launch App on given port.
@@ -3537,7 +3651,9 @@ def sync_project_to_fiftyone(
         _s3_crops_prefix(s3_prefix, project_id, version_id) if s3_bucket else None
     )
     logger.info(
-        f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'}"
+        f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} "
+        f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
+        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'}"
     )
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
@@ -3596,7 +3712,9 @@ def sync_project_to_fiftyone(
     try:
         dl_dir = ""
         localizations_path = ""
-        crops = _crops_dir(project_id, version_id)
+        crops = _crops_dir(
+            project_id, version_id, section_id=section_id, query=query
+        )
         use_cached_jsonl = False
         try:
             host = api_url.rstrip("/")
@@ -3613,6 +3731,8 @@ def sync_project_to_fiftyone(
                 localization_batch_size=localization_batch_size,
                 s3_bucket=s3_bucket,
                 s3_crops_prefix=s3_crops_prefix,
+                section_id=section_id,
+                query=query,
             )
             if crop_result.get("status") != "ok":
                 return {
