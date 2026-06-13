@@ -80,3 +80,9 @@ Run tests from the repo root after substantive changes (see `README.md` / projec
 ## Graphify
 
 Before answering architecture or “how does X connect to Y?” questions, read `graphify-out/GRAPH_REPORT.md`. After editing code in a session, run `graphify update .` (AST-only, no API cost).
+
+---
+
+## Tools
+
+- **gh (GitHub CLI):** `/opt/homebrew/bin/gh`
