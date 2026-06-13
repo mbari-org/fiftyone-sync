@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-06-13)
+
+### Features
+
+- **launcher**: Remove Recompute Dimreduce button (#17)
+  ([#17](https://github.com/mbari-org/fiftyone-sync/pull/17),
+  [`aef7984`](https://github.com/mbari-org/fiftyone-sync/commit/aef798484e86f5c9083221adcb21d8571d68211a))
+
+
 ## v0.3.0 (2026-05-30)
 
 ### Documentation
