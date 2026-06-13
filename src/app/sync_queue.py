@@ -62,6 +62,8 @@ def enqueue_sync(
     vss_project_key: str | None = None,
     s3_bucket: str | None = None,
     s3_prefix: str | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
 ) -> str:
     """
     Enqueue a sync job. Returns RQ job id. Requires Redis.
@@ -86,6 +88,8 @@ def enqueue_sync(
         vss_project_key=vss_project_key,
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
+        section_id=section_id,
+        query=query,
         job_timeout=3600 * 24,  # 24h for large projects
         result_ttl=3600 * 24,
         failure_ttl=3600,

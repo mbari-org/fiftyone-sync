@@ -213,7 +213,7 @@ This service exposes a Jinja2 template for [Tator Hosted Templates](https://www.
      - `base_port`: `5151`
      - `iframe_host`: host for the FiftyOne app URL (same host you use for Tator; not `host.docker.internal`).
      - `message`, `config_yaml`: optional header text / YAML exposed as `window.FIFTYONE_CONFIG_YAML`.
-     - **Sync**: set `sync_service_url` and `api_url` (no token tparam). User enters token in applet and clicks **Verify Token**; optional `version_id` to preselect.
+     - **Sync**: set `sync_service_url` and `api_url` (no token tparam). User enters token in applet and clicks **Verify Token**; optional `version_id`, `section_id`, and `query` (Tator `encoded_search`) tparams to preselect filters.
 
 Click **Save**.
 
@@ -274,6 +274,8 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `api_url` | yes | Tator REST API base URL |
 | `token` | yes | Tator API token |
 | `version_id` | no | Version ID filter for localizations |
+| `section_id` | no | Tator media section ID; ANDed with `query` when both set |
+| `query` | no | Tator `encoded_search` filter (base64 Object_Search); ANDed with `section_id` when both set |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
@@ -315,7 +317,7 @@ embeddings:
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
 
-To recompute dimensionality reduction without re-embedding, use the launcher `Recompute Dimreduce` button (or `POST /dimreduce`). UMAP is stored under `${brain_key}_umap`; PCA and t-SNE are stored under `${brain_key}_pca` and `${brain_key}_tsne`.
+To recompute dimensionality reduction without re-embedding, use `POST /dimreduce`. UMAP is stored under `${brain_key}_umap`; PCA and t-SNE are stored under `${brain_key}_pca` and `${brain_key}_tsne`.
 
 **Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
 

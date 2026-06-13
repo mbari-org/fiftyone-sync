@@ -91,6 +91,16 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
+          <th>Section</th>
+          <td>
+            <div class="cell-controls">
+              <select id="section-select" aria-label="section" disabled title="Optional media section filter (ANDed with query when both set).">
+                <option value="">All sections</option>
+              </select>
+            </div>
+          </td>
+        </tr>
+        <tr>
           <th>Voxel Dataset</th>
           <td>
             <div class="cell-controls">
@@ -109,12 +119,6 @@ LAUNCHER_TEMPLATE = r"""
                 <input type="checkbox" id="force-sync-checkbox" name="force_sync" value="1"> Force sync
               </label>
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
-              <select id="dimreduce-method-select" aria-label="dimreduce-method" disabled>
-                <option value="umap">UMAP</option>
-                <option value="pca">PCA</option>
-                <option value="tsne">t-SNE</option>
-              </select>
-              <button type="button" id="dimreduce-btn" disabled title="Recompute dimensionality reduction using cached embeddings (does not recompute embeddings)">Recompute Dimreduce</button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
               <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone. Not this only deletes the dataset from Voxel51, not Tator."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Voxel51 Dataset</button>
@@ -160,17 +164,18 @@ LAUNCHER_TEMPLATE = r"""
       if (configYaml) window.FIFTYONE_CONFIG_YAML = configYaml;
       var apiUrl = "{{ api_url | default('') | e }}";
       var initialVersionId = "{{ version_id | default('') | e }}";
+      var initialSectionId = "{{ section_id | default('') | e }}";
+      var syncQuery = "{{ query | default('') | e }}";
       var syncBtn = document.getElementById('sync-from-tator-btn');
       var syncStatus = document.getElementById('sync-status');
       var fiftyoneAppLink = document.getElementById('fiftyone-app-link');
       var versionSelect = document.getElementById('version-select');
+      var sectionSelect = document.getElementById('section-select');
       var voxelDatasetSelect = document.getElementById('voxel-dataset-select');
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
       var deleteDatasetBtn = document.getElementById('delete-dataset-btn');
-      var dimreduceMethodSelect = document.getElementById('dimreduce-method-select');
-      var dimreduceBtn = document.getElementById('dimreduce-btn');
       var tokenInput = document.getElementById('user-token');
       var testTokenBtn = document.getElementById('test-token-btn');
       var tokenVerified = false;
@@ -284,12 +289,11 @@ LAUNCHER_TEMPLATE = r"""
         if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry || !embeddingServiceReady;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !selectedSyncDatasetName;
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
-        if (dimreduceMethodSelect) dimreduceMethodSelect.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
-        if (dimreduceBtn) dimreduceBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
       }
       function setSyncControlsEnabled(enabled) {
         tokenVerified = enabled;
         if (versionSelect) versionSelect.disabled = !enabled;
+        if (sectionSelect) sectionSelect.disabled = !enabled;
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
         updateSyncButtonsState();
       }
@@ -345,6 +349,41 @@ LAUNCHER_TEMPLATE = r"""
             vssProjectSelect.innerHTML = '<option value="">Failed to load VSS projects</option>';
           });
       }
+      function loadSections(token) {
+        if (!sectionSelect || !syncServiceUrl || !apiUrl || !token) return;
+        sectionSelect.innerHTML = '<option value="">Loading…</option>';
+        fetch(syncServiceUrl + '/sections?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl), {
+          headers: { 'Authorization': 'Token ' + token }
+        })
+          .then(function(r) {
+            if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || r.statusText); });
+            return r.json();
+          })
+          .then(function(sections) {
+            sectionSelect.innerHTML = '';
+            var allOpt = document.createElement('option');
+            allOpt.value = '';
+            allOpt.textContent = 'All sections';
+            sectionSelect.appendChild(allOpt);
+            (sections || []).forEach(function(s) {
+              var opt = document.createElement('option');
+              opt.value = String(s.id);
+              opt.textContent = s.name + (s.id != null ? ' (' + s.id + ')' : '');
+              sectionSelect.appendChild(opt);
+            });
+            if (initialSectionId && sectionSelect.querySelector('option[value="' + initialSectionId + '"]')) {
+              sectionSelect.value = initialSectionId;
+            }
+          })
+          .catch(function() {
+            sectionSelect.innerHTML = '';
+            var opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'All sections';
+            sectionSelect.appendChild(opt);
+            if (initialSectionId) sectionSelect.value = initialSectionId;
+          });
+      }
       function loadVersions(token) {
         if (!versionSelect || !syncServiceUrl || !apiUrl || !token) return;
         versionSelect.innerHTML = '<option value="">Loading…</option>';
@@ -391,6 +430,13 @@ LAUNCHER_TEMPLATE = r"""
             opt.value = '';
             opt.textContent = 'Enter token and click Test';
             versionSelect.appendChild(opt);
+          }
+          if (sectionSelect) {
+            sectionSelect.innerHTML = '';
+            var secOpt = document.createElement('option');
+            secOpt.value = '';
+            secOpt.textContent = 'Enter token and click Test';
+            sectionSelect.appendChild(secOpt);
           }
           if (vssProjectSelect && vssProjectRow) {
             vssProjectSelect.innerHTML = '<option value="">Enter token and click Test</option>';
@@ -468,6 +514,7 @@ LAUNCHER_TEMPLATE = r"""
             .then(function(versions) {
               setSyncControlsEnabled(true);
               loadVersions(token);
+              loadSections(token);
               loadVssProjects(token);
               syncStatus.textContent = 'Token OK. Resolving port/database…';
               updateDatabaseInfo(token);
@@ -583,6 +630,9 @@ LAUNCHER_TEMPLATE = r"""
           if (fiftyoneAppLink) fiftyoneAppLink.style.display = 'none';
           var params = new URLSearchParams({ project_id: String(project), api_url: apiUrl, token: token, launch_app: 'true', port: port });
           if (v) params.set('version_id', v);
+          var s = sectionSelect ? sectionSelect.value : '';
+          if (s) params.set('section_id', s);
+          if (syncQuery) params.set('query', syncQuery);
           if (vssProjectKey) params.set('vss_project_key', vssProjectKey);
           var forceSyncEl = document.getElementById('force-sync-checkbox');
           if (forceSyncEl && forceSyncEl.checked) {
@@ -822,118 +872,6 @@ LAUNCHER_TEMPLATE = r"""
               deleteDatasetBtn.disabled = true;
               checkDatasetExists();
               refreshSyncDatasetChoices();
-            });
-        });
-      }
-      if (dimreduceBtn && syncStatus && syncServiceUrl && apiUrl) {
-        dimreduceBtn.addEventListener('click', function() {
-          var token = getToken();
-          if (!token || !tokenVerified) return;
-          var v = versionSelect && versionSelect.value ? versionSelect.value : '';
-          if (!v) {
-            syncStatus.textContent = 'Select a version first.';
-            syncStatus.classList.add('error');
-            return;
-          }
-          var method = dimreduceMethodSelect && dimreduceMethodSelect.value ? dimreduceMethodSelect.value : 'umap';
-          dimreduceBtn.disabled = true;
-          syncStatus.textContent = 'Recomputing dimensionality reduction…';
-          syncStatus.classList.remove('error');
-
-          var params = new URLSearchParams({
-            project_id: String(project),
-            version_id: v,
-            api_url: apiUrl,
-            token: token,
-            port: String(port),
-            method: method
-          });
-          var fullUrl = syncServiceUrl + '/dimreduce?' + params.toString();
-          fetch(fullUrl, { method: 'POST' })
-            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-            .then(function(result) {
-              if (!result.ok) {
-                syncStatus.textContent = 'Dimreduce failed: ' + (result.data.detail || result.data.message || 'Unknown error');
-                syncStatus.classList.add('error');
-                dimreduceBtn.disabled = false;
-                return;
-              }
-              var data = result.data || {};
-              if (data.job_id) {
-                syncStatus.textContent = 'Dimreduce queued. Waiting for worker…';
-                var syncLogPanel = document.getElementById('sync-log-panel');
-                if (syncLogPanel) { syncLogPanel.classList.remove('visible'); syncLogPanel.textContent = ''; }
-                var statusUrl = syncServiceUrl + '/dimreduce/status/' + encodeURIComponent(data.job_id);
-                var logsUrl = syncServiceUrl + '/dimreduce/logs/' + encodeURIComponent(data.job_id);
-                function updateLogPanel(cb) {
-                  fetch(logsUrl).then(function(r) { return r.ok ? r.json() : null; }).then(function(logData) {
-                    if (syncLogPanel && logData && logData.log_lines && logData.log_lines.length) {
-                      syncLogPanel.textContent = logData.log_lines.join('\\n');
-                      syncLogPanel.scrollTop = syncLogPanel.scrollHeight;
-                    }
-                    if (cb) cb();
-                  }).catch(function() { if (cb) cb(); });
-                }
-                var logPanelHideTimeout = null;
-                function hideLogPanelAfterDelay() {
-                  if (logPanelHideTimeout) clearTimeout(logPanelHideTimeout);
-                  logPanelHideTimeout = setTimeout(function() {
-                    if (syncLogPanel) syncLogPanel.classList.remove('visible');
-                    logPanelHideTimeout = null;
-                  }, 30000);
-                }
-                var poll = function() {
-                  fetch(statusUrl)
-                    .then(function(r) { return r.json(); })
-                    .then(function(s) {
-                      if (s.status === 'queued' || s.status === 'started' || s.status === 'deferred') {
-                        syncStatus.textContent = 'Dimreduce in progress…';
-                        if (syncLogPanel) syncLogPanel.classList.add('visible');
-                        updateLogPanel(function() { setTimeout(poll, 2500); });
-                        return;
-                      }
-                      if (s.status === 'failed') {
-                        syncStatus.textContent = 'Dimreduce failed: ' + (s.error || 'Unknown error');
-                        syncStatus.classList.add('error');
-                        dimreduceBtn.disabled = false;
-                        if (syncLogPanel) syncLogPanel.classList.add('visible');
-                        updateLogPanel(hideLogPanelAfterDelay);
-                        return;
-                      }
-                      if (s.status === 'finished' && s.result) {
-                        var res = s.result;
-                        var m = res && res.method ? res.method : method;
-                        syncStatus.textContent = 'Dimreduce done (' + m + ').';
-                        syncStatus.classList.remove('error');
-                        dimreduceBtn.disabled = false;
-                        if (syncLogPanel) syncLogPanel.classList.add('visible');
-                        updateLogPanel(hideLogPanelAfterDelay);
-                        setTimeout(function() { syncStatus.textContent = ''; }, 5000);
-                        return;
-                      }
-                      syncStatus.textContent = 'Dimreduce: ' + (s.status || 'unknown');
-                      if (syncLogPanel) syncLogPanel.classList.add('visible');
-                      updateLogPanel(function() { setTimeout(poll, 2500); });
-                    })
-                    .catch(function(err) {
-                      syncStatus.textContent = 'Dimreduce status check failed: ' + (err.message || 'Network error');
-                      syncStatus.classList.add('error');
-                      dimreduceBtn.disabled = false;
-                      if (syncLogPanel) syncLogPanel.classList.remove('visible');
-                    });
-                };
-                poll();
-                return;
-              }
-              // Fallback: if no job_id is returned, just show completion state
-              syncStatus.textContent = 'Dimreduce started.';
-              setTimeout(function() { syncStatus.textContent = ''; }, 3000);
-              dimreduceBtn.disabled = false;
-            })
-            .catch(function(err) {
-              syncStatus.textContent = 'Dimreduce error: ' + (err.message || 'Network error');
-              syncStatus.classList.add('error');
-              dimreduceBtn.disabled = false;
             });
         });
       }

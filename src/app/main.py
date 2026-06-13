@@ -272,7 +272,7 @@ async def get_vss_embedding_ws_test(
 # Optional: iframe_host, base_port (5151).
 # For "Sync from Tator" / "Sync to Tator": set sync_service_url, api_url (no token tparam).
 # User enters their Tator API token in the applet and clicks "Verify Token"; sync controls enable after token is verified.
-# Optional tparams: version_id, database_name, project_name (vss_project for embedding status only).
+# Optional tparams: version_id, section_id, query, database_name, project_name (vss_project for embedding status only).
 # database-info is called with project_id; send api_url and Authorization to resolve to config key (project name).
 # Embedding service status: server uses FASTVSS_API_URL; GET /vss-embedding shows availability.
 # FiftyOne opens in a new window/tab (Open FiftyOne button); no iframe.
@@ -415,6 +415,32 @@ async def get_versions(
     ]
 
 
+@app_launch.get("/sections")
+async def get_sections(
+    project_id: int = Query(..., description="Tator project ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> list[dict]:
+    """
+    Return list of Tator media sections for the given project. Used by the launcher
+    template to populate the section dropdown. Token via Authorization header.
+    """
+    import tator
+
+    token = _token_from_authorization(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid Authorization header"
+        )
+    host = _resolve_api_url(api_url)
+    try:
+        api = tator.get_api(host, token)
+        section_list = api.get_section_list(project_id)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    return [{"id": s.id, "name": s.name} for s in section_list]
+
+
 @app_launch.get("/vss-projects")
 async def get_vss_projects(
     project_id: int = Query(..., description="Tator project ID"),
@@ -462,6 +488,13 @@ async def get_vss_projects(
 async def sync(
     project_id: int = Query(..., description="Tator project ID"),
     version_id: int | None = Query(None),
+    section_id: int | None = Query(
+        None, description="Optional Tator media section ID filter"
+    ),
+    query: str | None = Query(
+        None,
+        description="Optional Tator encoded_search filter (base64 Object_Search); ANDed with section when both set",
+    ),
     api_url: str = Query(
         ..., description="Tator REST API base URL (e.g. https://tator.example.com)"
     ),
@@ -542,6 +575,8 @@ async def sync(
             vss_project_key=vss_project_key,
             s3_bucket=s3_bucket,
             s3_prefix=s3_prefix,
+            section_id=section_id,
+            query=query,
         )
         return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:
