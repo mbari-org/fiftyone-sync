@@ -101,16 +101,6 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
-          <th>Voxel Dataset</th>
-          <td>
-            <div class="cell-controls">
-              <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator.">
-                <option value="">Enter token and click Test</option>
-              </select>
-            </div>
-          </td>
-        </tr>
-        <tr>
           <th>Sync</th>
           <td>
             <div class="cell-controls">
@@ -121,7 +111,6 @@ LAUNCHER_TEMPLATE = r"""
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
-              <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone. Not this only deletes the dataset from Voxel51, not Tator."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Voxel51 Dataset</button>
             </div>
             <div id="sync-log-panel" class="sync-log-panel" aria-live="polite" title="Sync progress log"></div>
           </td>
@@ -142,6 +131,25 @@ LAUNCHER_TEMPLATE = r"""
             <span id="embedding-status" class="sync-status" aria-live="polite">Checking…</span>
           </td>
         </tr>
+        {% if sync_service_url and api_url %}
+        <tr>
+          <td colspan="2" style="padding: 0.75rem 0 0.25rem;">
+            <hr style="border: none; border-top: 1px solid #444; margin: 0 0 0.5rem;">
+            <span style="font-size: 0.75rem; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.05em;">Voxel51 Management</span>
+          </td>
+        </tr>
+        <tr>
+          <th>Voxel51 dataset</th>
+          <td>
+            <div class="cell-controls">
+              <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator.">
+                <option value="">Enter token and click Test</option>
+              </select>
+              <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone. Not this only deletes the dataset from Voxel51, not Tator."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Voxel51 Dataset</button>
+            </div>
+          </td>
+        </tr>
+        {% endif %}
       </tbody>
     </table>
   </div>
