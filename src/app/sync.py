@@ -488,6 +488,151 @@ def _build_media_attributes_map(
     return result
 
 
+# Name of the Image media attribute that marks a project as a classification project.
+CLASSIFICATION_LABEL_ATTR = "Label"
+
+
+def is_classification_project(api: Any, project_id: int) -> bool:
+    """
+    True if the project's Image media type defines a "Label" attribute.
+
+    Such projects classify whole images: the ground-truth label lives on the
+    media (its "Label" attribute), not on localizations. For these projects sync
+    downloads each image and uses it as its own crop instead of fetching and
+    cropping localizations.
+    """
+    _, attr_names = _get_image_media_type_and_attr_names(api, project_id)
+    return CLASSIFICATION_LABEL_ATTR in attr_names
+
+
+def _media_to_classification_loc(m: Any) -> dict[str, Any] | None:
+    """
+    Build a synthetic full-frame localization for one Image media.
+
+    The label comes from the media's "Label" attribute (copied verbatim into the
+    synthetic localization's attributes). Using a full-frame box (x=0, y=0,
+    width=1, height=1) lets the rest of the pipeline (manifest, dataset build,
+    reconcile, sync-to-tator) treat the whole image as one classification sample.
+    """
+    mid = getattr(m, "id", None)
+    if mid is None:
+        return None
+    attrs = dict(getattr(m, "attributes", None) or {})
+    eid = getattr(m, "elemental_id", None)
+    eid = str(eid) if eid else f"m{mid}"
+    return {
+        "id": mid,
+        "elemental_id": eid,
+        "media": int(mid),
+        "frame": None,
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1.0,
+        "height": 1.0,
+        "attributes": attrs,
+        "type": getattr(m, "type", None),
+        "version": getattr(m, "version", None),
+        "modified_datetime": getattr(m, "modified_datetime", None),
+        "created_datetime": getattr(m, "created_datetime", None),
+        "_classification": True,
+    }
+
+
+def fetch_and_save_classification_localizations(
+    api: Any,
+    project_id: int,
+    media_objects: list[Any],
+    version_id: int | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> str:
+    """
+    Write one synthetic full-frame localization per Image media to a JSONL file.
+
+    Mirrors fetch_and_save_localizations (overwrites the file so it is always
+    reconciled with Tator), but for classification projects where the label is a
+    media attribute rather than a localization. Returns the JSONL path.
+    """
+    out_path = _localizations_jsonl_path(
+        project_id, version_id, section_id=section_id, query=query
+    )
+    image_type_id, _ = _get_image_media_type_and_attr_names(api, project_id)
+    logger.info(f"Classification localizations JSONL will be saved to: {out_path}")
+    total = 0
+    with open(out_path, "w") as f:
+        for m in media_objects:
+            if not isinstance(m, tator.models.Media):
+                continue
+            if image_type_id is not None and getattr(m, "type", None) != image_type_id:
+                continue
+            loc = _media_to_classification_loc(m)
+            if loc is None:
+                continue
+            try:
+                f.write(json.dumps(loc, default=_json_serial) + "\n")
+                total += 1
+            except Exception as e:
+                logger.info(f"Skip classification localization serialization: {e}")
+    logger.info(f"Wrote {total} classification localizations -> {out_path}")
+    return out_path
+
+
+def _resolve_classification_localizations_jsonl(
+    api: Any,
+    *,
+    project_id: int,
+    version_id: int | None,
+    api_url: str,
+    token: str,
+    force_sync: bool,
+    media_id_batch_size: int,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> tuple[str, list[int], bool]:
+    """
+    Resolve the synthetic classification localizations JSONL and media ids.
+
+    Returns (localizations_path, media_ids_list, use_cached_jsonl). The cached
+    JSONL is reused when it is newer than one day and its line count matches the
+    current project media count (media labels are not versioned).
+    """
+    jsonl_path = _localizations_jsonl_path(
+        project_id, version_id, section_id=section_id, query=query
+    )
+    # Media labels are not versioned: fetch all project (section-scoped) media.
+    media_ids_list = fetch_project_media_ids(
+        api_url, token, project_id, section_id=section_id
+    )
+
+    if not force_sync and _file_newer_than_days(jsonl_path, days=1.0):
+        line_count, media_ids_from_jsonl = (
+            _localizations_jsonl_line_count_and_media_ids(jsonl_path)
+        )
+        if line_count > 0 and line_count == len(media_ids_list):
+            logger.info(
+                "Bypassing media fetch: classification JSONL is newer than 1 day and "
+                "line count (%s) matches project media count",
+                line_count,
+            )
+            return (jsonl_path, media_ids_from_jsonl, True)
+
+    media_objects = get_media_chunked(
+        api, project_id, media_ids_list, media_id_batch_size=media_id_batch_size
+    )
+    localizations_path = fetch_and_save_classification_localizations(
+        api,
+        project_id,
+        media_objects,
+        version_id=version_id,
+        section_id=section_id,
+        query=query,
+    )
+    _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+        localizations_path
+    )
+    return (localizations_path, media_ids_list, False)
+
+
 # Video extensions: skip download (not supported); downloads come directly from Tator for images only.
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v")
 
@@ -829,6 +974,56 @@ def _safe_unlink(path: str | Path) -> None:
         pass
 
 
+def _pad_to_square(img: Image.Image) -> Image.Image:
+    """
+    Pad the shorter side of an image so it becomes square, centering the content.
+
+    Keeps aspect ratio (no distortion) before a later resize to the target size,
+    matching how localization crops are made square before resizing. Padding is
+    black (zeros), consistent with letterbox conventions.
+    """
+    width, height = img.size
+    if width == height:
+        return img
+    side = max(width, height)
+    mode = img.mode if img.mode in ("RGB", "RGBA", "L") else "RGB"
+    if img.mode != mode:
+        img = img.convert(mode)
+    fill = 0 if mode == "L" else (0, 0, 0) if mode == "RGB" else (0, 0, 0, 0)
+    canvas = Image.new(mode, (side, side), fill)
+    offset = ((side - width) // 2, (side - height) // 2)
+    canvas.paste(img, offset)
+    return canvas
+
+
+def _resize_whole_image(
+    img: Image.Image,
+    locs_with_out_paths: list[tuple[dict, Path]],
+    size: int,
+) -> tuple[int, int]:
+    """
+    Save the entire image (padded to square, then resized) for each output path.
+
+    Used for classification projects where the media image itself is the crop
+    (no localization box); see crop_localizations_parallel(classification=True).
+    The image is padded to a square to preserve aspect ratio before resizing to
+    size x size, mirroring the square-then-resize behavior of localization crops.
+    """
+    total_ok = 0
+    total_fail = 0
+    squared = _pad_to_square(img)
+    for _loc, out_path in locs_with_out_paths:
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            resized = squared.resize((size, size), _PIL_RESAMPLE)
+            resized.save(out_path, format="PNG")
+            total_ok += 1
+        except Exception as e:
+            logger.debug(f"PIL resize failed for {out_path}: {e}")
+            total_fail += 1
+    return (total_ok, total_fail)
+
+
 def _crop_media_group(
     input_path_or_url: str | Path,
     locs_with_out_paths: list[tuple[dict, Path]],
@@ -837,13 +1032,16 @@ def _crop_media_group(
     _dim_cache: dict[str, tuple[int, int]] | None = None,
     media: Any = None,
     crop_timeout: int = _DEFAULT_CROP_TIMEOUT,
+    classification: bool = False,
 ) -> tuple[int, int]:
     """
     Crop multiple localizations from one image or one video frame using PIL.
 
     For images the source file is opened directly. For video frames a single
     frame is extracted via ffmpeg to a temp file, cropped with PIL, then the
-    temp file is deleted. Returns (num_ok, num_fail).
+    temp file is deleted. When classification is True the whole image is padded
+    to a square and resized to size x size instead of cropping a localization
+    box. Returns (num_ok, num_fail).
     """
     if not locs_with_out_paths:
         return (0, 0)
@@ -863,6 +1061,11 @@ def _crop_media_group(
 
         img.load()
         width, height = img.size
+
+        if classification and not is_video:
+            result = _resize_whole_image(img, locs_with_out_paths, size)
+            img.close()
+            return result
 
         total_ok = 0
         total_fail = 0
@@ -1167,9 +1370,14 @@ def crop_localizations_parallel(
     max_workers: int | None = None,
     locs_to_crop: list[dict] | None = None,
     media_objects: list[Any] | None = None,
+    classification: bool = False,
 ) -> tuple[int, int]:
     """
     Crop localizations from their media in parallel using PIL.
+
+    When classification is True, each media image is padded to a square and
+    resized whole to size x size (no localization box crop); only image media are
+    processed in this mode.
 
     Frames are downloaded/extracted in batches of _FRAME_BATCH_SIZE to limit disk
     and memory usage. Video frames are extracted via ffmpeg to temp files, cropped
@@ -1384,7 +1592,14 @@ def crop_localizations_parallel(
             batch = image_tasks[batch_start : batch_start + batch_size]
             with ThreadPoolExecutor(max_workers=image_workers) as ex:
                 futures = [
-                    ex.submit(_crop_media_group, image_path, group, None, size)
+                    ex.submit(
+                        _crop_media_group,
+                        image_path,
+                        group,
+                        None,
+                        size,
+                        classification=classification,
+                    )
                     for image_path, group in batch
                 ]
                 ok, fail = _collect(futures)
@@ -1976,23 +2191,48 @@ def _run_crop_pipeline(
     num_cropped = 0
     num_failed = 0
     used_cached_jsonl = False
-    try:
-        (
-            localizations_path,
-            media_ids_list,
-            used_cached_jsonl,
-        ) = _resolve_localizations_jsonl(
-            api,
-            project_id=project_id,
-            version_id=version_id,
-            api_url=api_url,
-            token=token,
-            force_sync=force_sync,
-            media_id_batch_size=media_id_batch_size,
-            localization_batch_size=localization_batch_size,
-            section_id=section_id,
-            query=query,
+    classification = is_classification_project(api, project_id)
+    if classification:
+        logger.info(
+            "Project %s is a classification project (Image '%s' attribute present): "
+            "using whole-image crops, skipping localization fetch/crop",
+            project_id,
+            CLASSIFICATION_LABEL_ATTR,
         )
+    try:
+        if classification:
+            (
+                localizations_path,
+                media_ids_list,
+                used_cached_jsonl,
+            ) = _resolve_classification_localizations_jsonl(
+                api,
+                project_id=project_id,
+                version_id=version_id,
+                api_url=api_url,
+                token=token,
+                force_sync=force_sync,
+                media_id_batch_size=media_id_batch_size,
+                section_id=section_id,
+                query=query,
+            )
+        else:
+            (
+                localizations_path,
+                media_ids_list,
+                used_cached_jsonl,
+            ) = _resolve_localizations_jsonl(
+                api,
+                project_id=project_id,
+                version_id=version_id,
+                api_url=api_url,
+                token=token,
+                force_sync=force_sync,
+                media_id_batch_size=media_id_batch_size,
+                localization_batch_size=localization_batch_size,
+                section_id=section_id,
+                query=query,
+            )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
         old_manifest = _load_crop_manifest(
@@ -2064,6 +2304,7 @@ def _run_crop_pipeline(
                 size=224,
                 locs_to_crop=locs_to_crop,
                 media_objects=all_media,
+                classification=classification,
             )
             _cleanup_downloaded_videos(dl_dir)
         elif not locs_to_crop:
@@ -2294,6 +2535,37 @@ def _get_tator_modified_at_datetime(sample: fo.Sample) -> tuple[datetime | None,
     return None, False
 
 
+_PREDICT_WORD_RE = re.compile(r"^([A-Za-z0-9]*predict[A-Za-z0-9]*)(_.*)?$", re.IGNORECASE)
+_PREDICT_EXCLUDED = frozenset({"predicted_label"})
+
+
+def _discover_prediction_pairs(attrs: dict) -> list[tuple[str, str | None]]:
+    """
+    Scan attribute keys for any that contain the word 'predict' (case-insensitive).
+
+    For each such key a companion score key is inferred by taking the suffix that
+    follows the predict-word and prepending 'score'.  Examples:
+        prediction_v1 + score_v1  ->  ('prediction_v1', 'score_v1')
+        predict_v1    + score_v1  ->  ('predict_v1',    'score_v1')
+        prediction_v2 + score_v2  ->  ('prediction_v2', 'score_v2')
+
+    Keys already handled by the fixed top1/top2 logic ('predicted_label') are
+    excluded.  Returns a list of (pred_attr, score_attr_or_None) tuples, where
+    score_attr is only set when that key is actually present in attrs.
+    """
+    result: list[tuple[str, str | None]] = []
+    for key in attrs:
+        if key in _PREDICT_EXCLUDED:
+            continue
+        m = _PREDICT_WORD_RE.match(key)
+        if m is None:
+            continue
+        suffix = m.group(2) or ""
+        score_key = f"score{suffix}" if suffix else None
+        result.append((key, score_key if score_key and score_key in attrs else None))
+    return result
+
+
 def _apply_loc_to_sample(
     sample: fo.Sample,
     loc: dict,
@@ -2331,6 +2603,23 @@ def _apply_loc_to_sample(
         if score_s is not None:
             top2_kwargs["confidence"] = float(score_s)
         sample["top2_prediction"] = fo.Classification(**top2_kwargs)
+
+    # Dynamic prediction pairs: any attribute whose name contains 'predict'
+    # paired with a companion score attribute sharing the same suffix.
+    for pred_attr, score_attr in _discover_prediction_pairs(attrs):
+        pred_val = attrs.get(pred_attr)
+        if pred_val is None:
+            continue
+        field_name = re.sub(r"[^A-Za-z0-9_]", "_", pred_attr)
+        dyn_kwargs: dict[str, Any] = {"label": str(pred_val)}
+        if score_attr:
+            score_val = attrs.get(score_attr)
+            if score_val is not None:
+                try:
+                    dyn_kwargs["confidence"] = float(score_val)
+                except (ValueError, TypeError):
+                    pass
+        sample[field_name] = fo.Classification(**dyn_kwargs)
 
     # Primitive sample-level attributes
     _PRIMITIVE_ATTR_MAP = (
@@ -2749,7 +3038,7 @@ def build_fiftyone_dataset_from_crops(
 
 def _ensure_field_indexes(dataset: fo.Dataset) -> None:
     """Create MongoDB indexes on classification and primitive fields for faster queries."""
-    for field_path in (
+    static_paths = [
         "elemental_id",  # Used by reconcile (values aggregation) and sync-to-tator
         "ground_truth.label",
         "ground_truth.confidence",
@@ -2765,7 +3054,22 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
         "cluster",
         "comment",
         "verified",
-    ):
+    ]
+
+    # Discover any dynamically-added prediction Classification fields
+    dynamic_paths: list[str] = []
+    try:
+        for field_name in dataset.get_field_schema():
+            if "predict" in field_name.lower() and field_name not in {
+                "top1_prediction",
+                "top2_prediction",
+            }:
+                dynamic_paths.append(f"{field_name}.label")
+                dynamic_paths.append(f"{field_name}.confidence")
+    except Exception:
+        pass
+
+    for field_path in static_paths + dynamic_paths:
         try:
             dataset.create_index(field_path)
         except Exception:
