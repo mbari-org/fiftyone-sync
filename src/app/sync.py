@@ -2525,6 +2525,37 @@ def _get_tator_modified_at_datetime(sample: fo.Sample) -> tuple[datetime | None,
     return None, False
 
 
+_PREDICT_WORD_RE = re.compile(r"^([A-Za-z0-9]*predict[A-Za-z0-9]*)(_.*)?$", re.IGNORECASE)
+_PREDICT_EXCLUDED = frozenset({"predicted_label"})
+
+
+def _discover_prediction_pairs(attrs: dict) -> list[tuple[str, str | None]]:
+    """
+    Scan attribute keys for any that contain the word 'predict' (case-insensitive).
+
+    For each such key a companion score key is inferred by taking the suffix that
+    follows the predict-word and prepending 'score'.  Examples:
+        prediction_v1 + score_v1  ->  ('prediction_v1', 'score_v1')
+        predict_v1    + score_v1  ->  ('predict_v1',    'score_v1')
+        prediction_v2 + score_v2  ->  ('prediction_v2', 'score_v2')
+
+    Keys already handled by the fixed top1/top2 logic ('predicted_label') are
+    excluded.  Returns a list of (pred_attr, score_attr_or_None) tuples, where
+    score_attr is only set when that key is actually present in attrs.
+    """
+    result: list[tuple[str, str | None]] = []
+    for key in attrs:
+        if key in _PREDICT_EXCLUDED:
+            continue
+        m = _PREDICT_WORD_RE.match(key)
+        if m is None:
+            continue
+        suffix = m.group(2) or ""
+        score_key = f"score{suffix}" if suffix else None
+        result.append((key, score_key if score_key and score_key in attrs else None))
+    return result
+
+
 def _apply_loc_to_sample(
     sample: fo.Sample,
     loc: dict,
@@ -2562,6 +2593,23 @@ def _apply_loc_to_sample(
         if score_s is not None:
             top2_kwargs["confidence"] = float(score_s)
         sample["top2_prediction"] = fo.Classification(**top2_kwargs)
+
+    # Dynamic prediction pairs: any attribute whose name contains 'predict'
+    # paired with a companion score attribute sharing the same suffix.
+    for pred_attr, score_attr in _discover_prediction_pairs(attrs):
+        pred_val = attrs.get(pred_attr)
+        if pred_val is None:
+            continue
+        field_name = re.sub(r"[^A-Za-z0-9_]", "_", pred_attr)
+        dyn_kwargs: dict[str, Any] = {"label": str(pred_val)}
+        if score_attr:
+            score_val = attrs.get(score_attr)
+            if score_val is not None:
+                try:
+                    dyn_kwargs["confidence"] = float(score_val)
+                except (ValueError, TypeError):
+                    pass
+        sample[field_name] = fo.Classification(**dyn_kwargs)
 
     # Primitive sample-level attributes
     _PRIMITIVE_ATTR_MAP = (
@@ -2985,7 +3033,7 @@ def build_fiftyone_dataset_from_crops(
 
 def _ensure_field_indexes(dataset: fo.Dataset) -> None:
     """Create MongoDB indexes on classification and primitive fields for faster queries."""
-    for field_path in (
+    static_paths = [
         "elemental_id",  # Used by reconcile (values aggregation) and sync-to-tator
         "ground_truth.label",
         "ground_truth.confidence",
@@ -3001,7 +3049,22 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
         "cluster",
         "comment",
         "verified",
-    ):
+    ]
+
+    # Discover any dynamically-added prediction Classification fields
+    dynamic_paths: list[str] = []
+    try:
+        for field_name in dataset.get_field_schema():
+            if "predict" in field_name.lower() and field_name not in {
+                "top1_prediction",
+                "top2_prediction",
+            }:
+                dynamic_paths.append(f"{field_name}.label")
+                dynamic_paths.append(f"{field_name}.confidence")
+    except Exception:
+        pass
+
+    for field_path in static_paths + dynamic_paths:
         try:
             dataset.create_index(field_path)
         except Exception:

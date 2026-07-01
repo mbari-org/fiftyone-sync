@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-06-23)
+
+### Features
+
+- **sync**: Discover versioned prediction/score pairs as indexed labels (#20)
+  ([#20](https://github.com/mbari-org/fiftyone-sync/pull/20),
+  [`c7b7bf4`](https://github.com/mbari-org/fiftyone-sync/commit/c7b7bf43507bdef18658cdf6a46f9de325cd7c43))
+
+
+## v0.5.0 (2026-06-14)
+
+### Features
+
+- **ui**: Add Voxel51 Management section to launcher template (#18)
+  ([#18](https://github.com/mbari-org/fiftyone-sync/pull/18),
+  [`f0e3de0`](https://github.com/mbari-org/fiftyone-sync/commit/f0e3de03ebd4d58718e7b6d8f5297de8e5f8166d))
+
+
 ## v0.4.0 (2026-06-13)
 
 ### Features
