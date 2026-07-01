@@ -2598,6 +2598,11 @@ def _apply_loc_to_sample(
     dt = _to_datetime(modified_at)
     if dt is not None:
         sample[TATOR_MODIFIED_AT_FIELD] = dt
+    if loc.get("_classification"):
+        sample["is_classification"] = True
+        media_id = loc.get("media")
+        if media_id is not None:
+            sample["tator_media_id"] = int(media_id)
 
 
 def _create_sample_from_loc(
@@ -3104,6 +3109,16 @@ def _fetch_localizations_by_elemental_ids(
             if eid is None:
                 continue
             out[str(eid)] = loc
+        resolved_in_chunk = {str(e) for e in chunk if str(e) in out}
+        unresolved_in_chunk = [str(e) for e in chunk if str(e) not in resolved_in_chunk]
+        if unresolved_in_chunk:
+            logger.info(
+                "sync_edits_to_tator: fetch_localizations chunk %s/%s "
+                "unresolved_elemental_ids=%s",
+                i,
+                total_chunks,
+                unresolved_in_chunk,
+            )
         logger.info(
             "sync_edits_to_tator: fetch_localizations chunk %s/%s size=%s resolved_total=%s",
             i,
@@ -3112,6 +3127,143 @@ def _fetch_localizations_by_elemental_ids(
             len(out),
         )
     return out
+
+
+def _fetch_media_by_elemental_ids(
+    api: Any,
+    project_id: int,
+    elemental_ids: list[str],
+    *,
+    chunk_size: int | None = None,
+) -> dict[str, Any]:
+    """Resolve elemental_ids to media objects (classification samples use media elemental_id)."""
+    out: dict[str, Any] = {}
+    if not elemental_ids:
+        return out
+    effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_fetch_chunk()
+    unique = list(dict.fromkeys(elemental_ids))
+    total_chunks = max(1, (len(unique) + effective_chunk - 1) // effective_chunk)
+    logger.info(
+        "sync_edits_to_tator: fetch_media chunks=%s chunk_size=%s unique_ids=%s",
+        total_chunks,
+        effective_chunk,
+        len(unique),
+    )
+    for i, chunk in enumerate(_chunk_list(unique, effective_chunk), start=1):
+        media_list: list[Any] = []
+        try:
+            result = api.get_media_list_by_id(
+                project_id, media_id_query={"elemental_ids": chunk}
+            )
+            media_list = list(result) if not isinstance(result, list) else result
+        except Exception as e:
+            logger.info(
+                "sync_edits_to_tator: fetch_media batch failed (%s); "
+                "falling back to per-elemental_id get_media_list",
+                e,
+            )
+            for eid in chunk:
+                try:
+                    one = api.get_media_list(project_id, elemental_id=eid)
+                    media_list.extend(one or [])
+                except Exception as e2:
+                    logger.info(
+                        "sync_edits_to_tator: fetch_media elemental_id=%s failed: %s",
+                        eid,
+                        e2,
+                    )
+        for media in media_list:
+            eid = getattr(media, "elemental_id", None)
+            if eid is None:
+                continue
+            out[str(eid)] = media
+        unresolved_in_chunk = [str(e) for e in chunk if str(e) not in out]
+        if unresolved_in_chunk:
+            logger.info(
+                "sync_edits_to_tator: fetch_media chunk %s/%s unresolved_elemental_ids=%s",
+                i,
+                total_chunks,
+                unresolved_in_chunk,
+            )
+        logger.info(
+            "sync_edits_to_tator: fetch_media chunk %s/%s size=%s resolved_total=%s",
+            i,
+            total_chunks,
+            len(chunk),
+            len(out),
+        )
+    return out
+
+
+def _bulk_patch_media_by_elemental_id(
+    api: Any,
+    project_id: int,
+    elemental_id_to_attrs: dict[str, dict[str, Any]],
+    media_by_eid: dict[str, Any],
+    *,
+    chunk_size: int | None = None,
+    inter_chunk_delay_seconds: float | None = None,
+) -> None:
+    """
+    Apply attribute updates to Image media via PATCH /rest/Medias/{project}.
+    Groups by attribute payload and chunks by media id.
+    """
+    groups: dict[tuple[tuple[str, Any], ...], list[int]] = defaultdict(list)
+    missing: list[str] = []
+    for eid, attrs in elemental_id_to_attrs.items():
+        media = media_by_eid.get(eid)
+        if media is None:
+            missing.append(eid)
+            continue
+        mid = getattr(media, "id", None)
+        if mid is None:
+            missing.append(eid)
+            continue
+        groups[_attrs_group_key(attrs)].append(int(mid))
+
+    if missing:
+        preview = ", ".join(missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise ValueError(f"No media found for elemental_id(s): {preview}{suffix}")
+
+    effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_patch_chunk()
+    effective_delay = (
+        inter_chunk_delay_seconds
+        if inter_chunk_delay_seconds is not None
+        else _sync_to_tator_chunk_delay_seconds()
+    )
+    total_chunks = sum(
+        max(1, (len(ids) + effective_chunk - 1) // effective_chunk)
+        for ids in groups.values()
+    )
+    logger.info(
+        "sync_edits_to_tator: bulk media PATCH groups=%s total_chunks=%s chunk_size=%s",
+        len(groups),
+        total_chunks,
+        effective_chunk,
+    )
+
+    sent_chunks = 0
+    for group_idx, (key, media_ids) in enumerate(groups.items(), start=1):
+        attrs = dict(key)
+        chunks = list(_chunk_list(media_ids, effective_chunk))
+        for i, chunk in enumerate(chunks):
+            api.update_media_list(
+                project_id,
+                media_bulk_update={"attributes": attrs, "ids": chunk},
+            )
+            sent_chunks += 1
+            logger.info(
+                "sync_edits_to_tator: bulk media PATCH chunk %s/%s "
+                "(group %s/%s, size=%s)",
+                sent_chunks,
+                total_chunks,
+                group_idx,
+                len(groups),
+                len(chunk),
+            )
+            if effective_delay > 0 and (i + 1) < len(chunks):
+                time.sleep(effective_delay)
 
 
 def _bulk_patch_localizations_by_elemental_id(
@@ -3435,6 +3587,20 @@ def _do_sync_edits_to_tator(
                 continue
 
         pending.append((sample, eid_str, attrs, last_modified_at))
+        if _debug:
+            logger.info(
+                "sync_edits_to_tator: PENDING elem=%s label=%s attrs=%s "
+                "is_classification=%s tator_media_id=%s",
+                eid_str,
+                label,
+                attrs,
+                bool(
+                    sample["is_classification"]
+                    if "is_classification" in sample
+                    else False
+                ),
+                sample["tator_media_id"] if "tator_media_id" in sample else None,
+            )
 
     logger.info(
         "sync_edits_to_tator: scan complete scanned=%s pending=%s skipped=%s failed=%s",
@@ -3449,33 +3615,111 @@ def _do_sync_edits_to_tator(
         for _sample, eid_str, attrs, _lm in pending:
             updates[eid_str] = attrs
 
-        try:
+        logger.info(
+            "sync_edits_to_tator: resolving %s elemental_ids -> localizations",
+            len(updates),
+        )
+        loc_by_eid = _fetch_localizations_by_elemental_ids(
+            api, project_id, version_id, list(updates.keys())
+        )
+        unresolved_for_loc = sorted(
+            eid for eid in updates if eid not in loc_by_eid
+        )
+        if unresolved_for_loc:
             logger.info(
-                "sync_edits_to_tator: resolving %s elemental_ids -> localizations",
-                len(updates),
+                "sync_edits_to_tator: %s elemental_id(s) not found as localizations; "
+                "will try media lookup: %s",
+                len(unresolved_for_loc),
+                unresolved_for_loc,
             )
-            loc_by_eid = _fetch_localizations_by_elemental_ids(
-                api, project_id, version_id, list(updates.keys())
+
+        media_by_eid: dict[str, Any] = {}
+        if unresolved_for_loc:
+            media_by_eid = _fetch_media_by_elemental_ids(
+                api, project_id, unresolved_for_loc
             )
-            logger.info(
-                "sync_edits_to_tator: bulk push samples=%s distinct_elemental_ids=%s "
-                "resolved_localizations=%s",
-                len(pending),
-                len(updates),
-                len(loc_by_eid),
+            for eid in unresolved_for_loc:
+                if eid in media_by_eid:
+                    logger.info(
+                        "sync_edits_to_tator: elemental_id=%s resolved as media "
+                        "(classification sample)",
+                        eid,
+                    )
+
+        loc_updates = {eid: attrs for eid, attrs in updates.items() if eid in loc_by_eid}
+        media_updates = {
+            eid: attrs for eid, attrs in updates.items() if eid in media_by_eid
+        }
+        unresolved = sorted(
+            eid
+            for eid in updates
+            if eid not in loc_by_eid and eid not in media_by_eid
+        )
+        if unresolved:
+            logger.warning(
+                "sync_edits_to_tator: %s elemental_id(s) unresolved (neither "
+                "localization nor media): %s",
+                len(unresolved),
+                unresolved,
             )
-            _bulk_patch_localizations_by_elemental_id(
-                api, project_id, version_id, updates, loc_by_eid
-            )
-        except Exception as e:
-            failed += len(pending)
-            errors.append(f"Batch update to Tator failed: {e}")
-        else:
+            for eid in unresolved:
+                failed += 1
+                errors.append(
+                    f"No localization or media found for elemental_id={eid}"
+                )
+
+        logger.info(
+            "sync_edits_to_tator: bulk push samples=%s distinct_elemental_ids=%s "
+            "resolved_localizations=%s resolved_media=%s unresolved=%s",
+            len(pending),
+            len(updates),
+            len(loc_by_eid),
+            len(media_by_eid),
+            len(unresolved),
+        )
+
+        successful_eids: set[str] = set()
+        if loc_updates:
+            try:
+                _bulk_patch_localizations_by_elemental_id(
+                    api, project_id, version_id, loc_updates, loc_by_eid
+                )
+            except Exception as e:
+                failed += len(loc_updates)
+                errors.append(f"Localization batch update to Tator failed: {e}")
+                logger.error(
+                    "sync_edits_to_tator: localization PATCH failed for %s "
+                    "elemental_id(s): %s",
+                    len(loc_updates),
+                    sorted(loc_updates.keys()),
+                )
+            else:
+                successful_eids.update(loc_updates.keys())
+
+        if media_updates:
+            try:
+                _bulk_patch_media_by_elemental_id(
+                    api, project_id, media_updates, media_by_eid
+                )
+            except Exception as e:
+                failed += len(media_updates)
+                errors.append(f"Media batch update to Tator failed: {e}")
+                logger.error(
+                    "sync_edits_to_tator: media PATCH failed for %s elemental_id(s): %s",
+                    len(media_updates),
+                    sorted(media_updates.keys()),
+                )
+            else:
+                successful_eids.update(media_updates.keys())
+
+        if successful_eids:
             logger.info(
                 "sync_edits_to_tator: writing tator_modified_at to %s samples",
-                len(pending),
+                len(successful_eids),
             )
-            for sample, _eid_str, _attrs, last_modified_at in pending:
+            for sample, eid_str, _attrs, last_modified_at in pending:
+                if eid_str not in successful_eids:
+                    continue
                 try:
                     sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
                     sample.save()
