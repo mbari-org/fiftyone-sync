@@ -122,8 +122,9 @@ def test_run_crop_pipeline_miss_only(monkeypatch, tmp_path):
         "_resolve_localizations_jsonl",
         lambda *args, **kwargs: (str(localizations), [1, 2], False),
     )
+    monkeypatch.setattr(sync, "is_classification_project", lambda *_a, **_k: False)
     monkeypatch.setattr(sync, "_download_dir", lambda _pid: str(download_dir))
-    monkeypatch.setattr(sync, "_crops_dir", lambda _pid, _vid: str(crops_dir))
+    monkeypatch.setattr(sync, "_crops_dir", lambda _pid, _vid, **_kw: str(crops_dir))
     monkeypatch.setattr(sync, "_load_crop_manifest", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(sync, "_cleanup_deleted_crops", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(
@@ -192,8 +193,9 @@ def test_run_crop_pipeline_force_all(monkeypatch, tmp_path):
         "_resolve_localizations_jsonl",
         lambda *args, **kwargs: (str(localizations), [1], True),
     )
+    monkeypatch.setattr(sync, "is_classification_project", lambda *_a, **_k: False)
     monkeypatch.setattr(sync, "_download_dir", lambda _pid: str(download_dir))
-    monkeypatch.setattr(sync, "_crops_dir", lambda _pid, _vid: str(crops_dir))
+    monkeypatch.setattr(sync, "_crops_dir", lambda _pid, _vid, **_kw: str(crops_dir))
     monkeypatch.setattr(
         sync, "_load_crop_manifest", lambda *_args, **_kwargs: {"old": {}}
     )

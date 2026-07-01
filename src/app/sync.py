@@ -488,6 +488,145 @@ def _build_media_attributes_map(
     return result
 
 
+# Name of the Image media attribute that marks a media as a classification sample.
+CLASSIFICATION_LABEL_ATTR = "Label"
+
+
+def is_classification_project(api: Any, project_id: int) -> bool:
+    """
+    True if the project's Image media type defines a "Label" attribute.
+
+    A project may be BOTH classification and detection: when this attribute
+    exists, labeled whole images are synced as classification samples (the media
+    image is the crop) in addition to any localizations (which are cropped as
+    usual). The two kinds of samples coexist, each identified by its elemental_id.
+    """
+    _, attr_names = _get_image_media_type_and_attr_names(api, project_id)
+    return CLASSIFICATION_LABEL_ATTR in attr_names
+
+
+def _media_to_classification_loc(m: Any) -> dict[str, Any] | None:
+    """
+    Build a synthetic full-frame localization for one Image media.
+
+    The label comes from the media's "Label" attribute (copied verbatim into the
+    synthetic localization's attributes). Using a full-frame box (x=0, y=0,
+    width=1, height=1) and the media's own elemental_id lets the rest of the
+    pipeline (manifest, dataset build, reconcile) treat the whole image as one
+    classification sample distinct from any real localizations on the same media.
+    The "_classification" flag routes cropping to a whole-image resize.
+    """
+    mid = getattr(m, "id", None)
+    if mid is None:
+        return None
+    attrs = dict(getattr(m, "attributes", None) or {})
+    eid = getattr(m, "elemental_id", None)
+    eid = str(eid) if eid else f"m{mid}"
+    return {
+        "id": mid,
+        "elemental_id": eid,
+        "media": int(mid),
+        "frame": None,
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1.0,
+        "height": 1.0,
+        "attributes": attrs,
+        "type": getattr(m, "type", None),
+        "version": getattr(m, "version", None),
+        "modified_datetime": getattr(m, "modified_datetime", None),
+        "created_datetime": getattr(m, "created_datetime", None),
+        "_classification": True,
+    }
+
+
+def fetch_and_save_classification_localizations(
+    api: Any,
+    project_id: int,
+    media_objects: list[Any],
+    out_path: str | None = None,
+    mode: str = "w",
+    require_label: bool = True,
+    version_id: int | None = None,
+    section_id: int | None = None,
+    query: str | None = None,
+) -> int:
+    """
+    Write one synthetic full-frame localization per labeled Image media to JSONL.
+
+    For classification samples the label is a media attribute rather than a
+    localization. When require_label is True, only media whose "Label" attribute
+    has a non-empty value produce a sample (so detection-only images are skipped).
+    Use mode="a" to append these alongside detection localizations in the same
+    file. Returns the number of classification localizations written.
+    """
+    if out_path is None:
+        out_path = _localizations_jsonl_path(
+            project_id, version_id, section_id=section_id, query=query
+        )
+    image_type_id, _ = _get_image_media_type_and_attr_names(api, project_id)
+    logger.info(f"Classification localizations JSONL (mode={mode}): {out_path}")
+    total = 0
+    with open(out_path, mode) as f:
+        for m in media_objects:
+            if not isinstance(m, tator.models.Media):
+                continue
+            if image_type_id is not None and getattr(m, "type", None) != image_type_id:
+                continue
+            loc = _media_to_classification_loc(m)
+            if loc is None:
+                continue
+            if require_label:
+                label = (loc.get("attributes") or {}).get(CLASSIFICATION_LABEL_ATTR)
+                if label is None or not str(label).strip():
+                    continue
+            try:
+                f.write(json.dumps(loc, default=_json_serial) + "\n")
+                total += 1
+            except Exception as e:
+                logger.info(f"Skip classification localization serialization: {e}")
+    logger.info(f"Wrote {total} classification localizations -> {out_path}")
+    return total
+
+
+def _append_classification_localizations_to_jsonl(
+    api: Any,
+    *,
+    project_id: int,
+    api_url: str,
+    token: str,
+    localizations_path: str,
+    media_id_batch_size: int,
+    section_id: int | None = None,
+) -> int:
+    """
+    Append synthetic full-frame localizations for labeled Image media to the JSONL.
+
+    Detection localizations are written first (by _resolve_localizations_jsonl);
+    this adds one whole-image classification sample per labeled Image media, so a
+    project that is both classification and detection yields both kinds of
+    samples, each identified by its own elemental_id. Media labels are not
+    versioned, so all project (section-scoped) media are considered. Returns the
+    number of classification localizations appended.
+    """
+    media_ids = fetch_project_media_ids(
+        api_url, token, project_id, section_id=section_id
+    )
+    if not media_ids:
+        return 0
+    media_objects = get_media_chunked(
+        api, project_id, media_ids, media_id_batch_size=media_id_batch_size
+    )
+    return fetch_and_save_classification_localizations(
+        api,
+        project_id,
+        media_objects,
+        out_path=localizations_path,
+        mode="a",
+        require_label=True,
+    )
+
+
 # Video extensions: skip download (not supported); downloads come directly from Tator for images only.
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v")
 
@@ -829,6 +968,53 @@ def _safe_unlink(path: str | Path) -> None:
         pass
 
 
+def _pad_to_square(img: Image.Image) -> Image.Image:
+    """
+    Pad the shorter side of an image so it becomes square, centering the content.
+
+    Keeps aspect ratio (no distortion) before a later resize to the target size,
+    mirroring how localization crops are made square before resizing. Padding is
+    black (zeros), the standard letterbox convention.
+    """
+    width, height = img.size
+    if width == height:
+        return img
+    side = max(width, height)
+    mode = img.mode if img.mode in ("RGB", "RGBA", "L") else "RGB"
+    if img.mode != mode:
+        img = img.convert(mode)
+    fill = 0 if mode == "L" else (0, 0, 0) if mode == "RGB" else (0, 0, 0, 0)
+    canvas = Image.new(mode, (side, side), fill)
+    canvas.paste(img, ((side - width) // 2, (side - height) // 2))
+    return canvas
+
+
+def _resize_whole_image(
+    img: Image.Image,
+    locs_with_out_paths: list[tuple[dict, Path]],
+    size: int,
+) -> tuple[int, int]:
+    """
+    Save the whole image (padded to square, then resized) for each output path.
+
+    Used for classification samples where the media image itself is the crop (no
+    localization box). Padding to a square preserves aspect ratio before resizing
+    to size x size, matching the square-then-resize behavior of localization crops.
+    """
+    total_ok = 0
+    total_fail = 0
+    squared = _pad_to_square(img)
+    for _loc, out_path in locs_with_out_paths:
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            squared.resize((size, size), _PIL_RESAMPLE).save(out_path, format="PNG")
+            total_ok += 1
+        except Exception as e:
+            logger.debug(f"PIL resize failed for {out_path}: {e}")
+            total_fail += 1
+    return (total_ok, total_fail)
+
+
 def _crop_media_group(
     input_path_or_url: str | Path,
     locs_with_out_paths: list[tuple[dict, Path]],
@@ -843,7 +1029,9 @@ def _crop_media_group(
 
     For images the source file is opened directly. For video frames a single
     frame is extracted via ffmpeg to a temp file, cropped with PIL, then the
-    temp file is deleted. Returns (num_ok, num_fail).
+    temp file is deleted. Localizations flagged with "_classification" (whole-image
+    classification samples) are padded to a square and resized to size x size
+    instead of cropping a box; only image media use that path. Returns (num_ok, num_fail).
     """
     if not locs_with_out_paths:
         return (0, 0)
@@ -864,9 +1052,24 @@ def _crop_media_group(
         img.load()
         width, height = img.size
 
+        # Split into whole-image classification samples and box crops. Classification
+        # only applies to still images (video frames always crop the localization box).
+        class_items: list[tuple[dict, Path]] = []
+        box_items: list[tuple[dict, Path]] = []
+        for loc, out_path in locs_with_out_paths:
+            if not is_video and loc.get("_classification"):
+                class_items.append((loc, out_path))
+            else:
+                box_items.append((loc, out_path))
+
         total_ok = 0
         total_fail = 0
-        for loc, out_path in locs_with_out_paths:
+        if class_items:
+            ok, fail = _resize_whole_image(img, class_items, size)
+            total_ok += ok
+            total_fail += fail
+
+        for loc, out_path in box_items:
             square_coords = _compute_square_coordinates(loc, width, height)
             if square_coords is None:
                 total_fail += 1
@@ -1995,6 +2198,34 @@ def _run_crop_pipeline(
         )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
+
+        # Classification-and-detection projects: append one whole-image
+        # classification localization per labeled Image media alongside the
+        # detection localizations already written above. Each is identified by
+        # its own elemental_id; whole images are resized, boxes are cropped.
+        if localizations_path and is_classification_project(api, project_id):
+            added = _append_classification_localizations_to_jsonl(
+                api,
+                project_id=project_id,
+                api_url=api_url,
+                token=token,
+                localizations_path=localizations_path,
+                media_id_batch_size=media_id_batch_size,
+                section_id=section_id,
+            )
+            if added:
+                # The combined JSONL now differs from the detection-only file, so
+                # the cached-JSONL fast path no longer applies; recompute media ids.
+                used_cached_jsonl = False
+                _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                    localizations_path
+                )
+                logger.info(
+                    "Classification project: appended %s whole-image sample(s); "
+                    "total media ids now %s",
+                    added,
+                    len(media_ids_list),
+                )
         old_manifest = _load_crop_manifest(
             project_id, version_id, section_id=section_id, query=query
         )
