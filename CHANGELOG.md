@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-07-01)
+
+### Features
+
+- **sync**: Classification samples alongside localizations (#21)
+  ([#21](https://github.com/mbari-org/fiftyone-sync/pull/21),
+  [`a6462ab`](https://github.com/mbari-org/fiftyone-sync/commit/a6462aba83289f6e4b2fc9d674f25e59b2675ee7))
+
+
 ## v0.6.0 (2026-06-23)
 
 ### Features
