@@ -488,7 +488,7 @@ def _build_media_attributes_map(
     return result
 
 
-# Name of the Image media attribute that marks a project as a classification project.
+# Name of the Image media attribute that marks a media as a classification sample.
 CLASSIFICATION_LABEL_ATTR = "Label"
 
 
@@ -496,10 +496,10 @@ def is_classification_project(api: Any, project_id: int) -> bool:
     """
     True if the project's Image media type defines a "Label" attribute.
 
-    Such projects classify whole images: the ground-truth label lives on the
-    media (its "Label" attribute), not on localizations. For these projects sync
-    downloads each image and uses it as its own crop instead of fetching and
-    cropping localizations.
+    A project may be BOTH classification and detection: when this attribute
+    exists, labeled whole images are synced as classification samples (the media
+    image is the crop) in addition to any localizations (which are cropped as
+    usual). The two kinds of samples coexist, each identified by its elemental_id.
     """
     _, attr_names = _get_image_media_type_and_attr_names(api, project_id)
     return CLASSIFICATION_LABEL_ATTR in attr_names
@@ -511,8 +511,10 @@ def _media_to_classification_loc(m: Any) -> dict[str, Any] | None:
 
     The label comes from the media's "Label" attribute (copied verbatim into the
     synthetic localization's attributes). Using a full-frame box (x=0, y=0,
-    width=1, height=1) lets the rest of the pipeline (manifest, dataset build,
-    reconcile, sync-to-tator) treat the whole image as one classification sample.
+    width=1, height=1) and the media's own elemental_id lets the rest of the
+    pipeline (manifest, dataset build, reconcile) treat the whole image as one
+    classification sample distinct from any real localizations on the same media.
+    The "_classification" flag routes cropping to a whole-image resize.
     """
     mid = getattr(m, "id", None)
     if mid is None:
@@ -542,24 +544,30 @@ def fetch_and_save_classification_localizations(
     api: Any,
     project_id: int,
     media_objects: list[Any],
+    out_path: str | None = None,
+    mode: str = "w",
+    require_label: bool = True,
     version_id: int | None = None,
     section_id: int | None = None,
     query: str | None = None,
-) -> str:
+) -> int:
     """
-    Write one synthetic full-frame localization per Image media to a JSONL file.
+    Write one synthetic full-frame localization per labeled Image media to JSONL.
 
-    Mirrors fetch_and_save_localizations (overwrites the file so it is always
-    reconciled with Tator), but for classification projects where the label is a
-    media attribute rather than a localization. Returns the JSONL path.
+    For classification samples the label is a media attribute rather than a
+    localization. When require_label is True, only media whose "Label" attribute
+    has a non-empty value produce a sample (so detection-only images are skipped).
+    Use mode="a" to append these alongside detection localizations in the same
+    file. Returns the number of classification localizations written.
     """
-    out_path = _localizations_jsonl_path(
-        project_id, version_id, section_id=section_id, query=query
-    )
+    if out_path is None:
+        out_path = _localizations_jsonl_path(
+            project_id, version_id, section_id=section_id, query=query
+        )
     image_type_id, _ = _get_image_media_type_and_attr_names(api, project_id)
-    logger.info(f"Classification localizations JSONL will be saved to: {out_path}")
+    logger.info(f"Classification localizations JSONL (mode={mode}): {out_path}")
     total = 0
-    with open(out_path, "w") as f:
+    with open(out_path, mode) as f:
         for m in media_objects:
             if not isinstance(m, tator.models.Media):
                 continue
@@ -568,69 +576,55 @@ def fetch_and_save_classification_localizations(
             loc = _media_to_classification_loc(m)
             if loc is None:
                 continue
+            if require_label:
+                label = (loc.get("attributes") or {}).get(CLASSIFICATION_LABEL_ATTR)
+                if label is None or not str(label).strip():
+                    continue
             try:
                 f.write(json.dumps(loc, default=_json_serial) + "\n")
                 total += 1
             except Exception as e:
                 logger.info(f"Skip classification localization serialization: {e}")
     logger.info(f"Wrote {total} classification localizations -> {out_path}")
-    return out_path
+    return total
 
 
-def _resolve_classification_localizations_jsonl(
+def _append_classification_localizations_to_jsonl(
     api: Any,
     *,
     project_id: int,
-    version_id: int | None,
     api_url: str,
     token: str,
-    force_sync: bool,
+    localizations_path: str,
     media_id_batch_size: int,
     section_id: int | None = None,
-    query: str | None = None,
-) -> tuple[str, list[int], bool]:
+) -> int:
     """
-    Resolve the synthetic classification localizations JSONL and media ids.
+    Append synthetic full-frame localizations for labeled Image media to the JSONL.
 
-    Returns (localizations_path, media_ids_list, use_cached_jsonl). The cached
-    JSONL is reused when it is newer than one day and its line count matches the
-    current project media count (media labels are not versioned).
+    Detection localizations are written first (by _resolve_localizations_jsonl);
+    this adds one whole-image classification sample per labeled Image media, so a
+    project that is both classification and detection yields both kinds of
+    samples, each identified by its own elemental_id. Media labels are not
+    versioned, so all project (section-scoped) media are considered. Returns the
+    number of classification localizations appended.
     """
-    jsonl_path = _localizations_jsonl_path(
-        project_id, version_id, section_id=section_id, query=query
-    )
-    # Media labels are not versioned: fetch all project (section-scoped) media.
-    media_ids_list = fetch_project_media_ids(
+    media_ids = fetch_project_media_ids(
         api_url, token, project_id, section_id=section_id
     )
-
-    if not force_sync and _file_newer_than_days(jsonl_path, days=1.0):
-        line_count, media_ids_from_jsonl = (
-            _localizations_jsonl_line_count_and_media_ids(jsonl_path)
-        )
-        if line_count > 0 and line_count == len(media_ids_list):
-            logger.info(
-                "Bypassing media fetch: classification JSONL is newer than 1 day and "
-                "line count (%s) matches project media count",
-                line_count,
-            )
-            return (jsonl_path, media_ids_from_jsonl, True)
-
+    if not media_ids:
+        return 0
     media_objects = get_media_chunked(
-        api, project_id, media_ids_list, media_id_batch_size=media_id_batch_size
+        api, project_id, media_ids, media_id_batch_size=media_id_batch_size
     )
-    localizations_path = fetch_and_save_classification_localizations(
+    return fetch_and_save_classification_localizations(
         api,
         project_id,
         media_objects,
-        version_id=version_id,
-        section_id=section_id,
-        query=query,
+        out_path=localizations_path,
+        mode="a",
+        require_label=True,
     )
-    _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
-        localizations_path
-    )
-    return (localizations_path, media_ids_list, False)
 
 
 # Video extensions: skip download (not supported); downloads come directly from Tator for images only.
@@ -979,8 +973,8 @@ def _pad_to_square(img: Image.Image) -> Image.Image:
     Pad the shorter side of an image so it becomes square, centering the content.
 
     Keeps aspect ratio (no distortion) before a later resize to the target size,
-    matching how localization crops are made square before resizing. Padding is
-    black (zeros), consistent with letterbox conventions.
+    mirroring how localization crops are made square before resizing. Padding is
+    black (zeros), the standard letterbox convention.
     """
     width, height = img.size
     if width == height:
@@ -991,8 +985,7 @@ def _pad_to_square(img: Image.Image) -> Image.Image:
         img = img.convert(mode)
     fill = 0 if mode == "L" else (0, 0, 0) if mode == "RGB" else (0, 0, 0, 0)
     canvas = Image.new(mode, (side, side), fill)
-    offset = ((side - width) // 2, (side - height) // 2)
-    canvas.paste(img, offset)
+    canvas.paste(img, ((side - width) // 2, (side - height) // 2))
     return canvas
 
 
@@ -1002,12 +995,11 @@ def _resize_whole_image(
     size: int,
 ) -> tuple[int, int]:
     """
-    Save the entire image (padded to square, then resized) for each output path.
+    Save the whole image (padded to square, then resized) for each output path.
 
-    Used for classification projects where the media image itself is the crop
-    (no localization box); see crop_localizations_parallel(classification=True).
-    The image is padded to a square to preserve aspect ratio before resizing to
-    size x size, mirroring the square-then-resize behavior of localization crops.
+    Used for classification samples where the media image itself is the crop (no
+    localization box). Padding to a square preserves aspect ratio before resizing
+    to size x size, matching the square-then-resize behavior of localization crops.
     """
     total_ok = 0
     total_fail = 0
@@ -1015,8 +1007,7 @@ def _resize_whole_image(
     for _loc, out_path in locs_with_out_paths:
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            resized = squared.resize((size, size), _PIL_RESAMPLE)
-            resized.save(out_path, format="PNG")
+            squared.resize((size, size), _PIL_RESAMPLE).save(out_path, format="PNG")
             total_ok += 1
         except Exception as e:
             logger.debug(f"PIL resize failed for {out_path}: {e}")
@@ -1032,16 +1023,15 @@ def _crop_media_group(
     _dim_cache: dict[str, tuple[int, int]] | None = None,
     media: Any = None,
     crop_timeout: int = _DEFAULT_CROP_TIMEOUT,
-    classification: bool = False,
 ) -> tuple[int, int]:
     """
     Crop multiple localizations from one image or one video frame using PIL.
 
     For images the source file is opened directly. For video frames a single
     frame is extracted via ffmpeg to a temp file, cropped with PIL, then the
-    temp file is deleted. When classification is True the whole image is padded
-    to a square and resized to size x size instead of cropping a localization
-    box. Returns (num_ok, num_fail).
+    temp file is deleted. Localizations flagged with "_classification" (whole-image
+    classification samples) are padded to a square and resized to size x size
+    instead of cropping a box; only image media use that path. Returns (num_ok, num_fail).
     """
     if not locs_with_out_paths:
         return (0, 0)
@@ -1062,14 +1052,24 @@ def _crop_media_group(
         img.load()
         width, height = img.size
 
-        if classification and not is_video:
-            result = _resize_whole_image(img, locs_with_out_paths, size)
-            img.close()
-            return result
+        # Split into whole-image classification samples and box crops. Classification
+        # only applies to still images (video frames always crop the localization box).
+        class_items: list[tuple[dict, Path]] = []
+        box_items: list[tuple[dict, Path]] = []
+        for loc, out_path in locs_with_out_paths:
+            if not is_video and loc.get("_classification"):
+                class_items.append((loc, out_path))
+            else:
+                box_items.append((loc, out_path))
 
         total_ok = 0
         total_fail = 0
-        for loc, out_path in locs_with_out_paths:
+        if class_items:
+            ok, fail = _resize_whole_image(img, class_items, size)
+            total_ok += ok
+            total_fail += fail
+
+        for loc, out_path in box_items:
             square_coords = _compute_square_coordinates(loc, width, height)
             if square_coords is None:
                 total_fail += 1
@@ -1370,14 +1370,9 @@ def crop_localizations_parallel(
     max_workers: int | None = None,
     locs_to_crop: list[dict] | None = None,
     media_objects: list[Any] | None = None,
-    classification: bool = False,
 ) -> tuple[int, int]:
     """
     Crop localizations from their media in parallel using PIL.
-
-    When classification is True, each media image is padded to a square and
-    resized whole to size x size (no localization box crop); only image media are
-    processed in this mode.
 
     Frames are downloaded/extracted in batches of _FRAME_BATCH_SIZE to limit disk
     and memory usage. Video frames are extracted via ffmpeg to temp files, cropped
@@ -1592,14 +1587,7 @@ def crop_localizations_parallel(
             batch = image_tasks[batch_start : batch_start + batch_size]
             with ThreadPoolExecutor(max_workers=image_workers) as ex:
                 futures = [
-                    ex.submit(
-                        _crop_media_group,
-                        image_path,
-                        group,
-                        None,
-                        size,
-                        classification=classification,
-                    )
+                    ex.submit(_crop_media_group, image_path, group, None, size)
                     for image_path, group in batch
                 ]
                 ok, fail = _collect(futures)
@@ -2191,50 +2179,53 @@ def _run_crop_pipeline(
     num_cropped = 0
     num_failed = 0
     used_cached_jsonl = False
-    classification = is_classification_project(api, project_id)
-    if classification:
-        logger.info(
-            "Project %s is a classification project (Image '%s' attribute present): "
-            "using whole-image crops, skipping localization fetch/crop",
-            project_id,
-            CLASSIFICATION_LABEL_ATTR,
-        )
     try:
-        if classification:
-            (
-                localizations_path,
-                media_ids_list,
-                used_cached_jsonl,
-            ) = _resolve_classification_localizations_jsonl(
-                api,
-                project_id=project_id,
-                version_id=version_id,
-                api_url=api_url,
-                token=token,
-                force_sync=force_sync,
-                media_id_batch_size=media_id_batch_size,
-                section_id=section_id,
-                query=query,
-            )
-        else:
-            (
-                localizations_path,
-                media_ids_list,
-                used_cached_jsonl,
-            ) = _resolve_localizations_jsonl(
-                api,
-                project_id=project_id,
-                version_id=version_id,
-                api_url=api_url,
-                token=token,
-                force_sync=force_sync,
-                media_id_batch_size=media_id_batch_size,
-                localization_batch_size=localization_batch_size,
-                section_id=section_id,
-                query=query,
-            )
+        (
+            localizations_path,
+            media_ids_list,
+            used_cached_jsonl,
+        ) = _resolve_localizations_jsonl(
+            api,
+            project_id=project_id,
+            version_id=version_id,
+            api_url=api_url,
+            token=token,
+            force_sync=force_sync,
+            media_id_batch_size=media_id_batch_size,
+            localization_batch_size=localization_batch_size,
+            section_id=section_id,
+            query=query,
+        )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
+
+        # Classification-and-detection projects: append one whole-image
+        # classification localization per labeled Image media alongside the
+        # detection localizations already written above. Each is identified by
+        # its own elemental_id; whole images are resized, boxes are cropped.
+        if localizations_path and is_classification_project(api, project_id):
+            added = _append_classification_localizations_to_jsonl(
+                api,
+                project_id=project_id,
+                api_url=api_url,
+                token=token,
+                localizations_path=localizations_path,
+                media_id_batch_size=media_id_batch_size,
+                section_id=section_id,
+            )
+            if added:
+                # The combined JSONL now differs from the detection-only file, so
+                # the cached-JSONL fast path no longer applies; recompute media ids.
+                used_cached_jsonl = False
+                _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                    localizations_path
+                )
+                logger.info(
+                    "Classification project: appended %s whole-image sample(s); "
+                    "total media ids now %s",
+                    added,
+                    len(media_ids_list),
+                )
         old_manifest = _load_crop_manifest(
             project_id, version_id, section_id=section_id, query=query
         )
@@ -2304,7 +2295,6 @@ def _run_crop_pipeline(
                 size=224,
                 locs_to_crop=locs_to_crop,
                 media_objects=all_media,
-                classification=classification,
             )
             _cleanup_downloaded_videos(dl_dir)
         elif not locs_to_crop:
@@ -2656,6 +2646,11 @@ def _apply_loc_to_sample(
     dt = _to_datetime(modified_at)
     if dt is not None:
         sample[TATOR_MODIFIED_AT_FIELD] = dt
+    if loc.get("_classification"):
+        sample["is_classification"] = True
+        media_id = loc.get("media")
+        if media_id is not None:
+            sample["tator_media_id"] = int(media_id)
 
 
 def _create_sample_from_loc(
@@ -3177,6 +3172,16 @@ def _fetch_localizations_by_elemental_ids(
             if eid is None:
                 continue
             out[str(eid)] = loc
+        resolved_in_chunk = {str(e) for e in chunk if str(e) in out}
+        unresolved_in_chunk = [str(e) for e in chunk if str(e) not in resolved_in_chunk]
+        if unresolved_in_chunk:
+            logger.info(
+                "sync_edits_to_tator: fetch_localizations chunk %s/%s "
+                "unresolved_elemental_ids=%s",
+                i,
+                total_chunks,
+                unresolved_in_chunk,
+            )
         logger.info(
             "sync_edits_to_tator: fetch_localizations chunk %s/%s size=%s resolved_total=%s",
             i,
@@ -3185,6 +3190,143 @@ def _fetch_localizations_by_elemental_ids(
             len(out),
         )
     return out
+
+
+def _fetch_media_by_elemental_ids(
+    api: Any,
+    project_id: int,
+    elemental_ids: list[str],
+    *,
+    chunk_size: int | None = None,
+) -> dict[str, Any]:
+    """Resolve elemental_ids to media objects (classification samples use media elemental_id)."""
+    out: dict[str, Any] = {}
+    if not elemental_ids:
+        return out
+    effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_fetch_chunk()
+    unique = list(dict.fromkeys(elemental_ids))
+    total_chunks = max(1, (len(unique) + effective_chunk - 1) // effective_chunk)
+    logger.info(
+        "sync_edits_to_tator: fetch_media chunks=%s chunk_size=%s unique_ids=%s",
+        total_chunks,
+        effective_chunk,
+        len(unique),
+    )
+    for i, chunk in enumerate(_chunk_list(unique, effective_chunk), start=1):
+        media_list: list[Any] = []
+        try:
+            result = api.get_media_list_by_id(
+                project_id, media_id_query={"elemental_ids": chunk}
+            )
+            media_list = list(result) if not isinstance(result, list) else result
+        except Exception as e:
+            logger.info(
+                "sync_edits_to_tator: fetch_media batch failed (%s); "
+                "falling back to per-elemental_id get_media_list",
+                e,
+            )
+            for eid in chunk:
+                try:
+                    one = api.get_media_list(project_id, elemental_id=eid)
+                    media_list.extend(one or [])
+                except Exception as e2:
+                    logger.info(
+                        "sync_edits_to_tator: fetch_media elemental_id=%s failed: %s",
+                        eid,
+                        e2,
+                    )
+        for media in media_list:
+            eid = getattr(media, "elemental_id", None)
+            if eid is None:
+                continue
+            out[str(eid)] = media
+        unresolved_in_chunk = [str(e) for e in chunk if str(e) not in out]
+        if unresolved_in_chunk:
+            logger.info(
+                "sync_edits_to_tator: fetch_media chunk %s/%s unresolved_elemental_ids=%s",
+                i,
+                total_chunks,
+                unresolved_in_chunk,
+            )
+        logger.info(
+            "sync_edits_to_tator: fetch_media chunk %s/%s size=%s resolved_total=%s",
+            i,
+            total_chunks,
+            len(chunk),
+            len(out),
+        )
+    return out
+
+
+def _bulk_patch_media_by_elemental_id(
+    api: Any,
+    project_id: int,
+    elemental_id_to_attrs: dict[str, dict[str, Any]],
+    media_by_eid: dict[str, Any],
+    *,
+    chunk_size: int | None = None,
+    inter_chunk_delay_seconds: float | None = None,
+) -> None:
+    """
+    Apply attribute updates to Image media via PATCH /rest/Medias/{project}.
+    Groups by attribute payload and chunks by media id.
+    """
+    groups: dict[tuple[tuple[str, Any], ...], list[int]] = defaultdict(list)
+    missing: list[str] = []
+    for eid, attrs in elemental_id_to_attrs.items():
+        media = media_by_eid.get(eid)
+        if media is None:
+            missing.append(eid)
+            continue
+        mid = getattr(media, "id", None)
+        if mid is None:
+            missing.append(eid)
+            continue
+        groups[_attrs_group_key(attrs)].append(int(mid))
+
+    if missing:
+        preview = ", ".join(missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise ValueError(f"No media found for elemental_id(s): {preview}{suffix}")
+
+    effective_chunk = chunk_size if chunk_size is not None else _sync_to_tator_patch_chunk()
+    effective_delay = (
+        inter_chunk_delay_seconds
+        if inter_chunk_delay_seconds is not None
+        else _sync_to_tator_chunk_delay_seconds()
+    )
+    total_chunks = sum(
+        max(1, (len(ids) + effective_chunk - 1) // effective_chunk)
+        for ids in groups.values()
+    )
+    logger.info(
+        "sync_edits_to_tator: bulk media PATCH groups=%s total_chunks=%s chunk_size=%s",
+        len(groups),
+        total_chunks,
+        effective_chunk,
+    )
+
+    sent_chunks = 0
+    for group_idx, (key, media_ids) in enumerate(groups.items(), start=1):
+        attrs = dict(key)
+        chunks = list(_chunk_list(media_ids, effective_chunk))
+        for i, chunk in enumerate(chunks):
+            api.update_media_list(
+                project_id,
+                media_bulk_update={"attributes": attrs, "ids": chunk},
+            )
+            sent_chunks += 1
+            logger.info(
+                "sync_edits_to_tator: bulk media PATCH chunk %s/%s "
+                "(group %s/%s, size=%s)",
+                sent_chunks,
+                total_chunks,
+                group_idx,
+                len(groups),
+                len(chunk),
+            )
+            if effective_delay > 0 and (i + 1) < len(chunks):
+                time.sleep(effective_delay)
 
 
 def _bulk_patch_localizations_by_elemental_id(
@@ -3508,6 +3650,20 @@ def _do_sync_edits_to_tator(
                 continue
 
         pending.append((sample, eid_str, attrs, last_modified_at))
+        if _debug:
+            logger.info(
+                "sync_edits_to_tator: PENDING elem=%s label=%s attrs=%s "
+                "is_classification=%s tator_media_id=%s",
+                eid_str,
+                label,
+                attrs,
+                bool(
+                    sample["is_classification"]
+                    if "is_classification" in sample
+                    else False
+                ),
+                sample["tator_media_id"] if "tator_media_id" in sample else None,
+            )
 
     logger.info(
         "sync_edits_to_tator: scan complete scanned=%s pending=%s skipped=%s failed=%s",
@@ -3522,33 +3678,111 @@ def _do_sync_edits_to_tator(
         for _sample, eid_str, attrs, _lm in pending:
             updates[eid_str] = attrs
 
-        try:
+        logger.info(
+            "sync_edits_to_tator: resolving %s elemental_ids -> localizations",
+            len(updates),
+        )
+        loc_by_eid = _fetch_localizations_by_elemental_ids(
+            api, project_id, version_id, list(updates.keys())
+        )
+        unresolved_for_loc = sorted(
+            eid for eid in updates if eid not in loc_by_eid
+        )
+        if unresolved_for_loc:
             logger.info(
-                "sync_edits_to_tator: resolving %s elemental_ids -> localizations",
-                len(updates),
+                "sync_edits_to_tator: %s elemental_id(s) not found as localizations; "
+                "will try media lookup: %s",
+                len(unresolved_for_loc),
+                unresolved_for_loc,
             )
-            loc_by_eid = _fetch_localizations_by_elemental_ids(
-                api, project_id, version_id, list(updates.keys())
+
+        media_by_eid: dict[str, Any] = {}
+        if unresolved_for_loc:
+            media_by_eid = _fetch_media_by_elemental_ids(
+                api, project_id, unresolved_for_loc
             )
-            logger.info(
-                "sync_edits_to_tator: bulk push samples=%s distinct_elemental_ids=%s "
-                "resolved_localizations=%s",
-                len(pending),
-                len(updates),
-                len(loc_by_eid),
+            for eid in unresolved_for_loc:
+                if eid in media_by_eid:
+                    logger.info(
+                        "sync_edits_to_tator: elemental_id=%s resolved as media "
+                        "(classification sample)",
+                        eid,
+                    )
+
+        loc_updates = {eid: attrs for eid, attrs in updates.items() if eid in loc_by_eid}
+        media_updates = {
+            eid: attrs for eid, attrs in updates.items() if eid in media_by_eid
+        }
+        unresolved = sorted(
+            eid
+            for eid in updates
+            if eid not in loc_by_eid and eid not in media_by_eid
+        )
+        if unresolved:
+            logger.warning(
+                "sync_edits_to_tator: %s elemental_id(s) unresolved (neither "
+                "localization nor media): %s",
+                len(unresolved),
+                unresolved,
             )
-            _bulk_patch_localizations_by_elemental_id(
-                api, project_id, version_id, updates, loc_by_eid
-            )
-        except Exception as e:
-            failed += len(pending)
-            errors.append(f"Batch update to Tator failed: {e}")
-        else:
+            for eid in unresolved:
+                failed += 1
+                errors.append(
+                    f"No localization or media found for elemental_id={eid}"
+                )
+
+        logger.info(
+            "sync_edits_to_tator: bulk push samples=%s distinct_elemental_ids=%s "
+            "resolved_localizations=%s resolved_media=%s unresolved=%s",
+            len(pending),
+            len(updates),
+            len(loc_by_eid),
+            len(media_by_eid),
+            len(unresolved),
+        )
+
+        successful_eids: set[str] = set()
+        if loc_updates:
+            try:
+                _bulk_patch_localizations_by_elemental_id(
+                    api, project_id, version_id, loc_updates, loc_by_eid
+                )
+            except Exception as e:
+                failed += len(loc_updates)
+                errors.append(f"Localization batch update to Tator failed: {e}")
+                logger.error(
+                    "sync_edits_to_tator: localization PATCH failed for %s "
+                    "elemental_id(s): %s",
+                    len(loc_updates),
+                    sorted(loc_updates.keys()),
+                )
+            else:
+                successful_eids.update(loc_updates.keys())
+
+        if media_updates:
+            try:
+                _bulk_patch_media_by_elemental_id(
+                    api, project_id, media_updates, media_by_eid
+                )
+            except Exception as e:
+                failed += len(media_updates)
+                errors.append(f"Media batch update to Tator failed: {e}")
+                logger.error(
+                    "sync_edits_to_tator: media PATCH failed for %s elemental_id(s): %s",
+                    len(media_updates),
+                    sorted(media_updates.keys()),
+                )
+            else:
+                successful_eids.update(media_updates.keys())
+
+        if successful_eids:
             logger.info(
                 "sync_edits_to_tator: writing tator_modified_at to %s samples",
-                len(pending),
+                len(successful_eids),
             )
-            for sample, _eid_str, _attrs, last_modified_at in pending:
+            for sample, eid_str, _attrs, last_modified_at in pending:
+                if eid_str not in successful_eids:
+                    continue
                 try:
                     sample[TATOR_MODIFIED_AT_FIELD] = last_modified_at
                     sample.save()

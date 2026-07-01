@@ -1,6 +1,6 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: tests/test_classify_sync.py
-# Description: Tests for classification-project sync (padded whole-image crops, label from media attribute).
+# Description: Tests for combined classification+detection sync (whole-image resize + box crop, per elemental_id).
 
 import json
 from types import SimpleNamespace
@@ -62,7 +62,43 @@ def test_pad_to_square_preserves_aspect_and_centers():
     assert squared.getpixel((200, 200)) == (10, 20, 30)
 
 
-def test_classification_crop_pads_and_resizes_whole_image(tmp_path):
+class _FakeMedia(sync.tator.models.Media):
+    def __init__(self, mid, label, mtype=7, eid=None):
+        self.id = mid
+        self.elemental_id = eid or f"eid-{mid}"
+        self.type = mtype
+        self.version = 1
+        self.attributes = {"Label": label} if label is not None else {}
+        self.modified_datetime = None
+        self.created_datetime = None
+
+
+def test_fetch_and_save_classification_localizations_requires_label(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sync, "_get_image_media_type_and_attr_names", lambda _a, _p: (7, ["Label"])
+    )
+    out = tmp_path / "locs.jsonl"
+    # Seed a detection localization; classification samples must be appended, not overwrite.
+    out.write_text(json.dumps({"elemental_id": "det-1", "media": 1}) + "\n")
+
+    media = [
+        _FakeMedia(1, "Krill"),
+        _FakeMedia(2, ""),      # empty label -> skipped
+        _FakeMedia(3, None),    # no label -> skipped
+        _FakeMedia(4, "Salp", mtype=99),  # wrong media type -> skipped
+    ]
+    written = sync.fetch_and_save_classification_localizations(
+        object(), 1, media, out_path=str(out), mode="a", require_label=True
+    )
+    assert written == 1
+    lines = [json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+    assert len(lines) == 2  # detection + one classification
+    assert lines[0]["elemental_id"] == "det-1"
+    assert lines[1]["_classification"] is True
+    assert lines[1]["attributes"]["Label"] == "Krill"
+
+
+def test_combined_box_and_classification_crops(tmp_path):
     from PIL import Image
 
     download_dir = tmp_path / "downloads"
@@ -70,13 +106,20 @@ def test_classification_crop_pads_and_resizes_whole_image(tmp_path):
     crops_dir = tmp_path / "crops"
     crops_dir.mkdir()
 
-    # Non-square source so a plain resize (distort) differs from pad-then-resize.
+    # Non-square source so pad-then-resize differs from a distorting plain resize.
     src = download_dir / "5_image.jpg"
     Image.new("RGB", (400, 100), color=(10, 20, 30)).save(src)
 
-    localizations = tmp_path / "localizations.jsonl"
-    loc = {
-        "elemental_id": "eid-5",
+    box_loc = {
+        "elemental_id": "box-5",
+        "media": 5,
+        "x": 0.1,
+        "y": 0.1,
+        "width": 0.2,
+        "height": 0.2,
+    }
+    class_loc = {
+        "elemental_id": "cls-5",
         "media": 5,
         "x": 0.0,
         "y": 0.0,
@@ -84,58 +127,65 @@ def test_classification_crop_pads_and_resizes_whole_image(tmp_path):
         "height": 1.0,
         "_classification": True,
     }
-    localizations.write_text(json.dumps(loc) + "\n")
+    localizations = tmp_path / "localizations.jsonl"
+    localizations.write_text(
+        json.dumps(box_loc) + "\n" + json.dumps(class_loc) + "\n"
+    )
 
     num_ok, num_fail = sync.crop_localizations_parallel(
         str(download_dir),
         str(localizations),
         str(crops_dir),
         size=224,
-        locs_to_crop=[loc],
-        classification=True,
+        locs_to_crop=[box_loc, class_loc],
     )
-    assert (num_ok, num_fail) == (1, 0)
+    assert (num_ok, num_fail) == (2, 0)
 
-    out_file = crops_dir / "5_image" / "eid-5.png"
-    assert out_file.exists()
-    with Image.open(out_file) as crop:
+    box_file = crops_dir / "5_image" / "box-5.png"
+    cls_file = crops_dir / "5_image" / "cls-5.png"
+    assert box_file.exists()
+    assert cls_file.exists()
+
+    with Image.open(cls_file) as crop:
         crop = crop.convert("RGB")
         assert crop.size == (224, 224)
-        # Top band is padding (black); center band is the source color. A plain
-        # (non-padded) resize would make the whole image the source color.
+        # Whole-image sample is padded: top band is black, center is source color.
         r, g, b = crop.getpixel((112, 3))
         assert r < 30 and g < 30 and b < 30
         assert crop.getpixel((112, 112)) == (10, 20, 30)
 
 
-def test_run_crop_pipeline_routes_to_classification(monkeypatch, tmp_path):
+def test_run_crop_pipeline_appends_classification_for_labeled_project(
+    monkeypatch, tmp_path
+):
     localizations = tmp_path / "localizations.jsonl"
-    localizations.write_text("{}\n")
+    localizations.write_text(json.dumps({"elemental_id": "det-1", "media": 1}) + "\n")
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
     crops_dir = tmp_path / "crops"
     crops_dir.mkdir()
 
-    loc = {"elemental_id": "eid-1", "media": 1}
+    loc = {"elemental_id": "det-1", "media": 1}
     updated_manifest = {
-        "eid-1": {"modified_at": "t1", "media_id": 1, "media_stem": "1_img"},
+        "det-1": {"modified_at": "t1", "media_id": 1, "media_stem": "1_img"},
     }
 
+    monkeypatch.setattr(
+        sync,
+        "_resolve_localizations_jsonl",
+        lambda *_a, **_k: (str(localizations), [1], False),
+    )
     monkeypatch.setattr(sync, "is_classification_project", lambda _api, _pid: True)
 
-    classify_called = {}
+    appended = {}
 
-    def _fake_classify_resolve(*_args, **_kwargs):
-        classify_called["yes"] = True
-        return (str(localizations), [1], False)
-
-    def _fail_loc_resolve(*_args, **_kwargs):
-        raise AssertionError("non-classification resolver must not be called")
+    def _fake_append(*_a, **kwargs):
+        appended["path"] = kwargs.get("localizations_path")
+        return 3
 
     monkeypatch.setattr(
-        sync, "_resolve_classification_localizations_jsonl", _fake_classify_resolve
+        sync, "_append_classification_localizations_to_jsonl", _fake_append
     )
-    monkeypatch.setattr(sync, "_resolve_localizations_jsonl", _fail_loc_resolve)
     monkeypatch.setattr(sync, "_download_dir", lambda _pid: str(download_dir))
     monkeypatch.setattr(sync, "_crops_dir", lambda _pid, _vid, **_kw: str(crops_dir))
     monkeypatch.setattr(sync, "_load_crop_manifest", lambda *_a, **_k: {})
@@ -150,15 +200,7 @@ def test_run_crop_pipeline_routes_to_classification(monkeypatch, tmp_path):
     monkeypatch.setattr(sync, "_save_crop_manifest", lambda *_a, **_k: None)
     monkeypatch.setattr(sync, "_cleanup_download_dir", lambda *_a, **_k: None)
     monkeypatch.setattr(sync, "_cleanup_downloaded_videos", lambda *_a: None)
-
-    captured = {}
-
-    def _fake_crop(*_args, **kwargs):
-        captured["classification"] = kwargs.get("classification")
-        captured["locs_to_crop"] = kwargs.get("locs_to_crop")
-        return (1, 0)
-
-    monkeypatch.setattr(sync, "crop_localizations_parallel", _fake_crop)
+    monkeypatch.setattr(sync, "crop_localizations_parallel", lambda *_a, **_k: (1, 0))
 
     out = sync._run_crop_pipeline(
         object(),
@@ -174,6 +216,4 @@ def test_run_crop_pipeline_routes_to_classification(monkeypatch, tmp_path):
         s3_crops_prefix=None,
     )
     assert out["status"] == "ok"
-    assert classify_called.get("yes") is True
-    assert captured["classification"] is True
-    assert captured["locs_to_crop"] == [loc]
+    assert appended.get("path") == str(localizations)
