@@ -802,7 +802,7 @@ async def sync_to_tator(
     port: int = Query(..., description="Port for this project"),
     dataset_name: str | None = Query(
         None,
-        description="FiftyOne dataset name (default: project_name_v{version_id}_{port})",
+        description="FiftyOne dataset name (default: project_name_v{version_id}[_s{section_id}]_{port})",
     ),
     label_attr: str = Query("Label", description="Tator attribute name for label"),
     score_attr: str | None = Query(
@@ -898,9 +898,12 @@ async def dataset_exists(
     version_id: int = Query(..., description="Tator version ID"),
     api_url: str = Query(..., description="Tator REST API base URL"),
     port: int = Query(..., description="Port for this project"),
+    section_id: int | None = Query(
+        None, description="Optional Tator media section ID (matches section-scoped datasets)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
-    """Check whether a FiftyOne dataset exists for a specific version/port."""
+    """Check whether a FiftyOne dataset exists for a specific version/port/section."""
     token = _token_from_authorization(authorization)
     if not token:
         raise HTTPException(
@@ -936,6 +939,7 @@ async def dataset_exists(
             token=token,
             project_name=project_name,
             database_name=database_name_from_uri(database_entry.uri),
+            section_id=section_id,
         )
     except Exception as e:
         logger.warning(f"dataset_exists check failed: {e}")
@@ -1000,10 +1004,13 @@ async def delete_dataset(
     version_id: int = Query(..., description="Tator version ID"),
     api_url: str = Query(..., description="Tator REST API base URL"),
     port: int = Query(..., description="Port for this project"),
+    section_id: int | None = Query(
+        None, description="Optional Tator media section ID (matches section-scoped datasets)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """
-    Delete the FiftyOne dataset for a specific version/port. Requires authentication.
+    Delete the FiftyOne dataset for a specific version/port/section. Requires authentication.
     Returns {"status": "ok", "deleted": str | None, "database_name": str}.
     """
     token = _token_from_authorization(authorization)
@@ -1044,6 +1051,7 @@ async def delete_dataset(
             token=token,
             project_name=project_name,
             database_name=database_name_from_uri(database_entry.uri),
+            section_id=section_id,
         )
         return result
     except Exception as e:

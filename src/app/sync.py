@@ -3084,8 +3084,21 @@ def _sanitize_dataset_name(name: str) -> str:
     return re.sub(r"_+", "_", s).strip("_") or "default"
 
 
-def _default_dataset_name(api: Any, project_id: int, version_id: int | None) -> str:
-    """FiftyOne dataset name (base): project_name + '_v' + version_id. Port is appended by _dataset_name_with_port."""
+def _section_slug(section_id: int | None) -> str:
+    """Section component for dataset names (e.g. s42). Empty when no section filter."""
+    return _filter_slug(section_id=section_id, query=None)
+
+
+def _default_dataset_name(
+    api: Any,
+    project_id: int,
+    version_id: int | None,
+    section_id: int | None = None,
+) -> str:
+    """FiftyOne dataset name (base): project_name + '_v' + version_id [+ '_s' + section_id].
+
+    Port is appended by _dataset_name_with_port.
+    """
     try:
         project = api.get_project(project_id)
         project_name = (
@@ -3099,7 +3112,43 @@ def _default_dataset_name(api: Any, project_id: int, version_id: int | None) -> 
         version_part = f"v{version_id}"
     else:
         version_part = "default"
-    return f"{project_name}_{version_part}"
+    base = f"{project_name}_{version_part}"
+    section_part = _section_slug(section_id)
+    if section_part:
+        return f"{base}_{section_part}"
+    return base
+
+
+def _find_dataset_match(
+    available: list[str],
+    *,
+    ds_name: str,
+    ds_name_with_port: str,
+    project_prefix: str,
+    version_id: int,
+    port: int,
+    section_id: int | None = None,
+) -> str | None:
+    """Resolve a dataset name from exact matches, then project/version/port (and section) fallback."""
+    port_suffix = f"_{port}"
+    version_part = f"_v{version_id}"
+    section_part = f"_{_section_slug(section_id)}" if section_id is not None else None
+
+    if ds_name_with_port in available:
+        return ds_name_with_port
+    if ds_name in available:
+        return ds_name
+    for d in available:
+        if not (
+            d.startswith(project_prefix)
+            and version_part in d
+            and d.endswith(port_suffix)
+        ):
+            continue
+        if section_part is not None and section_part not in d:
+            continue
+        return d
+    return None
 
 
 def _dataset_name_with_port(dataset_name: str, port: int) -> str:
@@ -4327,7 +4376,9 @@ def sync_project_to_fiftyone(
             config["s3_bucket"] = s3_bucket
             config["s3_prefix"] = s3_crops_prefix or ""
 
-        dataset_name = _default_dataset_name(api, project_id, version_id)
+        dataset_name = _default_dataset_name(
+            api, project_id, version_id, section_id=section_id
+        )
         dataset_name = _dataset_name_with_port(dataset_name, port)
 
         # Set env so FiftyOne app subprocess uses the same database (only when not production)
@@ -4644,8 +4695,9 @@ def check_dataset_exists_for_version(
     project_name: str | None = None,
     database_uri: str | None = None,
     database_name: str | None = None,
+    section_id: int | None = None,
 ) -> dict[str, Any]:
-    """Check whether a FiftyOne dataset exists for the given version/port.
+    """Check whether a FiftyOne dataset exists for the given version/port/section.
 
     Returns {"exists": bool, "dataset_name": str | None, "database_name": str}.
     """
@@ -4672,27 +4724,23 @@ def check_dataset_exists_for_version(
 
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
-    ds_name = _default_dataset_name(api, project_id, version_id)
+    ds_name = _default_dataset_name(
+        api, project_id, version_id, section_id=section_id
+    )
     ds_name_with_port = _dataset_name_with_port(ds_name, port)
     project_prefix = (
         _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
     )
-    port_suffix = f"_{port}"
-    version_part = f"_v{version_id}"
 
-    available = fo.list_datasets()
-
-    def _find_match() -> str | None:
-        if ds_name_with_port in available:
-            return ds_name_with_port
-        if ds_name in available:
-            return ds_name
-        for d in available:
-            if d.startswith(project_prefix) and version_part in d and d.endswith(port_suffix):
-                return d
-        return None
-
-    target = _find_match()
+    target = _find_dataset_match(
+        fo.list_datasets(),
+        ds_name=ds_name,
+        ds_name_with_port=ds_name_with_port,
+        project_prefix=project_prefix,
+        version_id=version_id,
+        port=port,
+        section_id=section_id,
+    )
     return {
         "exists": target is not None,
         "dataset_name": target,
@@ -4849,8 +4897,9 @@ def delete_dataset_for_version(
     project_name: str | None = None,
     database_uri: str | None = None,
     database_name: str | None = None,
+    section_id: int | None = None,
 ) -> dict[str, Any]:
-    """Delete the FiftyOne dataset (MongoDB) and JSONL cache for a specific version/port.
+    """Delete the FiftyOne dataset (MongoDB) and JSONL cache for a specific version/port/section.
 
     Only removes the MongoDB dataset and the localizations JSONL file.
     Crop images and downloaded media are intentionally preserved.
@@ -4879,26 +4928,22 @@ def delete_dataset_for_version(
 
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
-    ds_name = _default_dataset_name(api, project_id, version_id)
+    ds_name = _default_dataset_name(
+        api, project_id, version_id, section_id=section_id
+    )
     ds_name_with_port = _dataset_name_with_port(ds_name, port)
 
     project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
-    port_suffix = f"_{port}"
-    version_part = f"_v{version_id}"
 
-    available = fo.list_datasets()
-
-    def _find_match() -> str | None:
-        if ds_name_with_port in available:
-            return ds_name_with_port
-        if ds_name in available:
-            return ds_name
-        for d in available:
-            if d.startswith(project_prefix) and version_part in d and d.endswith(port_suffix):
-                return d
-        return None
-
-    target = _find_match()
+    target = _find_dataset_match(
+        fo.list_datasets(),
+        ds_name=ds_name,
+        ds_name_with_port=ds_name_with_port,
+        project_prefix=project_prefix,
+        version_id=version_id,
+        port=port,
+        section_id=section_id,
+    )
     if target is None:
         return {
             "status": "ok",
