@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-07-08)
+
+### Features
+
+- **app**: Include section_id in Voxel51 dataset names (#22)
+  ([#22](https://github.com/mbari-org/fiftyone-sync/pull/22),
+  [`70bb9d9`](https://github.com/mbari-org/fiftyone-sync/commit/70bb9d99aaf75dc88eff5b52870331849d1283ef))
+
+
 ## v0.7.0 (2026-07-01)
 
 ### Features
