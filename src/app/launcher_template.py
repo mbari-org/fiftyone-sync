@@ -108,7 +108,6 @@ LAUNCHER_TEMPLATE = r"""
               <label class="force-sync-option" title="Re-fetch media and localizations from Tator instead of using cached data when available.">
                 <input type="checkbox" id="force-sync-checkbox" name="force_sync" value="1"> Force sync
               </label>
-              <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
             </div>
@@ -145,6 +144,7 @@ LAUNCHER_TEMPLATE = r"""
               <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator.">
                 <option value="">Enter token and click Test</option>
               </select>
+              <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
               <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone. Not this only deletes the dataset from Voxel51, not Tator."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Voxel51 Dataset</button>
             </div>
           </td>
@@ -309,7 +309,10 @@ LAUNCHER_TEMPLATE = r"""
         var token = getToken();
         var v = versionId;
         if (!syncServiceUrl || !apiUrl || !token || !v) return;
-        fetch(syncServiceUrl + '/dataset-exists?project_id=' + project + '&version_id=' + encodeURIComponent(v) + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port, {
+        var existsUrl = syncServiceUrl + '/dataset-exists?project_id=' + project + '&version_id=' + encodeURIComponent(v) + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port;
+        var s = sectionSelect ? sectionSelect.value : '';
+        if (s) existsUrl += '&section_id=' + encodeURIComponent(s);
+        fetch(existsUrl, {
           headers: { 'Authorization': 'Token ' + token }
         })
           .then(function(r) { return r.ok ? r.json() : null; })
@@ -457,6 +460,9 @@ LAUNCHER_TEMPLATE = r"""
       if (voxelDatasetSelect) voxelDatasetSelect.addEventListener('change', setSyncDatasetFromDropdown);
       if (vssProjectSelect) vssProjectSelect.addEventListener('change', setVssProjectFromDropdown);
       if (versionSelect) versionSelect.addEventListener('change', setVersionFromDropdown);
+      if (sectionSelect) sectionSelect.addEventListener('change', function() {
+        if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
+      });
       function updateDatabaseInfo(token) {
         if (!syncServiceUrl || !token) return;
         var databaseInfoUrl = syncServiceUrl + '/database-info?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port;
@@ -852,6 +858,8 @@ LAUNCHER_TEMPLATE = r"""
             api_url: apiUrl,
             port: String(port)
           });
+          var sec = sectionSelect ? sectionSelect.value : '';
+          if (sec) params.set('section_id', sec);
           fetch(syncServiceUrl + '/delete-dataset?' + params.toString(), {
             method: 'POST',
             headers: { 'Authorization': 'Token ' + token }
