@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-07-14)
+
+### Features
+
+- Add box type selector for dataset sync (#24)
+  ([#24](https://github.com/mbari-org/fiftyone-sync/pull/24),
+  [`e5f72a0`](https://github.com/mbari-org/fiftyone-sync/commit/e5f72a0c74e9e617f38633ef06e787ecdd9223f1))
+
+
 ## v0.8.0 (2026-07-08)
 
 ### Features
