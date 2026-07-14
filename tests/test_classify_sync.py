@@ -155,6 +155,62 @@ def test_combined_box_and_classification_crops(tmp_path):
         assert crop.getpixel((112, 112)) == (10, 20, 30)
 
 
+def test_apply_media_attrs_merges_and_skips_reserved():
+    import fiftyone as fo
+
+    sample = fo.Sample(filepath="/tmp/nonexistent.png")
+    media_map = {5: {"depth": 12.5, "camera": "cam-A", "ground_truth": "SHOULD_SKIP"}}
+    sync._apply_media_attrs_to_sample(sample, {"media": 5}, media_map)
+    assert sample["depth"] == 12.5
+    assert sample["camera"] == "cam-A"
+    # Reserved sync-owned field must not be clobbered by a media attribute.
+    assert not sample.has_field("ground_truth") or sample["ground_truth"] != "SHOULD_SKIP"
+
+
+def test_apply_loc_to_sample_localization_attr_wins_over_media():
+    import fiftyone as fo
+
+    sample = fo.Sample(filepath="/tmp/nonexistent.png")
+    loc = {
+        "media": 5,
+        "elemental_id": "box-1",
+        "attributes": {"Label": "Krill", "depth": 3.0},
+    }
+    # Media also carries depth; the localization value must win.
+    media_map = {5: {"depth": 99.0, "survey": "dive-42"}}
+    sync._apply_loc_to_sample(sample, loc, media_attributes_map=media_map)
+    assert sample["survey"] == "dive-42"
+    assert sample["depth"] == 3.0
+    assert sample["ground_truth"].label == "Krill"
+
+
+def test_build_media_attributes_map_covers_all_media_types(monkeypatch, tmp_path):
+    localizations = tmp_path / "localizations.jsonl"
+    localizations.write_text(
+        json.dumps({"elemental_id": "box-1", "media": 1}) + "\n"
+        + json.dumps({"elemental_id": "box-2", "media": 2}) + "\n"
+    )
+
+    video_type = SimpleNamespace(
+        name="Video", attribute_types=[SimpleNamespace(name="depth")]
+    )
+    image_type = SimpleNamespace(
+        name="Image", attribute_types=[SimpleNamespace(name="Label")]
+    )
+
+    api = SimpleNamespace(get_media_type_list=lambda _pid: [video_type, image_type])
+    monkeypatch.setattr(
+        sync,
+        "get_media_chunked",
+        lambda *_a, **_k: [
+            SimpleNamespace(id=1, type=10, attributes={"depth": 5.0}),
+            SimpleNamespace(id=2, type=7, attributes={"Label": "Salp"}),
+        ],
+    )
+    result = sync._build_media_attributes_map(api, 1, str(localizations))
+    assert result == {1: {"depth": 5.0}, 2: {"Label": "Salp"}}
+
+
 def test_run_crop_pipeline_appends_classification_for_labeled_project(
     monkeypatch, tmp_path
 ):
