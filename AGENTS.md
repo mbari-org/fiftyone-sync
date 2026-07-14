@@ -44,6 +44,8 @@ Use **Angular-style** commit messages so `python-semantic-release` can version c
  
 Do **not** use ad-hoc prefixes (`Update`, `WIP`, version-only messages) for changes that should ship.
 
+Always update the README.md or docs when adding new features or changing existing behavior.
+
 ---
 
 ## Pull requests
