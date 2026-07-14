@@ -64,11 +64,13 @@ def enqueue_sync(
     s3_prefix: str | None = None,
     section_id: int | None = None,
     query: str | None = None,
+    localization_type_id: int | None = None,
 ) -> str:
     """
     Enqueue a sync job. Returns RQ job id. Requires Redis.
     project_name is used by the worker to resolve get_database_uri(project_id, port).
     vss_project_key is used to select a specific VSS project configuration for embeddings.
+    localization_type_id restricts the sync to a single Tator box (localization) type.
     """
     from rq import Queue
 
@@ -90,6 +92,7 @@ def enqueue_sync(
         s3_prefix=s3_prefix,
         section_id=section_id,
         query=query,
+        localization_type_id=localization_type_id,
         job_timeout=3600 * 24,  # 24h for large projects
         result_ttl=3600 * 24,
         failure_ttl=3600,

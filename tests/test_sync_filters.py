@@ -30,9 +30,22 @@ def test_filter_slug_section_and_query():
     assert slug.startswith("s7_q")
 
 
+def test_filter_slug_localization_type_only():
+    assert filter_slug(localization_type_id=15) == "t15"
+
+
+def test_filter_slug_section_and_localization_type():
+    assert filter_slug(section_id=7, localization_type_id=15) == "s7_t15"
+
+
 def test_localization_fetch_kwargs_version_section_query():
     kw = localization_fetch_kwargs(version_id=3, section_id=9, query="b64query")
     assert kw == {"version": [3], "section": 9, "encoded_search": "b64query"}
+
+
+def test_localization_fetch_kwargs_localization_type():
+    kw = localization_fetch_kwargs(version_id=3, localization_type_id=15)
+    assert kw == {"version": [3], "type": [15]}
 
 
 def test_localization_fetch_kwargs_strips_query():

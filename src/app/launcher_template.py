@@ -101,6 +101,16 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
+          <th>Box type</th>
+          <td>
+            <div class="cell-controls">
+              <select id="box-type-select" aria-label="box-type" disabled title="Optional Tator box (localization) type filter. Only localizations of the selected box type are loaded into the dataset.">
+                <option value="">All box types</option>
+              </select>
+            </div>
+          </td>
+        </tr>
+        <tr>
           <th>Sync</th>
           <td>
             <div class="cell-controls">
@@ -179,6 +189,7 @@ LAUNCHER_TEMPLATE = r"""
       var fiftyoneAppLink = document.getElementById('fiftyone-app-link');
       var versionSelect = document.getElementById('version-select');
       var sectionSelect = document.getElementById('section-select');
+      var boxTypeSelect = document.getElementById('box-type-select');
       var voxelDatasetSelect = document.getElementById('voxel-dataset-select');
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
@@ -302,6 +313,7 @@ LAUNCHER_TEMPLATE = r"""
         tokenVerified = enabled;
         if (versionSelect) versionSelect.disabled = !enabled;
         if (sectionSelect) sectionSelect.disabled = !enabled;
+        if (boxTypeSelect) boxTypeSelect.disabled = !enabled;
         if (vssProjectSelect) vssProjectSelect.disabled = !enabled;
         updateSyncButtonsState();
       }
@@ -395,6 +407,37 @@ LAUNCHER_TEMPLATE = r"""
             if (initialSectionId) sectionSelect.value = initialSectionId;
           });
       }
+      function loadBoxTypes(token) {
+        if (!boxTypeSelect || !syncServiceUrl || !apiUrl || !token) return;
+        boxTypeSelect.innerHTML = '<option value="">Loading…</option>';
+        fetch(syncServiceUrl + '/localization-types?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl), {
+          headers: { 'Authorization': 'Token ' + token }
+        })
+          .then(function(r) {
+            if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || r.statusText); });
+            return r.json();
+          })
+          .then(function(boxTypes) {
+            boxTypeSelect.innerHTML = '';
+            var allOpt = document.createElement('option');
+            allOpt.value = '';
+            allOpt.textContent = 'All box types';
+            boxTypeSelect.appendChild(allOpt);
+            (boxTypes || []).forEach(function(t) {
+              var opt = document.createElement('option');
+              opt.value = String(t.id);
+              opt.textContent = t.name + (t.id != null ? ' (' + t.id + ')' : '');
+              boxTypeSelect.appendChild(opt);
+            });
+          })
+          .catch(function() {
+            boxTypeSelect.innerHTML = '';
+            var opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'All box types';
+            boxTypeSelect.appendChild(opt);
+          });
+      }
       function loadVersions(token) {
         if (!versionSelect || !syncServiceUrl || !apiUrl || !token) return;
         versionSelect.innerHTML = '<option value="">Loading…</option>';
@@ -448,6 +491,13 @@ LAUNCHER_TEMPLATE = r"""
             secOpt.value = '';
             secOpt.textContent = 'Enter token and click Test';
             sectionSelect.appendChild(secOpt);
+          }
+          if (boxTypeSelect) {
+            boxTypeSelect.innerHTML = '';
+            var btOpt = document.createElement('option');
+            btOpt.value = '';
+            btOpt.textContent = 'Enter token and click Test';
+            boxTypeSelect.appendChild(btOpt);
           }
           if (vssProjectSelect && vssProjectRow) {
             vssProjectSelect.innerHTML = '<option value="">Enter token and click Test</option>';
@@ -529,6 +579,7 @@ LAUNCHER_TEMPLATE = r"""
               setSyncControlsEnabled(true);
               loadVersions(token);
               loadSections(token);
+              loadBoxTypes(token);
               loadVssProjects(token);
               syncStatus.textContent = 'Token OK. Resolving port/database…';
               updateDatabaseInfo(token);
@@ -646,6 +697,8 @@ LAUNCHER_TEMPLATE = r"""
           if (v) params.set('version_id', v);
           var s = sectionSelect ? sectionSelect.value : '';
           if (s) params.set('section_id', s);
+          var bt = boxTypeSelect ? boxTypeSelect.value : '';
+          if (bt) params.set('localization_type_id', bt);
           if (syncQuery) params.set('query', syncQuery);
           if (vssProjectKey) params.set('vss_project_key', vssProjectKey);
           var forceSyncEl = document.getElementById('force-sync-checkbox');
