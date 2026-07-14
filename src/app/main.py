@@ -441,6 +441,37 @@ async def get_sections(
     return [{"id": s.id, "name": s.name} for s in section_list]
 
 
+@app_launch.get("/localization-types")
+async def get_localization_types(
+    project_id: int = Query(..., description="Tator project ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> list[dict]:
+    """
+    Return the list of Tator box (localization) types for the given project. Used by the
+    launcher template to populate the box-type dropdown. Only box-shaped localization types
+    (dtype == "box") are returned. Token via Authorization header.
+    """
+    import tator
+
+    token = _token_from_authorization(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid Authorization header"
+        )
+    host = _resolve_api_url(api_url)
+    try:
+        api = tator.get_api(host, token)
+        type_list = api.get_localization_type_list(project_id)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    return [
+        {"id": t.id, "name": t.name, "dtype": getattr(t, "dtype", None)}
+        for t in type_list
+        if getattr(t, "dtype", None) == "box"
+    ]
+
+
 @app_launch.get("/vss-projects")
 async def get_vss_projects(
     project_id: int = Query(..., description="Tator project ID"),
@@ -494,6 +525,10 @@ async def sync(
     query: str | None = Query(
         None,
         description="Optional Tator encoded_search filter (base64 Object_Search); ANDed with section when both set",
+    ),
+    localization_type_id: int | None = Query(
+        None,
+        description="Optional Tator localization (box) type ID; restricts sync to a single box type",
     ),
     api_url: str = Query(
         ..., description="Tator REST API base URL (e.g. https://tator.example.com)"
@@ -577,6 +612,7 @@ async def sync(
             s3_prefix=s3_prefix,
             section_id=section_id,
             query=query,
+            localization_type_id=localization_type_id,
         )
         return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:
