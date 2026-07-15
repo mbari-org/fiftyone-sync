@@ -1680,6 +1680,79 @@ def crop_localizations_parallel(
     return (num_ok, num_fail)
 
 
+def _download_and_crop_media_sequentially(
+    api: Any,
+    project_id: int,
+    needed_ids: list[int],
+    media_by_id: dict[int, Any],
+    locs_by_media: dict[int, list[dict]],
+    localizations_path: str,
+    crops_dir: str,
+    size: int = 224,
+) -> tuple[str, list[Any], int, int]:
+    """
+    Download and crop one media at a time: download media N -> crop only media N's
+    localizations -> delete media N's video file (if any) -> move to media N+1.
+
+    Downloading every needed media before cropping any of them means the whole
+    download phase (which can take minutes per video) has to finish before
+    cropping starts on even the first one, and every downloaded video sits on
+    local disk simultaneously (large videos can be several GB each). Interleaving
+    keeps at most one media file on local disk at a time and lets cropping start
+    as soon as the first media finishes downloading instead of waiting on the
+    whole batch.
+
+    Returns (download_dir, processed_media_objects, num_cropped, num_failed).
+    """
+    dl_dir = _download_dir(project_id)
+    processed_media: list[Any] = []
+    num_ok = 0
+    num_fail = 0
+    total = len(needed_ids)
+    for idx, mid in enumerate(needed_ids, 1):
+        media_obj = media_by_id.get(mid)
+        locs_for_media = locs_by_media.get(mid) or []
+        if not locs_for_media:
+            continue
+        if media_obj is not None:
+            logger.info(
+                "Downloading media %s/%s (id=%s, name=%s)...",
+                idx, total, mid, getattr(media_obj, "name", ""),
+            )
+            dl_dir = save_media_to_tmp(
+                api, project_id, [media_obj], media_ids_filter={mid}
+            )
+        else:
+            # No Media metadata resolved for this id (e.g. lookup failed) -- still
+            # attempt the crop in case the file is already present in the
+            # download dir from an earlier run, matching the previous
+            # always-attempt-crop behavior instead of silently dropping it.
+            logger.info(
+                "No Media object resolved for id=%s (%s/%s); attempting crop from "
+                "existing download dir",
+                mid, idx, total,
+            )
+        ok, fail = crop_localizations_parallel(
+            dl_dir,
+            localizations_path,
+            crops_dir,
+            size=size,
+            locs_to_crop=locs_for_media,
+            media_objects=[media_obj] if media_obj is not None else [],
+        )
+        num_ok += ok
+        num_fail += fail
+        if media_obj is not None:
+            processed_media.append(media_obj)
+            # Delete the video immediately so at most one large video occupies
+            # local disk at a time; images are left in place (existing behavior)
+            # until the final download-dir cleanup, since they're small and some
+            # sample types reference the downloaded image directly.
+            if _is_video_name(getattr(media_obj, "name", "") or ""):
+                _cleanup_downloaded_videos(dl_dir)
+    return dl_dir, processed_media, num_ok, num_fail
+
+
 def _load_config(path: str) -> dict[str, Any]:
     """Load configuration from YAML or JSON file."""
     ext = os.path.splitext(path)[1].lower()
@@ -2370,34 +2443,46 @@ def _run_crop_pipeline(
                 len(needed_ids),
                 len(media_ids_list),
             )
-            all_media = get_media_chunked(
+            media_for_crop = get_media_chunked(
                 api, project_id, needed_ids, media_id_batch_size=media_id_batch_size
             )
-            if not all_media:
+            if not media_for_crop:
                 logger.info(
                     "No Media objects returned for %s ids; skipping download",
                     len(needed_ids),
                 )
-            else:
+            if locs_to_crop and localizations_path:
+                media_by_id = {
+                    m.id: m
+                    for m in media_for_crop
+                    if isinstance(m, tator.models.Media)
+                }
+                locs_by_media: dict[int, list[dict]] = defaultdict(list)
+                for loc in locs_to_crop:
+                    loc_media_id = loc.get("media")
+                    if loc_media_id is not None:
+                        locs_by_media[int(loc_media_id)].append(loc)
                 logger.info(
-                    "Saving %s media files to tmp (images + videos)...", len(all_media)
+                    "Downloading and cropping %s media one at a time "
+                    "(images + videos)...",
+                    len(needed_ids),
                 )
-                dl_dir = save_media_to_tmp(
-                    api, project_id, all_media, media_ids_filter=media_ids_needed
+                (
+                    dl_dir,
+                    all_media,
+                    num_cropped,
+                    num_failed,
+                ) = _download_and_crop_media_sequentially(
+                    api,
+                    project_id,
+                    needed_ids,
+                    media_by_id,
+                    locs_by_media,
+                    localizations_path,
+                    crops,
                 )
-
-        if locs_to_crop and localizations_path:
-            num_cropped, num_failed = crop_localizations_parallel(
-                dl_dir,
-                localizations_path,
-                crops,
-                size=224,
-                locs_to_crop=locs_to_crop,
-                media_objects=all_media,
-            )
-            _cleanup_downloaded_videos(dl_dir)
-        elif not locs_to_crop:
-            logger.info("No crop cache misses; skipping crop step")
+            else:
+                logger.info("No crop cache misses; skipping crop step")
 
         _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
         _save_crop_manifest(
