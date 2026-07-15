@@ -4598,7 +4598,6 @@ def sync_project_to_fiftyone(
             query=query,
             localization_type_id=localization_type_id,
         )
-        use_cached_jsonl = False
         try:
             host = api_url.rstrip("/")
             api = tator.get_api(host, token)
