@@ -1680,6 +1680,33 @@ def crop_localizations_parallel(
     return (num_ok, num_fail)
 
 
+def _media_locs_already_cropped(
+    media_obj: Any, locs_for_media: list[dict], crops_dir: str
+) -> bool:
+    """
+    True when every localization for this media already has a non-empty crop
+    file on disk under the stem this media would actually be cropped to
+    (media_id + Media.name, matching crop_localizations_parallel's convention).
+
+    Checked entirely from existing crop files -- no download needed -- so a
+    media whose crops are all already on disk can skip the download step
+    instead of paying for the download and only then discovering during
+    cropping that nothing needed doing.
+    """
+    if not locs_for_media:
+        return True
+    name = getattr(media_obj, "name", "") or ""
+    mid = getattr(media_obj, "id", "")
+    stem_dir = Path(crops_dir) / f"{mid}_{name}"
+    for loc in locs_for_media:
+        elemental_id = loc.get("elemental_id") or loc.get("id")
+        if elemental_id is None:
+            return False
+        if not _crop_output_exists(stem_dir / f"{elemental_id}.png"):
+            return False
+    return True
+
+
 def _download_and_crop_media_sequentially(
     api: Any,
     project_id: int,
@@ -1713,6 +1740,19 @@ def _download_and_crop_media_sequentially(
         media_obj = media_by_id.get(mid)
         locs_for_media = locs_by_media.get(mid) or []
         if not locs_for_media:
+            continue
+        if media_obj is not None and _media_locs_already_cropped(
+            media_obj, locs_for_media, crops_dir
+        ):
+            # Check on-disk crops before downloading: avoids downloading a
+            # (potentially large) video only to discover during cropping that
+            # every localization on it was already cropped.
+            logger.info(
+                "Skipping download for media %s/%s (id=%s, name=%s): all %s "
+                "crop(s) already on disk",
+                idx, total, mid, getattr(media_obj, "name", ""), len(locs_for_media),
+            )
+            processed_media.append(media_obj)
             continue
         if media_obj is not None:
             logger.info(
@@ -2054,10 +2094,17 @@ def _find_crop_cache_misses(
             mid = int(media_id)
             modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
 
+            # crops_stem_map reflects the actual on-disk crop directory name and
+            # takes priority over the manifest's recorded stem: a stale manifest
+            # entry (e.g. written back when media_stem defaulted to a bare
+            # media_id, or the media was renamed in Tator since) would otherwise
+            # shadow the real crop folder for every localization on this media,
+            # making crop_file.exists() check the wrong path and falsely report
+            # every one of them as a miss even though they're already cropped.
             media_stem = (
-                manifest_stem_map.get(mid)
+                crops_stem_map.get(mid)
+                or manifest_stem_map.get(mid)
                 or download_stem_map.get(mid)
-                or crops_stem_map.get(mid)
                 or f"{mid}"
             )
 
@@ -2572,14 +2619,15 @@ def _media_id_to_stem(download_dir: str) -> dict[int, str]:
     out: dict[int, str] = {}
     if not download_dir or not os.path.exists(download_dir):
         return out
+    image_and_video_exts = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".bmp",
+    } | set(VIDEO_EXTENSIONS)
     for f in Path(download_dir).iterdir():
-        if f.is_file() and f.suffix.lower() in (
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp",
-            ".bmp",
-        ):
+        if f.is_file() and f.suffix.lower() in image_and_video_exts:
             stem = f.stem
             if "_" in stem:
                 try:
