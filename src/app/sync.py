@@ -52,10 +52,16 @@ from src.app.sync_lock import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+_log_level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+_APP_LOG_LEVEL = (
+    getattr(logging, _log_level_name)
+    if _log_level_name in ("DEBUG", "INFO", "WARNING", "ERROR")
+    else logging.INFO
+)
+logger.setLevel(_APP_LOG_LEVEL)
 # logger.info to console
 handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
+handler.setLevel(_APP_LOG_LEVEL)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -1922,9 +1928,14 @@ def _find_crop_cache_misses(
     """
     Diff current localizations against the crop manifest and on-disk crop files.
     A localization is a "miss" (needs cropping) when:
-      - its elemental_id is absent from the manifest, OR
-      - its Tator modified_datetime differs from the manifest entry, OR
-      - the crop file does not exist on disk.
+      - the crop file does not exist on disk, OR
+      - the manifest has a prior record for it AND that record's modified_datetime
+        differs from the current one (the localization changed since it was cropped).
+
+    A crop file already on disk counts as a hit even without a manifest record
+    (e.g. the manifest was reset/lost, or these crops predate the manifest) --
+    otherwise a missing/stale manifest alone would mark every localization a
+    "miss" and re-download/re-crop videos that are already fully cropped on disk.
 
     Returns:
         media_ids_needed: set of media IDs that must be downloaded (have >= 1 miss)
@@ -1932,6 +1943,11 @@ def _find_crop_cache_misses(
         updated_manifest:  new manifest reflecting current localizations (to be saved after cropping)
     """
     download_stem_map = _media_id_to_stem(download_dir) if download_dir else {}
+    # The download dir is emptied after each sync (crops don't need the source file
+    # anymore), so on a later run with a missing/stale manifest, download_stem_map is
+    # empty too. Fall back to the crop subdirectory names themselves so the on-disk
+    # crop check below still resolves to the real stem instead of a bare media_id.
+    crops_stem_map = _media_id_to_stem_from_crops(crops_dir)
 
     manifest_stem_map: dict[int, str] = {}
     for entry in manifest.values():
@@ -1966,7 +1982,10 @@ def _find_crop_cache_misses(
             modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
 
             media_stem = (
-                manifest_stem_map.get(mid) or download_stem_map.get(mid) or f"{mid}"
+                manifest_stem_map.get(mid)
+                or download_stem_map.get(mid)
+                or crops_stem_map.get(mid)
+                or f"{mid}"
             )
 
             updated_manifest[eid] = {
@@ -1978,10 +1997,16 @@ def _find_crop_cache_misses(
             old_entry = manifest.get(eid)
             crop_file = crops_path / media_stem / f"{eid}.png"
 
-            is_miss = (
-                old_entry is None
-                or old_entry.get("modified_at") != modified_at
-                or not crop_file.exists()
+            # A crop file already on disk is direct proof that localization was
+            # already cropped, even when the manifest has no record of it (e.g. the
+            # manifest was reset/lost, or these crops predate the manifest). Only
+            # force a re-crop when we have a prior record AND it disagrees with the
+            # current modified_at (the localization changed since it was cropped).
+            # Without this, a missing/stale manifest alone would mark every
+            # localization a "miss" and re-download/re-crop videos that are already
+            # fully cropped on disk.
+            is_miss = not crop_file.exists() or (
+                old_entry is not None and old_entry.get("modified_at") != modified_at
             )
             if is_miss:
                 media_ids_needed.add(mid)
@@ -4018,7 +4043,7 @@ def run_sync_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4174,7 +4199,7 @@ def run_recompute_crops_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4243,7 +4268,7 @@ def run_sync_to_tator_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4306,7 +4331,7 @@ def run_dimreduce_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass

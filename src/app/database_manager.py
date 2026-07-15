@@ -21,10 +21,16 @@ from src.app.database_uri_config import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+_log_level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+_APP_LOG_LEVEL = (
+    getattr(logging, _log_level_name)
+    if _log_level_name in ("DEBUG", "INFO", "WARNING", "ERROR")
+    else logging.INFO
+)
+logger.setLevel(_APP_LOG_LEVEL)
 # Print to console
 handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
+handler.setLevel(_APP_LOG_LEVEL)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
