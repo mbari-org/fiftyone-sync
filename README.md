@@ -333,6 +333,11 @@ If the embed service is unavailable or UMAP is not installed, sync still runs; e
 - Localizations: `/tmp/fiftyone_sync_project_{id}/localizations.jsonl` (JSONL)
 - Crops: `/tmp/fiftyone_sync_project_{id}/crops/{media_stem}/{elemental_id}.png`
 
+Media are downloaded and cropped one at a time so large source videos do not
+accumulate on local disk. Existing non-empty crop files are reused even when the
+crop manifest is missing or stale; localizations are recropped when their recorded
+modification time changes.
+
 Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 
 ### Sync edits back to Tator
