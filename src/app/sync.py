@@ -52,10 +52,16 @@ from src.app.sync_lock import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+_log_level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+_APP_LOG_LEVEL = (
+    getattr(logging, _log_level_name)
+    if _log_level_name in ("DEBUG", "INFO", "WARNING", "ERROR")
+    else logging.INFO
+)
+logger.setLevel(_APP_LOG_LEVEL)
 # logger.info to console
 handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
+handler.setLevel(_APP_LOG_LEVEL)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -1674,6 +1680,119 @@ def crop_localizations_parallel(
     return (num_ok, num_fail)
 
 
+def _media_locs_already_cropped(
+    media_obj: Any, locs_for_media: list[dict], crops_dir: str
+) -> bool:
+    """
+    True when every localization for this media already has a non-empty crop
+    file on disk under the stem this media would actually be cropped to
+    (media_id + Media.name, matching crop_localizations_parallel's convention).
+
+    Checked entirely from existing crop files -- no download needed -- so a
+    media whose crops are all already on disk can skip the download step
+    instead of paying for the download and only then discovering during
+    cropping that nothing needed doing.
+    """
+    if not locs_for_media:
+        return True
+    name = getattr(media_obj, "name", "") or ""
+    mid = getattr(media_obj, "id", "")
+    stem_dir = Path(crops_dir) / f"{mid}_{name}"
+    for loc in locs_for_media:
+        elemental_id = loc.get("elemental_id") or loc.get("id")
+        if elemental_id is None:
+            return False
+        if not _crop_output_exists(stem_dir / f"{elemental_id}.png"):
+            return False
+    return True
+
+
+def _download_and_crop_media_sequentially(
+    api: Any,
+    project_id: int,
+    needed_ids: list[int],
+    media_by_id: dict[int, Any],
+    locs_by_media: dict[int, list[dict]],
+    localizations_path: str,
+    crops_dir: str,
+    size: int = 224,
+) -> tuple[str, list[Any], int, int]:
+    """
+    Download and crop one media at a time: download media N -> crop only media N's
+    localizations -> delete media N's video file (if any) -> move to media N+1.
+
+    Downloading every needed media before cropping any of them means the whole
+    download phase (which can take minutes per video) has to finish before
+    cropping starts on even the first one, and every downloaded video sits on
+    local disk simultaneously (large videos can be several GB each). Interleaving
+    keeps at most one media file on local disk at a time and lets cropping start
+    as soon as the first media finishes downloading instead of waiting on the
+    whole batch.
+
+    Returns (download_dir, processed_media_objects, num_cropped, num_failed).
+    """
+    dl_dir = _download_dir(project_id)
+    processed_media: list[Any] = []
+    num_ok = 0
+    num_fail = 0
+    total = len(needed_ids)
+    for idx, mid in enumerate(needed_ids, 1):
+        media_obj = media_by_id.get(mid)
+        locs_for_media = locs_by_media.get(mid) or []
+        if not locs_for_media:
+            continue
+        if media_obj is not None and _media_locs_already_cropped(
+            media_obj, locs_for_media, crops_dir
+        ):
+            # Check on-disk crops before downloading: avoids downloading a
+            # (potentially large) video only to discover during cropping that
+            # every localization on it was already cropped.
+            logger.info(
+                "Skipping download for media %s/%s (id=%s, name=%s): all %s "
+                "crop(s) already on disk",
+                idx, total, mid, getattr(media_obj, "name", ""), len(locs_for_media),
+            )
+            processed_media.append(media_obj)
+            continue
+        if media_obj is not None:
+            logger.info(
+                "Downloading media %s/%s (id=%s, name=%s)...",
+                idx, total, mid, getattr(media_obj, "name", ""),
+            )
+            dl_dir = save_media_to_tmp(
+                api, project_id, [media_obj], media_ids_filter={mid}
+            )
+        else:
+            # No Media metadata resolved for this id (e.g. lookup failed) -- still
+            # attempt the crop in case the file is already present in the
+            # download dir from an earlier run, matching the previous
+            # always-attempt-crop behavior instead of silently dropping it.
+            logger.info(
+                "No Media object resolved for id=%s (%s/%s); attempting crop from "
+                "existing download dir",
+                mid, idx, total,
+            )
+        ok, fail = crop_localizations_parallel(
+            dl_dir,
+            localizations_path,
+            crops_dir,
+            size=size,
+            locs_to_crop=locs_for_media,
+            media_objects=[media_obj] if media_obj is not None else [],
+        )
+        num_ok += ok
+        num_fail += fail
+        if media_obj is not None:
+            processed_media.append(media_obj)
+            # Delete the video immediately so at most one large video occupies
+            # local disk at a time; images are left in place (existing behavior)
+            # until the final download-dir cleanup, since they're small and some
+            # sample types reference the downloaded image directly.
+            if _is_video_name(getattr(media_obj, "name", "") or ""):
+                _cleanup_downloaded_videos(dl_dir)
+    return dl_dir, processed_media, num_ok, num_fail
+
+
 def _load_config(path: str) -> dict[str, Any]:
     """Load configuration from YAML or JSON file."""
     ext = os.path.splitext(path)[1].lower()
@@ -1922,9 +2041,14 @@ def _find_crop_cache_misses(
     """
     Diff current localizations against the crop manifest and on-disk crop files.
     A localization is a "miss" (needs cropping) when:
-      - its elemental_id is absent from the manifest, OR
-      - its Tator modified_datetime differs from the manifest entry, OR
-      - the crop file does not exist on disk.
+      - the crop file does not exist on disk, OR
+      - the manifest has a prior record for it AND that record's modified_datetime
+        differs from the current one (the localization changed since it was cropped).
+
+    A crop file already on disk counts as a hit even without a manifest record
+    (e.g. the manifest was reset/lost, or these crops predate the manifest) --
+    otherwise a missing/stale manifest alone would mark every localization a
+    "miss" and re-download/re-crop videos that are already fully cropped on disk.
 
     Returns:
         media_ids_needed: set of media IDs that must be downloaded (have >= 1 miss)
@@ -1932,6 +2056,11 @@ def _find_crop_cache_misses(
         updated_manifest:  new manifest reflecting current localizations (to be saved after cropping)
     """
     download_stem_map = _media_id_to_stem(download_dir) if download_dir else {}
+    # The download dir is emptied after each sync (crops don't need the source file
+    # anymore), so on a later run with a missing/stale manifest, download_stem_map is
+    # empty too. Fall back to the crop subdirectory names themselves so the on-disk
+    # crop check below still resolves to the real stem instead of a bare media_id.
+    crops_stem_map = _media_id_to_stem_from_crops(crops_dir)
 
     manifest_stem_map: dict[int, str] = {}
     for entry in manifest.values():
@@ -1965,8 +2094,18 @@ def _find_crop_cache_misses(
             mid = int(media_id)
             modified_at = loc.get("modified_datetime") or loc.get("created_datetime")
 
+            # crops_stem_map reflects the actual on-disk crop directory name and
+            # takes priority over the manifest's recorded stem: a stale manifest
+            # entry (e.g. written back when media_stem defaulted to a bare
+            # media_id, or the media was renamed in Tator since) would otherwise
+            # shadow the real crop folder for every localization on this media,
+            # making crop_file.exists() check the wrong path and falsely report
+            # every one of them as a miss even though they're already cropped.
             media_stem = (
-                manifest_stem_map.get(mid) or download_stem_map.get(mid) or f"{mid}"
+                crops_stem_map.get(mid)
+                or manifest_stem_map.get(mid)
+                or download_stem_map.get(mid)
+                or f"{mid}"
             )
 
             updated_manifest[eid] = {
@@ -1978,10 +2117,16 @@ def _find_crop_cache_misses(
             old_entry = manifest.get(eid)
             crop_file = crops_path / media_stem / f"{eid}.png"
 
-            is_miss = (
-                old_entry is None
-                or old_entry.get("modified_at") != modified_at
-                or not crop_file.exists()
+            # A crop file already on disk is direct proof that localization was
+            # already cropped, even when the manifest has no record of it (e.g. the
+            # manifest was reset/lost, or these crops predate the manifest). Only
+            # force a re-crop when we have a prior record AND it disagrees with the
+            # current modified_at (the localization changed since it was cropped).
+            # Without this, a missing/stale manifest alone would mark every
+            # localization a "miss" and re-download/re-crop videos that are already
+            # fully cropped on disk.
+            is_miss = not crop_file.exists() or (
+                old_entry is not None and old_entry.get("modified_at") != modified_at
             )
             if is_miss:
                 media_ids_needed.add(mid)
@@ -2345,34 +2490,46 @@ def _run_crop_pipeline(
                 len(needed_ids),
                 len(media_ids_list),
             )
-            all_media = get_media_chunked(
+            media_for_crop = get_media_chunked(
                 api, project_id, needed_ids, media_id_batch_size=media_id_batch_size
             )
-            if not all_media:
+            if not media_for_crop:
                 logger.info(
                     "No Media objects returned for %s ids; skipping download",
                     len(needed_ids),
                 )
-            else:
+            if locs_to_crop and localizations_path:
+                media_by_id = {
+                    m.id: m
+                    for m in media_for_crop
+                    if isinstance(m, tator.models.Media)
+                }
+                locs_by_media: dict[int, list[dict]] = defaultdict(list)
+                for loc in locs_to_crop:
+                    loc_media_id = loc.get("media")
+                    if loc_media_id is not None:
+                        locs_by_media[int(loc_media_id)].append(loc)
                 logger.info(
-                    "Saving %s media files to tmp (images + videos)...", len(all_media)
+                    "Downloading and cropping %s media one at a time "
+                    "(images + videos)...",
+                    len(needed_ids),
                 )
-                dl_dir = save_media_to_tmp(
-                    api, project_id, all_media, media_ids_filter=media_ids_needed
+                (
+                    dl_dir,
+                    all_media,
+                    num_cropped,
+                    num_failed,
+                ) = _download_and_crop_media_sequentially(
+                    api,
+                    project_id,
+                    needed_ids,
+                    media_by_id,
+                    locs_by_media,
+                    localizations_path,
+                    crops,
                 )
-
-        if locs_to_crop and localizations_path:
-            num_cropped, num_failed = crop_localizations_parallel(
-                dl_dir,
-                localizations_path,
-                crops,
-                size=224,
-                locs_to_crop=locs_to_crop,
-                media_objects=all_media,
-            )
-            _cleanup_downloaded_videos(dl_dir)
-        elif not locs_to_crop:
-            logger.info("No crop cache misses; skipping crop step")
+            else:
+                logger.info("No crop cache misses; skipping crop step")
 
         _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
         _save_crop_manifest(
@@ -2462,14 +2619,15 @@ def _media_id_to_stem(download_dir: str) -> dict[int, str]:
     out: dict[int, str] = {}
     if not download_dir or not os.path.exists(download_dir):
         return out
+    image_and_video_exts = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".bmp",
+    } | set(VIDEO_EXTENSIONS)
     for f in Path(download_dir).iterdir():
-        if f.is_file() and f.suffix.lower() in (
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp",
-            ".bmp",
-        ):
+        if f.is_file() and f.suffix.lower() in image_and_video_exts:
             stem = f.stem
             if "_" in stem:
                 try:
@@ -4018,7 +4176,7 @@ def run_sync_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4174,7 +4332,7 @@ def run_recompute_crops_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4243,7 +4401,7 @@ def run_sync_to_tator_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4306,7 +4464,7 @@ def run_dimreduce_job(
         job = get_current_job()
         if job is not None:
             job_meta_handler = _JobMetaLogHandler(job)
-            job_meta_handler.setLevel(logging.DEBUG)
+            job_meta_handler.setLevel(_APP_LOG_LEVEL)
             logger.addHandler(job_meta_handler)
     except Exception:  # rq not installed or no worker context
         pass
@@ -4440,7 +4598,6 @@ def sync_project_to_fiftyone(
             query=query,
             localization_type_id=localization_type_id,
         )
-        use_cached_jsonl = False
         try:
             host = api_url.rstrip("/")
             api = tator.get_api(host, token)
