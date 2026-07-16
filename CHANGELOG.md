@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.1 (2026-07-16)
+
+### Performance Improvements
+
+- **app**: Streamline media download and crop caching (#25)
+  ([#25](https://github.com/mbari-org/fiftyone-sync/pull/25),
+  [`fc5e62d`](https://github.com/mbari-org/fiftyone-sync/commit/fc5e62da1a6ef4afa951f6909ff80ae347764411))
+
+
 ## v0.9.0 (2026-07-14)
 
 ### Features
