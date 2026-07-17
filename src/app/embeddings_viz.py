@@ -101,8 +101,30 @@ def has_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> bool:
 
 
 def has_brain_run(dataset: "fo.Dataset", brain_key: str) -> bool:
-    """Return True if the dataset has a brain run with the given key."""
-    return brain_key in dataset.list_brain_runs()
+    """
+    Return True if the dataset has a *usable* brain run with the given key.
+
+    A run can be registered (present in ``list_brain_runs()``) but have no results
+    if a prior computation crashed or was interrupted after registering the run but
+    before saving results. Treat such broken runs as absent so they get recomputed
+    instead of permanently blocking with "results not yet available" errors.
+    """
+    if brain_key not in dataset.list_brain_runs():
+        return False
+    try:
+        dataset.load_brain_results(brain_key)
+        return True
+    except Exception:
+        logger.warning(
+            f"Brain run '{brain_key}' is registered but its results could not be "
+            "loaded (likely an interrupted prior computation); deleting it so it "
+            "will be recomputed"
+        )
+        try:
+            dataset.delete_brain_run(brain_key)
+        except Exception:
+            logger.exception(f"Failed to delete broken brain run '{brain_key}'")
+        return False
 
 
 def _compute_embeddings_via_service(

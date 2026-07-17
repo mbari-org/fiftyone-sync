@@ -93,3 +93,54 @@ def test_repair_reraises_unrelated_iter_error():
 
     with pytest.raises(RuntimeError, match="mongo down"):
         sync.repair_undeclared_sample_fields(dataset)
+
+
+# ---------------------------------------------------------------------------
+# _embeddings_coverage
+# ---------------------------------------------------------------------------
+
+
+def test_embeddings_coverage_field_missing():
+    dataset = MagicMock()
+    dataset.has_field.return_value = False
+
+    count, up_to_date = sync._embeddings_coverage(dataset, "embeddings", 10)
+
+    assert count == 0
+    assert up_to_date is False
+    dataset.exists.assert_not_called()
+
+
+def test_embeddings_coverage_partial_is_not_up_to_date():
+    """This is the exact scenario that silently skipped recompute before the fix."""
+    dataset = MagicMock()
+    dataset.has_field.return_value = True
+    dataset.exists.return_value.count.return_value = 3
+
+    count, up_to_date = sync._embeddings_coverage(dataset, "embeddings", 10)
+
+    assert count == 3
+    assert up_to_date is False
+
+
+def test_embeddings_coverage_full_is_up_to_date():
+    dataset = MagicMock()
+    dataset.has_field.return_value = True
+    dataset.exists.return_value.count.return_value = 10
+
+    count, up_to_date = sync._embeddings_coverage(dataset, "embeddings", 10)
+
+    assert count == 10
+    assert up_to_date is True
+
+
+def test_embeddings_coverage_empty_dataset_not_up_to_date():
+    """Zero samples should not be considered 'up to date' (nothing to compute either way)."""
+    dataset = MagicMock()
+    dataset.has_field.return_value = True
+    dataset.exists.return_value.count.return_value = 0
+
+    count, up_to_date = sync._embeddings_coverage(dataset, "embeddings", 0)
+
+    assert count == 0
+    assert up_to_date is False
