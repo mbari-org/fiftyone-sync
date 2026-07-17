@@ -313,11 +313,14 @@ embeddings:
   similarity_metric: cosine            # e.g. cosine, euclidean
   force_similarity: false             # set true to recompute similarity index
   batch_size: 32                     # batch size for embed service requests
+  concurrency: 4                     # max batches submitted to the embed service concurrently
   service_url: null                   # optional; default FASTVSS_API_URL or http://localhost:8000
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
 
 To recompute dimensionality reduction without re-embedding, use `POST /dimreduce`. UMAP is stored under `${brain_key}_umap`; PCA and t-SNE are stored under `${brain_key}_pca` and `${brain_key}_tsne`.
+
+`concurrency` bounds how many batches are submitted to and awaited from the embed service at the same time (default 4). Increasing it speeds up embedding computation on services with spare capacity; at most `concurrency` jobs are ever in flight at once, regardless of how many batches remain, so it never overwhelms the service or risks jobs expiring while waiting to be polled.
 
 **Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
 
@@ -327,7 +330,7 @@ pip install umap-learn
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
-Embedding computation logs progress every batch for the first few batches, then every 10th batch: samples embedded, elapsed time, measured rate (images/sec), and an ETA. An upfront rough estimate (~50 ms/image) is logged before processing starts; the per-batch ETA switches to the measured rate once available.
+Embedding computation logs progress for the first few completed batches, then every 10th: samples embedded, elapsed time, measured rate (images/sec), and an ETA. An upfront rough estimate (~50 ms/image, divided by `concurrency`) is logged before processing starts; the per-batch ETA switches to the measured rate once available.
 
 To clear embeddings before a recompute, delete the field through FiftyOne so both the schema and sample documents are updated:
 

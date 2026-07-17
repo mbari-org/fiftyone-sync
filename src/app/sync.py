@@ -4924,9 +4924,15 @@ def sync_project_to_fiftyone(
                         "Embedding service unavailable; skipping embeddings/UMAP (dataset still available)"
                     )
                 else:
+                    from src.app.embeddings_viz import DEFAULT_EMBEDDING_CONCURRENCY
+
                     batch_size = embeddings_config.get("batch_size", 32)
+                    concurrency = int(
+                        embeddings_config.get("concurrency", DEFAULT_EMBEDDING_CONCURRENCY)
+                    )
                     logger.info(
-                        f"Computing embeddings with batch size {batch_size}, UMAP, and similarity for dataset '{dataset_name}'..."
+                        f"Computing embeddings with batch size {batch_size}, concurrency {concurrency}, "
+                        f"UMAP, and similarity for dataset '{dataset_name}'..."
                     )
                     # Force a recompute whenever coverage is incomplete, otherwise
                     # `compute_embeddings_and_viz`'s own cache check would immediately
@@ -4944,6 +4950,7 @@ def sync_project_to_fiftyone(
                         project_name=vss_project,
                         service_url=embeddings_config.get("service_url")
                         or os.environ.get("FASTVSS_API_URL"),
+                        concurrency=concurrency,
                     )
                     logger.info(
                         f"Embeddings, UMAP, and similarity completed for dataset '{dataset_name}'"
