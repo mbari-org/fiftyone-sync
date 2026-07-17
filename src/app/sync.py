@@ -4879,11 +4879,30 @@ def sync_project_to_fiftyone(
                 )
 
                 embeddings_field = model_info["embeddings_field"]
-                # When bypass was used (cached JSONL), skip embedding computation if embeddings already exist in MongoDB
-                if use_cached_jsonl and has_embeddings(dataset, embeddings_field):
+                # When bypass was used (cached JSONL), skip embedding computation only if
+                # embeddings already cover every current sample. A count mismatch (e.g. the
+                # dataset gained samples since the embeddings were last computed, so the
+                # bypassed/cached JSONL is stale relative to what's actually in Mongo) means
+                # some samples would silently be left without embeddings, so fall through
+                # and recompute instead.
+                bypass_has_embeddings = use_cached_jsonl and has_embeddings(
+                    dataset, embeddings_field
+                )
+                embeddings_up_to_date = False
+                if bypass_has_embeddings:
+                    embeddings_count = dataset.exists(embeddings_field).count()
+                    embeddings_up_to_date = embeddings_count == sample_count
+                    if not embeddings_up_to_date:
+                        logger.info(
+                            f"Bypass used but embeddings count ({embeddings_count}) does not "
+                            f"match sample count ({sample_count}) in '{embeddings_field}'; "
+                            "recomputing embeddings"
+                        )
+
+                if embeddings_up_to_date:
                     logger.info(
-                        f"Bypass used and embeddings already exist in dataset '{embeddings_field}'; "
-                        "skipping embedding computation"
+                        f"Bypass used and embeddings already exist in dataset '{embeddings_field}' "
+                        f"for all {sample_count} samples; skipping embedding computation"
                     )
                 elif not is_embedding_service_available():
                     logger.info(
@@ -4894,13 +4913,18 @@ def sync_project_to_fiftyone(
                     logger.info(
                         f"Computing embeddings with batch size {batch_size}, UMAP, and similarity for dataset '{dataset_name}'..."
                     )
+                    # `compute_embeddings_and_viz`'s own cache check only looks at whether
+                    # *any* sample has embeddings, not whether *every* sample does. Force a
+                    # recompute here when we detected a count mismatch above, otherwise it
+                    # would immediately re-skip and leave the new samples without embeddings.
+                    force_embeddings = bool(
+                        embeddings_config.get("force_embeddings", False)
+                    ) or (bypass_has_embeddings and not embeddings_up_to_date)
                     compute_embeddings_and_viz(
                         dataset,
                         model_info,
                         umap_seed=int(embeddings_config.get("umap_seed", 51)),
-                        force_embeddings=bool(
-                            embeddings_config.get("force_embeddings", False)
-                        ),
+                        force_embeddings=force_embeddings,
                         force_umap=bool(embeddings_config.get("force_umap", False)),
                         batch_size=batch_size,
                         project_name=vss_project,
