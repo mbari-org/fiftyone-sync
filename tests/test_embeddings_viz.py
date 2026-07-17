@@ -97,9 +97,10 @@ def test_format_duration_negative_clamped_to_zero():
 
 
 class _FakeSample:
-    def __init__(self, sample_id: str, path: str):
+    def __init__(self, sample_id: str, path: str, embedding=None):
         self.id = sample_id
         self._path = path
+        self.embedding = embedding
 
     def __contains__(self, key):
         return key == "local_filepath"
@@ -110,9 +111,29 @@ class _FakeSample:
         raise KeyError(key)
 
 
+class _FakeExistsView:
+    """Minimal stand-in for the view returned by dataset.exists(field)."""
+
+    def __init__(self, samples, field_name):
+        self._samples = [s for s in samples if getattr(s, "embedding", None) is not None]
+        self._field = field_name
+
+    def count(self):
+        return len(self._samples)
+
+    def values(self, field_name):
+        if field_name == "id":
+            return [s.id for s in self._samples]
+        return [s.embedding for s in self._samples]
+
+    def exists(self, field_name):
+        return self
+
+
 class _FakeDataset:
-    def __init__(self, samples):
+    def __init__(self, samples, embeddings_field="embeddings"):
         self._samples = samples
+        self._embeddings_field = embeddings_field
 
     def __len__(self):
         return len(self._samples)
@@ -123,14 +144,11 @@ class _FakeDataset:
     def reload(self):
         pass
 
+    def has_field(self, field_name):
+        return field_name == self._embeddings_field
+
     def exists(self, field_name):
-        count = len(self._samples)
-
-        class _Existing:
-            def count(self):
-                return count
-
-        return _Existing()
+        return _FakeExistsView(self._samples, field_name)
 
 
 class _FakeAsyncClient:
@@ -270,10 +288,10 @@ def test_compute_embeddings_via_service_uses_default_concurrency(monkeypatch):
     )
 
     fake_async.assert_awaited_once()
-    _, kwargs = fake_async.call_args
     args = fake_async.call_args.args
-    # concurrency is the last positional arg in the current signature
-    assert args[-1] == embeddings_viz.DEFAULT_EMBEDDING_CONCURRENCY
+    # positional order: (..., concurrency, skip_existing)
+    assert args[-2] == embeddings_viz.DEFAULT_EMBEDDING_CONCURRENCY
+    assert args[-1] is True
 
 
 def test_compute_embeddings_via_service_forwards_explicit_concurrency(monkeypatch):
@@ -290,7 +308,7 @@ def test_compute_embeddings_via_service_forwards_explicit_concurrency(monkeypatc
 
     fake_async.assert_awaited_once()
     args = fake_async.call_args.args
-    assert args[-1] == 8
+    assert args[-2] == 8
 
 
 def test_compute_embeddings_and_viz_forwards_concurrency(monkeypatch):
@@ -314,3 +332,176 @@ def test_compute_embeddings_and_viz_forwards_concurrency(monkeypatch):
 
     fake_compute.assert_called_once()
     assert fake_compute.call_args.kwargs["concurrency"] == 6
+    # Not forced -> only missing embeddings should be filled in.
+    assert fake_compute.call_args.kwargs["skip_existing"] is True
+
+
+# ---------------------------------------------------------------------------
+# count_embeddings / load_embeddings_array
+# ---------------------------------------------------------------------------
+
+
+def test_count_embeddings_zero_without_field():
+    dataset = MagicMock()
+    dataset.has_field.return_value = False
+    assert embeddings_viz.count_embeddings(dataset, "embeddings") == 0
+    dataset.exists.assert_not_called()
+
+
+def test_count_embeddings_counts_existing():
+    samples = [
+        _FakeSample("id0", "/a", embedding=[1.0, 2.0]),
+        _FakeSample("id1", "/b", embedding=None),
+        _FakeSample("id2", "/c", embedding=[3.0, 4.0]),
+    ]
+    dataset = _FakeDataset(samples)
+    assert embeddings_viz.count_embeddings(dataset, "embeddings") == 2
+
+
+def test_load_embeddings_array_returns_aligned_ids_and_vectors():
+    samples = [
+        _FakeSample("id0", "/a", embedding=[1.0, 2.0, 3.0]),
+        _FakeSample("id1", "/b", embedding=None),
+        _FakeSample("id2", "/c", embedding=[4.0, 5.0, 6.0]),
+    ]
+    dataset = _FakeDataset(samples)
+
+    ids, arr = embeddings_viz.load_embeddings_array(dataset, "embeddings")
+
+    assert ids == ["id0", "id2"]
+    assert arr.shape == (2, 3)
+    assert arr.dtype.name == "float32"
+    assert arr[0].tolist() == [1.0, 2.0, 3.0]
+    assert arr[1].tolist() == [4.0, 5.0, 6.0]
+
+
+def test_load_embeddings_array_empty_when_none_present():
+    samples = [_FakeSample("id0", "/a", embedding=None)]
+    dataset = _FakeDataset(samples)
+
+    ids, arr = embeddings_viz.load_embeddings_array(dataset, "embeddings")
+
+    assert ids == []
+    assert arr.size == 0
+
+
+# ---------------------------------------------------------------------------
+# Incremental (skip_existing) embedding computation
+# ---------------------------------------------------------------------------
+
+
+def test_compute_embeddings_via_service_async_skips_existing(monkeypatch, tmp_path):
+    """Only samples missing embeddings should be submitted; the return value is the new count."""
+    samples = []
+    for i in range(5):
+        p = tmp_path / f"s{i}.png"
+        p.write_bytes(b"fake")
+        # First 3 already have embeddings; last 2 are missing.
+        emb = [float(i)] if i < 3 else None
+        samples.append(_FakeSample(f"id{i}", str(p), embedding=emb))
+    dataset = _FakeDataset(samples)
+
+    submitted_ids: list[str] = []
+
+    async def fake_submit(client, url, files, batch_label):
+        return f"job-{batch_label}"
+
+    async def fake_poll(
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label, poll_timeout
+    ):
+        submitted_ids.extend(batch_ids)
+        return len(batch_ids)
+
+    monkeypatch.setattr(embeddings_viz, "_submit_batch_with_retries", fake_submit)
+    monkeypatch.setattr(embeddings_viz, "_poll_and_save_batch_with_retries", fake_poll)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
+
+    new_count = asyncio.run(
+        embeddings_viz._compute_embeddings_via_service_async(
+            dataset,
+            project_name="proj",
+            embeddings_field="embeddings",
+            service_url="http://embed.example",
+            batch_size=10,
+            poll_timeout=1.0,
+            concurrency=2,
+            skip_existing=True,
+        )
+    )
+
+    assert new_count == 2
+    assert sorted(submitted_ids) == ["id3", "id4"]
+
+
+def test_compute_embeddings_via_service_async_recomputes_all_when_not_skipping(
+    monkeypatch, tmp_path
+):
+    samples = []
+    for i in range(4):
+        p = tmp_path / f"s{i}.png"
+        p.write_bytes(b"fake")
+        samples.append(_FakeSample(f"id{i}", str(p), embedding=[float(i)]))
+    dataset = _FakeDataset(samples)
+
+    submitted_ids: list[str] = []
+
+    async def fake_submit(client, url, files, batch_label):
+        return f"job-{batch_label}"
+
+    async def fake_poll(
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label, poll_timeout
+    ):
+        submitted_ids.extend(batch_ids)
+        return len(batch_ids)
+
+    monkeypatch.setattr(embeddings_viz, "_submit_batch_with_retries", fake_submit)
+    monkeypatch.setattr(embeddings_viz, "_poll_and_save_batch_with_retries", fake_poll)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
+
+    new_count = asyncio.run(
+        embeddings_viz._compute_embeddings_via_service_async(
+            dataset,
+            project_name="proj",
+            embeddings_field="embeddings",
+            service_url="http://embed.example",
+            batch_size=10,
+            poll_timeout=1.0,
+            concurrency=2,
+            skip_existing=False,
+        )
+    )
+
+    assert new_count == 4
+    assert sorted(submitted_ids) == ["id0", "id1", "id2", "id3"]
+
+
+def test_compute_embeddings_via_service_async_returns_zero_when_all_present(
+    monkeypatch, tmp_path
+):
+    samples = []
+    for i in range(3):
+        p = tmp_path / f"s{i}.png"
+        p.write_bytes(b"fake")
+        samples.append(_FakeSample(f"id{i}", str(p), embedding=[float(i)]))
+    dataset = _FakeDataset(samples)
+
+    async def fake_submit(client, url, files, batch_label):  # pragma: no cover - should not run
+        raise AssertionError("submit should not be called when nothing is missing")
+
+    monkeypatch.setattr(embeddings_viz, "_submit_batch_with_retries", fake_submit)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
+
+    new_count = asyncio.run(
+        embeddings_viz._compute_embeddings_via_service_async(
+            dataset,
+            project_name="proj",
+            embeddings_field="embeddings",
+            service_url="http://embed.example",
+            batch_size=10,
+            poll_timeout=1.0,
+            concurrency=2,
+            skip_existing=True,
+        )
+    )
+
+    assert new_count == 0

@@ -4911,7 +4911,8 @@ def sync_project_to_fiftyone(
                     logger.info(
                         f"Embeddings count ({existing_embeddings_count}) does not match "
                         f"sample count ({sample_count}) in '{embeddings_field}'; "
-                        "recomputing embeddings"
+                        f"computing embeddings for the {sample_count - existing_embeddings_count} "
+                        "missing samples"
                     )
 
                 if use_cached_jsonl and embeddings_up_to_date:
@@ -4934,12 +4935,13 @@ def sync_project_to_fiftyone(
                         f"Computing embeddings with batch size {batch_size}, concurrency {concurrency}, "
                         f"UMAP, and similarity for dataset '{dataset_name}'..."
                     )
-                    # Force a recompute whenever coverage is incomplete, otherwise
-                    # `compute_embeddings_and_viz`'s own cache check would immediately
-                    # re-skip and leave samples without embeddings.
+                    # Only honor an explicit force_embeddings from config here.
+                    # compute_embeddings_and_viz now fills in missing embeddings
+                    # incrementally (skip_existing), so incomplete coverage no longer
+                    # requires re-embedding the whole dataset.
                     force_embeddings = bool(
                         embeddings_config.get("force_embeddings", False)
-                    ) or not embeddings_up_to_date
+                    )
                     compute_embeddings_and_viz(
                         dataset,
                         model_info,

@@ -122,6 +122,42 @@ def has_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> bool:
     return dataset.exists(embeddings_field).count() > 0
 
 
+def count_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> int:
+    """Return the number of samples that currently have a non-empty embedding stored."""
+    if not dataset.has_field(embeddings_field):
+        return 0
+    return dataset.exists(embeddings_field).count()
+
+
+def load_embeddings_array(view, embeddings_field: str):
+    """
+    Read the stored embeddings from Voxel51/FiftyOne into a NumPy array.
+
+    Returns ``(sample_ids, embeddings)`` where ``sample_ids`` is a list of sample IDs and
+    ``embeddings`` is an ``(n_samples, dim)`` float32 array in the same order. Only samples with a
+    non-empty embedding in ``embeddings_field`` are included. Both lists are aligned so the i-th row
+    of the array corresponds to the i-th sample id.
+    """
+    import numpy as np
+
+    emb_view = view.exists(embeddings_field)
+    ids = emb_view.values("id")
+    raw = emb_view.values(embeddings_field)
+
+    ids_out: list[str] = []
+    vectors: list = []
+    for sid, emb in zip(ids, raw):
+        if emb is None:
+            continue
+        ids_out.append(sid)
+        vectors.append(emb)
+
+    if not vectors:
+        return ids_out, np.empty((0, 0), dtype=np.float32)
+
+    return ids_out, np.asarray(vectors, dtype=np.float32)
+
+
 def has_brain_run(dataset: "fo.Dataset", brain_key: str) -> bool:
     """
     Return True if the dataset has a *usable* brain run with the given key.
@@ -277,7 +313,13 @@ async def _compute_embeddings_via_service_async(
     batch_size: int,
     poll_timeout: float,
     concurrency: int,
-) -> None:
+    skip_existing: bool = True,
+) -> int:
+    """Compute embeddings via the embed service. Returns the number of newly saved embeddings.
+
+    When ``skip_existing`` is True, samples that already have a non-empty embedding in
+    ``embeddings_field`` are left untouched, so only the missing ones are (re)computed.
+    """
     import httpx
 
     base = service_url.rstrip("/")
@@ -285,29 +327,51 @@ async def _compute_embeddings_via_service_async(
 
     total_samples = len(dataset)
     if total_samples == 0:
-        return
+        return 0
+
+    # Pre-fetch the IDs that already have embeddings in one aggregation so the scan below can
+    # skip them without reading each vector. When skip_existing is False we recompute everything.
+    existing_ids: set[str] = set()
+    if skip_existing and dataset.has_field(embeddings_field):
+        existing_ids = set(dataset.exists(embeddings_field).values("id"))
+        if existing_ids:
+            logger.info(
+                f"{len(existing_ids)}/{total_samples} samples already have embeddings in "
+                f"'{embeddings_field}'; only missing samples will be computed"
+            )
 
     # Scan once to collect (sample_id, filepath) pairs without holding all sample objects in memory.
     # For datasets with millions of samples this avoids an enormous in-memory list of FiftyOne objects.
     logger.info(f"Scanning {total_samples} samples for valid local filepaths...")
     valid_ids: list[str] = []
     valid_paths: list[str] = []
+    skipped_existing = 0
     for s in dataset.iter_samples():
+        if skip_existing and s.id in existing_ids:
+            skipped_existing += 1
+            continue
         path = s["local_filepath"] if "local_filepath" in s else None
         if path and os.path.isfile(path):
             valid_ids.append(s.id)
             valid_paths.append(path)
 
     if not valid_ids:
-        logger.warning("No valid samples with local_filepath found")
-        return
+        if skipped_existing:
+            logger.info(
+                f"All {skipped_existing} eligible samples already have embeddings; "
+                "nothing to compute"
+            )
+        else:
+            logger.warning("No valid samples with local_filepath found")
+        return 0
 
     num_valid = len(valid_ids)
     num_batches = (num_valid + batch_size - 1) // batch_size
     concurrency = max(1, min(concurrency, num_batches))
     est_total_seconds = num_valid * _ESTIMATED_SECONDS_PER_IMAGE / concurrency
     logger.info(
-        f"Processing embeddings for {num_valid} samples (out of {total_samples} total), "
+        f"Processing embeddings for {num_valid} samples needing computation "
+        f"(out of {total_samples} total, {skipped_existing} already had embeddings), "
         f"{num_batches} batches, concurrency={concurrency}; rough estimate "
         f"~{_format_duration(est_total_seconds)} total (~{_ESTIMATED_SECONDS_PER_IMAGE * 1000:.0f} ms/image)"
     )
@@ -396,6 +460,8 @@ async def _compute_embeddings_via_service_async(
             f"Dataset has {len(dataset)} total samples, {num_valid} valid samples were processed"
         )
 
+    return processed
+
 
 def _compute_embeddings_via_service(
     dataset: "fo.Dataset",
@@ -405,7 +471,8 @@ def _compute_embeddings_via_service(
     batch_size: int = 32,
     poll_timeout: float = 10.0,
     concurrency: int = DEFAULT_EMBEDDING_CONCURRENCY,
-) -> None:
+    skip_existing: bool = True,
+) -> int:
     """
     Compute embeddings by sending sample images to the embed service and writing results to the dataset.
 
@@ -416,8 +483,11 @@ def _compute_embeddings_via_service(
     jobs in flight at once (unlike the old fully-sequential one-at-a-time pattern, and unlike
     submitting every batch upfront, which would leave early jobs waiting for 30+ minutes and risk
     service-side TTL expiry when there are thousands of batches).
+
+    When ``skip_existing`` is True (default), samples that already have an embedding are skipped so
+    only the missing ones are computed. Returns the number of newly saved embeddings.
     """
-    asyncio.run(
+    return asyncio.run(
         _compute_embeddings_via_service_async(
             dataset,
             project_name,
@@ -426,6 +496,7 @@ def _compute_embeddings_via_service(
             batch_size,
             poll_timeout,
             concurrency,
+            skip_existing,
         )
     )
 
@@ -477,28 +548,39 @@ def compute_embeddings_and_viz(
     )
 
     # --- Embeddings (from service) ---
-    embeddings_exist = has_embeddings(dataset, embeddings_field)
-    if embeddings_exist and not force_embeddings:
+    # Count what already exists so we can (a) skip when fully covered and (b) recompute only the
+    # missing samples otherwise, rather than re-embedding the whole dataset every run.
+    total_samples = len(dataset)
+    existing_count = count_embeddings(dataset, embeddings_field)
+    newly_computed = 0
+    if existing_count >= total_samples > 0 and not force_embeddings:
         logger.info(
-            f"Embeddings already cached in '{embeddings_field}' - skipping computation (use force_embeddings to recompute)"
+            f"All {total_samples} samples already have embeddings in '{embeddings_field}' - "
+            "skipping computation (use force_embeddings to recompute)"
         )
     else:
         if not project_name:
             raise ValueError(
                 "Embeddings from service require project_name (Tator project name from get_project(project_id).name)"
             )
-        if embeddings_exist and force_embeddings:
+        if force_embeddings:
             logger.info(
-                "Force recomputing embeddings (cached embeddings will be overwritten)"
+                "Force recomputing embeddings for all samples (cached embeddings will be overwritten)"
+            )
+        else:
+            logger.info(
+                f"{existing_count}/{total_samples} samples already have embeddings; "
+                "computing only the missing ones"
             )
 
-        _compute_embeddings_via_service(
+        newly_computed = _compute_embeddings_via_service(
             dataset,
             project_name=project_name,
             embeddings_field=embeddings_field,
             service_url=base_url,
             batch_size=batch_size or 32,
             concurrency=concurrency or DEFAULT_EMBEDDING_CONCURRENCY,
+            skip_existing=not force_embeddings,
         )
 
     # Reload so exists() and brain see the persisted embeddings
@@ -513,22 +595,44 @@ def compute_embeddings_and_viz(
         )
         return
 
+    # New embeddings were added, so any existing UMAP/similarity run is stale and must be rebuilt
+    # to include the new points, even if force_umap was not requested.
+    embeddings_changed = newly_computed > 0
+    if embeddings_changed:
+        logger.info(
+            f"{newly_computed} new embeddings computed; UMAP/similarity will be recomputed to include them"
+        )
+
+    # Read the stored embeddings out of Voxel51 into an array once, and reuse it for both UMAP and
+    # similarity instead of having FiftyOne re-read the field from the DB for each.
+    sample_ids, embeddings_array = load_embeddings_array(dataset, embeddings_field)
+    logger.info(
+        f"Loaded {embeddings_array.shape[0]} embeddings "
+        f"(dim={embeddings_array.shape[1] if embeddings_array.ndim == 2 and embeddings_array.size else 0}) "
+        f"from '{embeddings_field}' into memory for UMAP/similarity"
+    )
+    if embeddings_array.size == 0:
+        logger.warning(
+            "UMAP/similarity skipped: loaded embeddings array is empty."
+        )
+        return
+
     brain_run_exists = has_brain_run(dataset, brain_key)
-    if brain_run_exists and not force_umap:
+    if brain_run_exists and not (force_umap or embeddings_changed):
         logger.info(
             f"UMAP visualization already cached with brain key '{brain_key}' - skipping computation (use force_umap to recompute)"
         )
     else:
-        if brain_run_exists and force_umap:
-            logger.info("Force recomputing UMAP (deleting existing brain run)")
+        if brain_run_exists:
+            logger.info("Recomputing UMAP (deleting existing brain run)")
             dataset.delete_brain_run(brain_key)
 
         logger.info(
-            f"Computing UMAP visualization ({n_with_emb} samples with embeddings)..."
+            f"Computing UMAP visualization ({embeddings_array.shape[0]} embeddings)..."
         )
         fob.compute_visualization(
             view_with_emb,
-            embeddings=embeddings_field,
+            embeddings=embeddings_array,
             brain_key=brain_key,
             method="umap",
             verbose=True,
@@ -541,22 +645,22 @@ def compute_embeddings_and_viz(
     similarity_metric = model_info.get("similarity_metric", "cosine")
     if similarity_brain_key:
         sim_run_exists = has_brain_run(dataset, similarity_brain_key)
-        if sim_run_exists and not force_umap:
+        if sim_run_exists and not (force_umap or embeddings_changed):
             logger.info(
                 f"Similarity index already cached with brain key '{similarity_brain_key}' - skipping (use force_umap to recompute)"
             )
         else:
-            if sim_run_exists and force_umap:
+            if sim_run_exists:
                 logger.info(
-                    "Force recomputing similarity (deleting existing brain run)"
+                    "Recomputing similarity (deleting existing brain run)"
                 )
                 dataset.delete_brain_run(similarity_brain_key)
             logger.info(
-                f"Computing similarity index ({n_with_emb} samples, metric={similarity_metric})..."
+                f"Computing similarity index ({embeddings_array.shape[0]} embeddings, metric={similarity_metric})..."
             )
             fob.compute_similarity(
                 view_with_emb,
-                embeddings=embeddings_field,
+                embeddings=embeddings_array,
                 metric=similarity_metric,
                 brain_key=similarity_brain_key,
             )

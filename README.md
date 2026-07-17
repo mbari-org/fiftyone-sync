@@ -330,6 +330,8 @@ pip install umap-learn
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
+**Incremental embeddings:** By default the sync counts how many samples already have embeddings and only computes the **missing** ones (rather than re-embedding the whole dataset). If any new embeddings are computed, the UMAP visualization and similarity index are automatically rebuilt to include the new points. Set `force_embeddings: true` to re-embed every sample regardless. When building UMAP/similarity, the stored embeddings are read out of Voxel51 into an in-memory NumPy array once and reused for both computations.
+
 Embedding computation logs progress for the first few completed batches, then every 10th: samples embedded, elapsed time, measured rate (images/sec), and an ETA. An upfront rough estimate (~50 ms/image, divided by `concurrency`) is logged before processing starts; the per-batch ETA switches to the measured rate once available.
 
 To clear embeddings before a recompute, delete the field through FiftyOne so both the schema and sample documents are updated:
