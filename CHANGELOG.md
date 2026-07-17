@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.2 (2026-07-17)
+
+### Bug Fixes
+
+- Repair orphaned embedding fields; incremental, concurrent embeddings with progress logging (#26)
+  ([#26](https://github.com/mbari-org/fiftyone-sync/pull/26),
+  [`fdcc343`](https://github.com/mbari-org/fiftyone-sync/commit/fdcc343741a4ee47a26bb555c32570f53fe75bcf))
+
+
 ## v0.9.1 (2026-07-16)
 
 ### Performance Improvements
