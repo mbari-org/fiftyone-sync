@@ -327,6 +327,8 @@ pip install umap-learn
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
+Embedding computation logs progress every batch for the first few batches, then every 10th batch: samples embedded, elapsed time, measured rate (images/sec), and an ETA. An upfront rough estimate (~50 ms/image) is logged before processing starts; the per-batch ETA switches to the measured rate once available.
+
 To clear embeddings before a recompute, delete the field through FiftyOne so both the schema and sample documents are updated:
 
 ```python

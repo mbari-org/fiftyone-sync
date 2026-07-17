@@ -35,6 +35,22 @@ EMBEDDING_FETCH_MAX_RETRIES = 3
 # Max time to wait for one job over WebSocket (align with Fast-VSS WS_MAX_WAIT)
 _WS_JOB_TIMEOUT = 10.0
 
+# Rough throughput estimate for the upfront ETA logged before processing starts;
+# actual progress logs below use the measured rate instead once a few batches complete.
+_ESTIMATED_SECONDS_PER_IMAGE = 0.05
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds as e.g. '45s', '3m 12s', or '1h 05m'."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, secs = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins:02d}m"
+
 
 def _service_base_to_ws(base: str) -> str:
     """Derive WebSocket base URL from service base (http -> ws, https -> wss)."""
@@ -172,12 +188,16 @@ def _compute_embeddings_via_service(
 
     num_valid = len(valid_ids)
     num_batches = (num_valid + batch_size - 1) // batch_size
+    est_total_seconds = num_valid * _ESTIMATED_SECONDS_PER_IMAGE
     logger.info(
-        f"Processing embeddings for {num_valid} samples (out of {total_samples} total), {num_batches} batches"
+        f"Processing embeddings for {num_valid} samples (out of {total_samples} total), "
+        f"{num_batches} batches; rough estimate ~{_format_duration(est_total_seconds)} total "
+        f"(~{_ESTIMATED_SECONDS_PER_IMAGE * 1000:.0f} ms/image)"
     )
 
     url = f"{base}/embed/{project_name}"
     processed = 0
+    start_time = time.monotonic()
 
     # Use a generous timeout for the HTTP POST: 512 images at several KB–MB each can take well over 5s.
     with httpx.Client(timeout=10.0) as client:
@@ -309,11 +329,31 @@ def _compute_embeddings_via_service(
                 raise RuntimeError(f"Embedding job failed: {last_error}") from last_error
 
             processed += len(batch_ids)
-            if batch_num % 10 == 0 or batch_num == num_batches - 1:
+            elapsed = time.monotonic() - start_time
+            # Log every batch for the first few (so progress is visible immediately even on
+            # small/slow runs), then every 10th batch to avoid flooding logs on large datasets.
+            if batch_num < 3 or batch_num % 10 == 0 or batch_num == num_batches - 1:
                 pct = 100 * processed // num_valid
-                logger.info(f"Progress: {processed}/{num_valid} samples embedded ({pct}%)")
+                rate = processed / elapsed if elapsed > 0 else 0.0
+                remaining = num_valid - processed
+                eta_seconds = (
+                    remaining / rate if rate > 0 else remaining * _ESTIMATED_SECONDS_PER_IMAGE
+                )
+                logger.info(
+                    f"Progress: {processed}/{num_valid} samples embedded ({pct}%) | "
+                    f"elapsed {_format_duration(elapsed)} | rate {rate:.1f} img/s | "
+                    f"ETA {_format_duration(eta_seconds)}"
+                )
 
-    logger.info(f"Embeddings stored in: {embeddings_field} ({num_valid} samples)")
+    total_elapsed = time.monotonic() - start_time
+    avg_rate = num_valid / total_elapsed if total_elapsed > 0 else 0.0
+    summary = f"Embeddings stored in: {embeddings_field} ({num_valid} samples)"
+    if avg_rate > 0:
+        summary += (
+            f" in {_format_duration(total_elapsed)} "
+            f"(avg {avg_rate:.1f} img/s, {1000 / avg_rate:.0f} ms/image)"
+        )
+    logger.info(summary)
 
     dataset.reload()
 

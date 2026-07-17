@@ -61,3 +61,28 @@ def test_has_embeddings_true_when_any_sample_has_value():
     dataset.exists.return_value.count.return_value = 1
 
     assert embeddings_viz.has_embeddings(dataset, "embeddings") is True
+
+
+# ---------------------------------------------------------------------------
+# _format_duration
+# ---------------------------------------------------------------------------
+
+
+def test_format_duration_seconds():
+    assert embeddings_viz._format_duration(0) == "0s"
+    assert embeddings_viz._format_duration(45) == "45s"
+    assert embeddings_viz._format_duration(59.4) == "59s"
+
+
+def test_format_duration_minutes():
+    assert embeddings_viz._format_duration(60) == "1m 00s"
+    assert embeddings_viz._format_duration(192) == "3m 12s"
+
+
+def test_format_duration_hours():
+    assert embeddings_viz._format_duration(3600) == "1h 00m"
+    assert embeddings_viz._format_duration(5400) == "1h 30m"
+
+
+def test_format_duration_negative_clamped_to_zero():
+    assert embeddings_viz._format_duration(-5) == "0s"
