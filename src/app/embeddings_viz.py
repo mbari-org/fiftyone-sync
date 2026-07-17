@@ -32,8 +32,30 @@ EMBED_SERVICE_BASE_URL = os.environ.get(
 # Stop embedding run after this many failed fetch attempts
 EMBEDDING_FETCH_MAX_RETRIES = 3
 
+# Default number of batches submitted to the embed service concurrently. Bounded (rather than
+# submitting every batch upfront) so at most this many jobs are ever in flight at once, avoiding
+# the job-TTL expiry that the old fully-sequential submit-all-then-poll-all pattern was written
+# to prevent, while still parallelizing the network round-trip wait across batches.
+DEFAULT_EMBEDDING_CONCURRENCY = 4
+
 # Max time to wait for one job over WebSocket (align with Fast-VSS WS_MAX_WAIT)
 _WS_JOB_TIMEOUT = 10.0
+
+# Rough throughput estimate for the upfront ETA logged before processing starts;
+# actual progress logs below use the measured rate instead once a few batches complete.
+_ESTIMATED_SECONDS_PER_IMAGE = 0.05
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds as e.g. '45s', '3m 12s', or '1h 05m'."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, secs = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins:02d}m"
 
 
 def _service_base_to_ws(base: str) -> str:
@@ -100,198 +122,329 @@ def has_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> bool:
     return dataset.exists(embeddings_field).count() > 0
 
 
+def count_embeddings(dataset: "fo.Dataset", embeddings_field: str) -> int:
+    """Return the number of samples that currently have a non-empty embedding stored."""
+    if not dataset.has_field(embeddings_field):
+        return 0
+    return dataset.exists(embeddings_field).count()
+
+
+def load_embeddings_array(view, embeddings_field: str):
+    """
+    Read the stored embeddings from Voxel51/FiftyOne into a NumPy array.
+
+    Returns ``(sample_ids, embeddings)`` where ``sample_ids`` is a list of sample IDs and
+    ``embeddings`` is an ``(n_samples, dim)`` float32 array in the same order. Only samples with a
+    non-empty embedding in ``embeddings_field`` are included. Both lists are aligned so the i-th row
+    of the array corresponds to the i-th sample id.
+    """
+    import numpy as np
+
+    emb_view = view.exists(embeddings_field)
+    ids = emb_view.values("id")
+    raw = emb_view.values(embeddings_field)
+
+    ids_out: list[str] = []
+    vectors: list = []
+    for sid, emb in zip(ids, raw):
+        if emb is None:
+            continue
+        ids_out.append(sid)
+        vectors.append(emb)
+
+    if not vectors:
+        return ids_out, np.empty((0, 0), dtype=np.float32)
+
+    return ids_out, np.asarray(vectors, dtype=np.float32)
+
+
 def has_brain_run(dataset: "fo.Dataset", brain_key: str) -> bool:
-    """Return True if the dataset has a brain run with the given key."""
-    return brain_key in dataset.list_brain_runs()
+    """
+    Return True if the dataset has a *usable* brain run with the given key.
+
+    A run can be registered (present in ``list_brain_runs()``) but have no results
+    if a prior computation crashed or was interrupted after registering the run but
+    before saving results. Treat such broken runs as absent so they get recomputed
+    instead of permanently blocking with "results not yet available" errors.
+    """
+    if brain_key not in dataset.list_brain_runs():
+        return False
+    try:
+        dataset.load_brain_results(brain_key)
+        return True
+    except Exception:
+        logger.warning(
+            f"Brain run '{brain_key}' is registered but its results could not be "
+            "loaded (likely an interrupted prior computation); deleting it so it "
+            "will be recomputed"
+        )
+        try:
+            dataset.delete_brain_run(brain_key)
+        except Exception:
+            logger.exception(f"Failed to delete broken brain run '{brain_key}'")
+        return False
 
 
-def _compute_embeddings_via_service(
+async def _submit_batch_with_retries(
+    client: "httpx.AsyncClient",
+    url: str,
+    files: list,
+    batch_label: str,
+) -> str:
+    """POST one batch to the embed service with retries. Returns the job_id."""
+    last_error: Exception | None = None
+    for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):
+        try:
+            logger.info(
+                f"Submitting {batch_label}"
+                + (
+                    f" (attempt {attempt + 1}/{EMBEDDING_FETCH_MAX_RETRIES})"
+                    if attempt
+                    else ""
+                )
+            )
+            resp = await client.post(url, files=files)
+            resp.raise_for_status()
+            data = resp.json()
+            err = data.get("error")
+            if err:
+                raise RuntimeError(f"Embed service error: {err}")
+            job_id = data.get("job_id")
+            if not job_id:
+                raise RuntimeError(f"No job_id in response: {data}")
+            logger.info(f"{batch_label} submitted -> job {job_id}")
+            return job_id
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"{batch_label} submit attempt {attempt + 1}/{EMBEDDING_FETCH_MAX_RETRIES} failed: {e}"
+            )
+    logger.error(
+        f"Embedding service failed after {EMBEDDING_FETCH_MAX_RETRIES} retries; stopping. Last error: {last_error}"
+    )
+    raise RuntimeError(
+        f"Embedding fetch failed after {EMBEDDING_FETCH_MAX_RETRIES} retries: {last_error}"
+    ) from last_error
+
+
+async def _poll_and_save_batch_with_retries(
+    dataset: "fo.Dataset",
+    ws_base: str,
+    project_name: str,
+    job_id: str,
+    batch_ids: list[str],
+    embeddings_field: str,
+    batch_label: str,
+    poll_timeout: float,
+) -> int:
+    """Poll the WebSocket for a job's result and save embeddings onto the given samples. Returns saved count."""
+    import numpy as np
+
+    ws_url = f"{ws_base}/ws/predict/job/{job_id}/{project_name}"
+    logger.debug(f"WebSocket URL: {ws_url}")
+    last_error: Exception | None = None
+    for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):
+        try:
+            raw_result = await _wait_job_result_ws(ws_url, timeout=poll_timeout)
+            logger.debug(
+                f"{batch_label} raw_result type: {type(raw_result).__name__}, "
+                f"keys: {raw_result.keys() if isinstance(raw_result, dict) else 'N/A'}"
+            )
+
+            if not isinstance(raw_result, dict):
+                logger.warning(
+                    f"WebSocket result is not a dict (type={type(raw_result).__name__}); using as-is"
+                )
+                emb_list = raw_result if isinstance(raw_result, list) else []
+            else:
+                emb_list = raw_result.get("embeddings")
+                if emb_list is None:
+                    result_field = raw_result.get("result")
+                    if isinstance(result_field, list):
+                        emb_list = result_field
+                    elif isinstance(result_field, dict):
+                        emb_list = result_field.get("embeddings")
+                    else:
+                        emb_list = []
+                if not emb_list:
+                    logger.warning(
+                        f"{batch_label}: No embeddings in result. Keys: {list(raw_result.keys())}"
+                    )
+                    logger.debug(
+                        f"{batch_label}: raw_result (first 500 chars): {str(raw_result)[:500]}"
+                    )
+
+            if not emb_list:
+                logger.error(f"{batch_label}: Empty embeddings list received")
+                return 0
+
+            logger.info(f"{batch_label}: Received {len(emb_list)} embeddings")
+            first_emb = emb_list[0]
+            logger.debug(
+                f"{batch_label}: First embedding type: {type(first_emb).__name__}, "
+                f"length: {len(first_emb) if hasattr(first_emb, '__len__') else 'N/A'}"
+            )
+            # Reload only this batch's samples by ID (ordered=True preserves submission order)
+            batch_view = dataset.select(batch_ids, ordered=True)
+            saved_count = 0
+            for s, emb in zip(batch_view.iter_samples(autosave=True), emb_list):
+                if isinstance(emb, np.ndarray):
+                    emb = emb.tolist()
+                elif not isinstance(emb, (list, tuple)):
+                    emb = list(emb)
+                s[embeddings_field] = emb
+                saved_count += 1
+            logger.info(f"{batch_label}: Saved {saved_count} embeddings")
+            return saved_count
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"WebSocket {batch_label} attempt {attempt + 1}/{EMBEDDING_FETCH_MAX_RETRIES} failed: {e}"
+            )
+    logger.error(f"{batch_label} failed after {EMBEDDING_FETCH_MAX_RETRIES} attempts: {last_error}")
+    raise RuntimeError(f"Embedding job failed: {last_error}") from last_error
+
+
+async def _compute_embeddings_via_service_async(
     dataset: "fo.Dataset",
     project_name: str,
     embeddings_field: str,
     service_url: str,
-    batch_size: int = 32,
-    poll_timeout: float = 10.0,
-) -> None:
-    """
-    Compute embeddings by sending sample images to the embed service and writing results to the dataset.
+    batch_size: int,
+    poll_timeout: float,
+    concurrency: int,
+    skip_existing: bool = True,
+) -> int:
+    """Compute embeddings via the embed service. Returns the number of newly saved embeddings.
 
-    Service: POST {service_url}/embed/{project_name} (no trailing slash) with files -> job_id
-             then WebSocket {service_url}/ws/predict/job/{job_id}/{project_name} until status done/failed.
-
-    Each batch is submitted and its WebSocket result is collected immediately before the next batch is
-    submitted.  This prevents jobs from expiring on the service side (TTL) when there are thousands of
-    batches and the old "submit-all-then-poll-all" pattern would leave early jobs waiting for 30+ minutes.
+    When ``skip_existing`` is True, samples that already have a non-empty embedding in
+    ``embeddings_field`` are left untouched, so only the missing ones are (re)computed.
     """
     import httpx
-    import numpy as np
 
     base = service_url.rstrip("/")
     ws_base = _service_base_to_ws(base)
 
     total_samples = len(dataset)
     if total_samples == 0:
-        return
+        return 0
+
+    # Pre-fetch the IDs that already have embeddings in one aggregation so the scan below can
+    # skip them without reading each vector. When skip_existing is False we recompute everything.
+    existing_ids: set[str] = set()
+    if skip_existing and dataset.has_field(embeddings_field):
+        existing_ids = set(dataset.exists(embeddings_field).values("id"))
+        if existing_ids:
+            logger.info(
+                f"{len(existing_ids)}/{total_samples} samples already have embeddings in "
+                f"'{embeddings_field}'; only missing samples will be computed"
+            )
 
     # Scan once to collect (sample_id, filepath) pairs without holding all sample objects in memory.
     # For datasets with millions of samples this avoids an enormous in-memory list of FiftyOne objects.
     logger.info(f"Scanning {total_samples} samples for valid local filepaths...")
     valid_ids: list[str] = []
     valid_paths: list[str] = []
+    skipped_existing = 0
     for s in dataset.iter_samples():
+        if skip_existing and s.id in existing_ids:
+            skipped_existing += 1
+            continue
         path = s["local_filepath"] if "local_filepath" in s else None
         if path and os.path.isfile(path):
             valid_ids.append(s.id)
             valid_paths.append(path)
 
     if not valid_ids:
-        logger.warning("No valid samples with local_filepath found")
-        return
+        if skipped_existing:
+            logger.info(
+                f"All {skipped_existing} eligible samples already have embeddings; "
+                "nothing to compute"
+            )
+        else:
+            logger.warning("No valid samples with local_filepath found")
+        return 0
 
     num_valid = len(valid_ids)
     num_batches = (num_valid + batch_size - 1) // batch_size
+    concurrency = max(1, min(concurrency, num_batches))
+    est_total_seconds = num_valid * _ESTIMATED_SECONDS_PER_IMAGE / concurrency
     logger.info(
-        f"Processing embeddings for {num_valid} samples (out of {total_samples} total), {num_batches} batches"
+        f"Processing embeddings for {num_valid} samples needing computation "
+        f"(out of {total_samples} total, {skipped_existing} already had embeddings), "
+        f"{num_batches} batches, concurrency={concurrency}; rough estimate "
+        f"~{_format_duration(est_total_seconds)} total (~{_ESTIMATED_SECONDS_PER_IMAGE * 1000:.0f} ms/image)"
     )
 
     url = f"{base}/embed/{project_name}"
     processed = 0
+    completed_batches = 0
+    start_time = time.monotonic()
+    semaphore = asyncio.Semaphore(concurrency)
 
     # Use a generous timeout for the HTTP POST: 512 images at several KB–MB each can take well over 5s.
-    with httpx.Client(timeout=10.0) as client:
-        for batch_num in range(num_batches):
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        async def run_batch(batch_num: int) -> None:
+            nonlocal processed, completed_batches
+
             start = batch_num * batch_size
             end = min(start + batch_size, num_valid)
             batch_paths = valid_paths[start:end]
             batch_ids = valid_ids[start:end]
+            batch_label = f"batch {batch_num + 1}/{num_batches}"
 
             files = []
             for fp in batch_paths:
                 with open(fp, "rb") as f:
                     files.append(("files", (os.path.basename(fp), f.read())))
 
-            # --- Submit batch (with retries) ---
-            job_id: str | None = None
-            last_error: Exception | None = None
-            for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):
-                try:
-                    logger.info(
-                        f"Submitting batch {batch_num + 1}/{num_batches}"
-                        + (
-                            f" (attempt {attempt + 1}/{EMBEDDING_FETCH_MAX_RETRIES})"
-                            if attempt
-                            else ""
-                        )
-                    )
-                    resp = client.post(url, files=files)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    err = data.get("error")
-                    if err:
-                        raise RuntimeError(f"Embed service error: {err}")
-                    job_id = data.get("job_id")
-                    if not job_id:
-                        raise RuntimeError(f"No job_id in response: {data}")
-                    logger.info(f"Batch {batch_num + 1} submitted -> job {job_id}")
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        f"Batch {batch_num + 1} submit attempt {attempt + 1}/{EMBEDDING_FETCH_MAX_RETRIES} failed: {e}"
-                    )
-            if last_error is not None:
-                logger.error(
-                    f"Embedding service failed after {EMBEDDING_FETCH_MAX_RETRIES} retries; stopping. Last error: {last_error}"
+            # Bounded to `concurrency` in-flight jobs at once: unlike submitting every batch
+            # upfront (which leaves early jobs waiting for the slowest of thousands to be
+            # polled, risking service-side TTL expiry), only a small, fixed number of jobs are
+            # ever outstanding, while still parallelizing the network round-trip wait.
+            async with semaphore:
+                job_id = await _submit_batch_with_retries(client, url, files, batch_label)
+                await _poll_and_save_batch_with_retries(
+                    dataset,
+                    ws_base,
+                    project_name,
+                    job_id,
+                    batch_ids,
+                    embeddings_field,
+                    batch_label,
+                    poll_timeout,
                 )
-                raise RuntimeError(
-                    f"Embedding fetch failed after {EMBEDDING_FETCH_MAX_RETRIES} retries: {last_error}"
-                ) from last_error
-
-            # --- Immediately poll WebSocket for this batch's result ---
-            # Polling right after submission prevents job TTL expiry that occurs when all batches
-            # are queued first and only then polled (e.g. 2000+ batches x submit time >> service TTL).
-            ws_url = f"{ws_base}/ws/predict/job/{job_id}/{project_name}"
-            logger.debug(f"WebSocket URL: {ws_url}")
-            last_error = None
-            for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):
-                try:
-                    raw_result = asyncio.run(
-                        _wait_job_result_ws(ws_url, timeout=poll_timeout)
-                    )
-                    logger.debug(
-                        f"Batch {batch_num + 1} raw_result type: {type(raw_result).__name__}, "
-                        f"keys: {raw_result.keys() if isinstance(raw_result, dict) else 'N/A'}"
-                    )
-
-                    if not isinstance(raw_result, dict):
-                        logger.warning(
-                            f"WebSocket result is not a dict (type={type(raw_result).__name__}); using as-is"
-                        )
-                        emb_list = raw_result if isinstance(raw_result, list) else []
-                    else:
-                        emb_list = raw_result.get("embeddings")
-                        if emb_list is None:
-                            result_field = raw_result.get("result")
-                            if isinstance(result_field, list):
-                                emb_list = result_field
-                            elif isinstance(result_field, dict):
-                                emb_list = result_field.get("embeddings")
-                            else:
-                                emb_list = []
-                        if not emb_list:
-                            logger.warning(
-                                f"Batch {batch_num + 1}: No embeddings in result. Keys: {list(raw_result.keys())}"
-                            )
-                            logger.debug(
-                                f"Batch {batch_num + 1}: raw_result (first 500 chars): {str(raw_result)[:500]}"
-                            )
-
-                    if not emb_list:
-                        logger.error(f"Batch {batch_num + 1}: Empty embeddings list received")
-                    else:
-                        logger.info(
-                            f"Batch {batch_num + 1}: Received {len(emb_list)} embeddings"
-                        )
-                        if emb_list:
-                            first_emb = emb_list[0]
-                            logger.debug(
-                                f"Batch {batch_num + 1}: First embedding type: {type(first_emb).__name__}, "
-                                f"length: {len(first_emb) if hasattr(first_emb, '__len__') else 'N/A'}"
-                            )
-                        # Reload only this batch's samples by ID (ordered=True preserves submission order)
-                        batch_view = dataset.select(batch_ids, ordered=True)
-                        saved_count = 0
-                        for s, emb in zip(batch_view.iter_samples(autosave=True), emb_list):
-                            if isinstance(emb, np.ndarray):
-                                emb = emb.tolist()
-                            elif not isinstance(emb, (list, tuple)):
-                                emb = list(emb)
-                            s[embeddings_field] = emb
-                            saved_count += 1
-                        logger.info(
-                            f"Batch {batch_num + 1}: Saved {saved_count} embeddings (samples {start}–{end - 1})"
-                        )
-
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        f"WebSocket batch {batch_num + 1} attempt {attempt + 1}/{EMBEDDING_FETCH_MAX_RETRIES} failed: {e}"
-                    )
-            if last_error is not None:
-                logger.error(
-                    f"Batch {batch_num + 1} failed after {EMBEDDING_FETCH_MAX_RETRIES} attempts: {last_error}"
-                )
-                raise RuntimeError(f"Embedding job failed: {last_error}") from last_error
 
             processed += len(batch_ids)
-            if batch_num % 10 == 0 or batch_num == num_batches - 1:
+            completed_batches += 1
+            elapsed = time.monotonic() - start_time
+            # Log the first few completions (so progress is visible immediately even on
+            # small/slow runs), then every 10th, to avoid flooding logs on large datasets.
+            if completed_batches <= 3 or completed_batches % 10 == 0 or completed_batches == num_batches:
                 pct = 100 * processed // num_valid
-                logger.info(f"Progress: {processed}/{num_valid} samples embedded ({pct}%)")
+                rate = processed / elapsed if elapsed > 0 else 0.0
+                remaining = num_valid - processed
+                eta_seconds = (
+                    remaining / rate if rate > 0 else remaining * _ESTIMATED_SECONDS_PER_IMAGE
+                )
+                logger.info(
+                    f"Progress: {processed}/{num_valid} samples embedded ({pct}%) | "
+                    f"{completed_batches}/{num_batches} batches done | "
+                    f"elapsed {_format_duration(elapsed)} | rate {rate:.1f} img/s | "
+                    f"ETA {_format_duration(eta_seconds)}"
+                )
 
-    logger.info(f"Embeddings stored in: {embeddings_field} ({num_valid} samples)")
+        await asyncio.gather(*(run_batch(i) for i in range(num_batches)))
+
+    total_elapsed = time.monotonic() - start_time
+    avg_rate = num_valid / total_elapsed if total_elapsed > 0 else 0.0
+    summary = f"Embeddings stored in: {embeddings_field} ({num_valid} samples)"
+    if avg_rate > 0:
+        summary += (
+            f" in {_format_duration(total_elapsed)} "
+            f"(avg {avg_rate:.1f} img/s, {1000 / avg_rate:.0f} ms/image)"
+        )
+    logger.info(summary)
 
     dataset.reload()
 
@@ -307,6 +460,46 @@ def _compute_embeddings_via_service(
             f"Dataset has {len(dataset)} total samples, {num_valid} valid samples were processed"
         )
 
+    return processed
+
+
+def _compute_embeddings_via_service(
+    dataset: "fo.Dataset",
+    project_name: str,
+    embeddings_field: str,
+    service_url: str,
+    batch_size: int = 32,
+    poll_timeout: float = 10.0,
+    concurrency: int = DEFAULT_EMBEDDING_CONCURRENCY,
+    skip_existing: bool = True,
+) -> int:
+    """
+    Compute embeddings by sending sample images to the embed service and writing results to the dataset.
+
+    Service: POST {service_url}/embed/{project_name} (no trailing slash) with files -> job_id
+             then WebSocket {service_url}/ws/predict/job/{job_id}/{project_name} until status done/failed.
+
+    Up to `concurrency` batches are submitted and polled concurrently. This bounds the number of
+    jobs in flight at once (unlike the old fully-sequential one-at-a-time pattern, and unlike
+    submitting every batch upfront, which would leave early jobs waiting for 30+ minutes and risk
+    service-side TTL expiry when there are thousands of batches).
+
+    When ``skip_existing`` is True (default), samples that already have an embedding are skipped so
+    only the missing ones are computed. Returns the number of newly saved embeddings.
+    """
+    return asyncio.run(
+        _compute_embeddings_via_service_async(
+            dataset,
+            project_name,
+            embeddings_field,
+            service_url,
+            batch_size,
+            poll_timeout,
+            concurrency,
+            skip_existing,
+        )
+    )
+
 
 def compute_embeddings_and_viz(
     dataset: "fo.Dataset",
@@ -317,6 +510,7 @@ def compute_embeddings_and_viz(
     batch_size: Optional[int] = None,
     project_name: Optional[str] = None,
     service_url: Optional[str] = None,
+    concurrency: Optional[int] = None,
 ) -> None:
     """
     Compute embeddings, UMAP visualization, and optional similarity index with caching.
@@ -338,6 +532,9 @@ def compute_embeddings_and_viz(
         batch_size: Batch size for embed service requests (default 32)
         project_name: Project key for embed service URL path (usually project ID; required when using service)
         service_url: Base URL for embed service (default FASTVSS_API_URL or http://localhost:8000)
+        concurrency: Max number of batches submitted to the embed service concurrently
+            (default DEFAULT_EMBEDDING_CONCURRENCY). Higher values speed up submission at the
+            cost of more simultaneous load on the embed service.
     """
     import fiftyone.brain as fob
 
@@ -346,31 +543,44 @@ def compute_embeddings_and_viz(
     base_url = (service_url or EMBED_SERVICE_BASE_URL).rstrip("/")
 
     logger.info(
-        f"Embeddings from service: {base_url}/embed/ | project={project_name} field={embeddings_field} brain_key={brain_key} batch_size={batch_size}"
+        f"Embeddings from service: {base_url}/embed/ | project={project_name} field={embeddings_field} "
+        f"brain_key={brain_key} batch_size={batch_size} concurrency={concurrency or DEFAULT_EMBEDDING_CONCURRENCY}"
     )
 
     # --- Embeddings (from service) ---
-    embeddings_exist = has_embeddings(dataset, embeddings_field)
-    if embeddings_exist and not force_embeddings:
+    # Count what already exists so we can (a) skip when fully covered and (b) recompute only the
+    # missing samples otherwise, rather than re-embedding the whole dataset every run.
+    total_samples = len(dataset)
+    existing_count = count_embeddings(dataset, embeddings_field)
+    newly_computed = 0
+    if existing_count >= total_samples > 0 and not force_embeddings:
         logger.info(
-            f"Embeddings already cached in '{embeddings_field}' - skipping computation (use force_embeddings to recompute)"
+            f"All {total_samples} samples already have embeddings in '{embeddings_field}' - "
+            "skipping computation (use force_embeddings to recompute)"
         )
     else:
         if not project_name:
             raise ValueError(
                 "Embeddings from service require project_name (Tator project name from get_project(project_id).name)"
             )
-        if embeddings_exist and force_embeddings:
+        if force_embeddings:
             logger.info(
-                "Force recomputing embeddings (cached embeddings will be overwritten)"
+                "Force recomputing embeddings for all samples (cached embeddings will be overwritten)"
+            )
+        else:
+            logger.info(
+                f"{existing_count}/{total_samples} samples already have embeddings; "
+                "computing only the missing ones"
             )
 
-        _compute_embeddings_via_service(
+        newly_computed = _compute_embeddings_via_service(
             dataset,
             project_name=project_name,
             embeddings_field=embeddings_field,
             service_url=base_url,
             batch_size=batch_size or 32,
+            concurrency=concurrency or DEFAULT_EMBEDDING_CONCURRENCY,
+            skip_existing=not force_embeddings,
         )
 
     # Reload so exists() and brain see the persisted embeddings
@@ -385,22 +595,44 @@ def compute_embeddings_and_viz(
         )
         return
 
+    # New embeddings were added, so any existing UMAP/similarity run is stale and must be rebuilt
+    # to include the new points, even if force_umap was not requested.
+    embeddings_changed = newly_computed > 0
+    if embeddings_changed:
+        logger.info(
+            f"{newly_computed} new embeddings computed; UMAP/similarity will be recomputed to include them"
+        )
+
+    # Read the stored embeddings out of Voxel51 into an array once, and reuse it for both UMAP and
+    # similarity instead of having FiftyOne re-read the field from the DB for each.
+    sample_ids, embeddings_array = load_embeddings_array(dataset, embeddings_field)
+    logger.info(
+        f"Loaded {embeddings_array.shape[0]} embeddings "
+        f"(dim={embeddings_array.shape[1] if embeddings_array.ndim == 2 and embeddings_array.size else 0}) "
+        f"from '{embeddings_field}' into memory for UMAP/similarity"
+    )
+    if embeddings_array.size == 0:
+        logger.warning(
+            "UMAP/similarity skipped: loaded embeddings array is empty."
+        )
+        return
+
     brain_run_exists = has_brain_run(dataset, brain_key)
-    if brain_run_exists and not force_umap:
+    if brain_run_exists and not (force_umap or embeddings_changed):
         logger.info(
             f"UMAP visualization already cached with brain key '{brain_key}' - skipping computation (use force_umap to recompute)"
         )
     else:
-        if brain_run_exists and force_umap:
-            logger.info("Force recomputing UMAP (deleting existing brain run)")
+        if brain_run_exists:
+            logger.info("Recomputing UMAP (deleting existing brain run)")
             dataset.delete_brain_run(brain_key)
 
         logger.info(
-            f"Computing UMAP visualization ({n_with_emb} samples with embeddings)..."
+            f"Computing UMAP visualization ({embeddings_array.shape[0]} embeddings)..."
         )
         fob.compute_visualization(
             view_with_emb,
-            embeddings=embeddings_field,
+            embeddings=embeddings_array,
             brain_key=brain_key,
             method="umap",
             verbose=True,
@@ -413,22 +645,22 @@ def compute_embeddings_and_viz(
     similarity_metric = model_info.get("similarity_metric", "cosine")
     if similarity_brain_key:
         sim_run_exists = has_brain_run(dataset, similarity_brain_key)
-        if sim_run_exists and not force_umap:
+        if sim_run_exists and not (force_umap or embeddings_changed):
             logger.info(
                 f"Similarity index already cached with brain key '{similarity_brain_key}' - skipping (use force_umap to recompute)"
             )
         else:
-            if sim_run_exists and force_umap:
+            if sim_run_exists:
                 logger.info(
-                    "Force recomputing similarity (deleting existing brain run)"
+                    "Recomputing similarity (deleting existing brain run)"
                 )
                 dataset.delete_brain_run(similarity_brain_key)
             logger.info(
-                f"Computing similarity index ({n_with_emb} samples, metric={similarity_metric})..."
+                f"Computing similarity index ({embeddings_array.shape[0]} embeddings, metric={similarity_metric})..."
             )
             fob.compute_similarity(
                 view_with_emb,
-                embeddings=embeddings_field,
+                embeddings=embeddings_array,
                 metric=similarity_metric,
                 brain_key=similarity_brain_key,
             )

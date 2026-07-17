@@ -313,11 +313,14 @@ embeddings:
   similarity_metric: cosine            # e.g. cosine, euclidean
   force_similarity: false             # set true to recompute similarity index
   batch_size: 32                     # batch size for embed service requests
+  concurrency: 4                     # max batches submitted to the embed service concurrently
   service_url: null                   # optional; default FASTVSS_API_URL or http://localhost:8000
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
 
 To recompute dimensionality reduction without re-embedding, use `POST /dimreduce`. UMAP is stored under `${brain_key}_umap`; PCA and t-SNE are stored under `${brain_key}_pca` and `${brain_key}_tsne`.
+
+`concurrency` bounds how many batches are submitted to and awaited from the embed service at the same time (default 4). Increasing it speeds up embedding computation on services with spare capacity; at most `concurrency` jobs are ever in flight at once, regardless of how many batches remain, so it never overwhelms the service or risks jobs expiring while waiting to be polled.
 
 **Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
 
@@ -326,6 +329,20 @@ pip install umap-learn
 ```
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
+
+**Incremental embeddings:** By default the sync counts how many samples already have embeddings and only computes the **missing** ones (rather than re-embedding the whole dataset). If any new embeddings are computed, the UMAP visualization and similarity index are automatically rebuilt to include the new points. Set `force_embeddings: true` to re-embed every sample regardless. When building UMAP/similarity, the stored embeddings are read out of Voxel51 into an in-memory NumPy array once and reused for both computations.
+
+Embedding computation logs progress for the first few completed batches, then every 10th: samples embedded, elapsed time, measured rate (images/sec), and an ETA. An upfront rough estimate (~50 ms/image, divided by `concurrency`) is logged before processing starts; the per-batch ETA switches to the measured rate once available.
+
+To clear embeddings before a recompute, delete the field through FiftyOne so both the schema and sample documents are updated:
+
+```python
+import fiftyone as fo
+dataset = fo.load_dataset("your_dataset_name")
+dataset.delete_sample_field("embeddings")  # also clears brain keys that use it if needed
+```
+
+If embeddings were removed only from the schema (or cleared incompletely in MongoDB), sync may hit `FieldDoesNotExist: The fields "{'embeddings'}" do not exist on the document ...` during reconcile. Reconcile now detects that mismatch and purges the orphaned field data automatically so the sync can continue and recompute embeddings.
 
 ### Data layout
 

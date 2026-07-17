@@ -9,6 +9,7 @@ Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping u
 from __future__ import annotations
 
 from collections import defaultdict
+import ast
 import glob
 import json
 import logging
@@ -2981,6 +2982,106 @@ def _create_sample_from_loc(
     return sample
 
 
+# FiftyOne/mongoengine: "The fields "{'embeddings'}" do not exist on the document "samples.<id>""
+_FIELD_DOES_NOT_EXIST_RE = re.compile(
+    r'The fields "(?P<fields>\{.*?\})" do not exist on the document'
+)
+
+
+def _parse_undeclared_fields_from_error(exc: BaseException) -> set[str]:
+    """Extract undeclared field names from a mongoengine FieldDoesNotExist message."""
+    match = _FIELD_DOES_NOT_EXIST_RE.search(str(exc))
+    if not match:
+        return set()
+    try:
+        parsed = ast.literal_eval(match.group("fields"))
+    except (ValueError, SyntaxError):
+        return set()
+    if isinstance(parsed, (set, frozenset, list, tuple)):
+        return {str(name) for name in parsed}
+    return set()
+
+
+def _schema_sample_db_keys(dataset: fo.Dataset) -> set[str]:
+    """MongoDB top-level keys that belong to the dataset sample schema."""
+    keys: set[str] = {"_id", "_cls"}
+    for name, field in dataset.get_field_schema(include_private=True).items():
+        keys.add(name)
+        db_field = getattr(field, "db_field", None)
+        if db_field:
+            keys.add(db_field)
+    return keys
+
+
+def _find_undeclared_sample_fields(
+    dataset: fo.Dataset, *, sample_limit: int = 100
+) -> set[str]:
+    """Return top-level sample keys present in MongoDB but absent from the schema."""
+    allowed = _schema_sample_db_keys(dataset)
+    undeclared: set[str] = set()
+    for doc in dataset._sample_collection.find({}).limit(sample_limit):
+        for key in doc:
+            if key not in allowed:
+                undeclared.add(key)
+    return undeclared
+
+
+def _purge_undeclared_sample_fields(
+    dataset: fo.Dataset, field_names: list[str] | set[str]
+) -> list[str]:
+    """Unset the given fields from all sample documents and reload the dataset."""
+    fields = sorted({str(name) for name in field_names if name})
+    if not fields:
+        return []
+    logger.warning(
+        "Purging undeclared sample field(s) %s so samples can load "
+        "(schema/document mismatch — often after manually deleting embeddings "
+        "without dataset.delete_sample_field)",
+        fields,
+    )
+    # Works even when the field is already gone from the schema (unlike delete_sample_field).
+    dataset._sample_doc_cls._delete_fields_simple(fields)
+    fo.Sample._purge_fields(dataset._sample_collection_name, fields)
+    dataset.reload()
+    return fields
+
+
+def repair_undeclared_sample_fields(
+    dataset: fo.Dataset,
+    *,
+    preferred_fields: list[str] | None = None,
+) -> list[str]:
+    """
+    Fix sample docs that still contain fields removed from the dataset schema.
+
+    After an incomplete embeddings delete (schema cleared, values left on documents),
+    FiftyOne fails on ``iter_samples()`` / ``sample.save()`` with FieldDoesNotExist
+    for ``embeddings``. This purges orphaned top-level fields so reconcile can proceed;
+    embeddings can then be recomputed normally.
+    """
+    preferred = list(preferred_fields or [])
+    # Fast path: if preferred fields are absent from schema but still on docs, purge them.
+    to_check = [f for f in preferred if f and not dataset.has_field(f)]
+    if to_check:
+        coll = dataset._sample_collection
+        present = [
+            f for f in to_check if coll.find_one({f: {"$exists": True}}, {"_id": 1})
+        ]
+        if present:
+            return _purge_undeclared_sample_fields(dataset, present)
+
+    # Probe full sample load (values()/aggregations can succeed while iter_samples fails).
+    try:
+        next(dataset.iter_samples(autosave=False), None)
+        return []
+    except Exception as exc:
+        from_error = _parse_undeclared_fields_from_error(exc)
+        if not from_error:
+            raise
+        undeclared = _find_undeclared_sample_fields(dataset) | from_error
+        return _purge_undeclared_sample_fields(dataset, undeclared)
+
+
 def reconcile_dataset_with_tator(
     dataset: fo.Dataset,
     loc_index: dict[str, dict],
@@ -2995,6 +3096,14 @@ def reconcile_dataset_with_tator(
     - Update samples whose modified_datetime changed (crop file already overwritten)
     - Add samples for new elemental_ids in Tator
     """
+    embeddings_cfg = config.get("embeddings") if isinstance(config, dict) else None
+    embeddings_field = "embeddings"
+    if isinstance(embeddings_cfg, dict):
+        embeddings_field = embeddings_cfg.get("embeddings_field") or "embeddings"
+    repair_undeclared_sample_fields(
+        dataset, preferred_fields=[embeddings_field]
+    )
+
     tator_eids = set(loc_index.keys())
     include_classes = set(config.get("include_classes") or [])
 
@@ -4491,6 +4600,27 @@ def run_dimreduce_job(
                 pass
 
 
+def _embeddings_coverage(
+    dataset: fo.Dataset, embeddings_field: str, sample_count: int
+) -> tuple[int, bool]:
+    """
+    Return ``(existing_embeddings_count, embeddings_up_to_date)`` for a field.
+
+    ``embeddings_up_to_date`` is True only when every current sample has the field
+    set (not just at least one), unlike the ``exists().count() > 0`` checks used
+    elsewhere to decide whether embeddings have ever been computed at all.
+    """
+    existing_embeddings_count = (
+        dataset.exists(embeddings_field).count()
+        if dataset.has_field(embeddings_field)
+        else 0
+    )
+    embeddings_up_to_date = (
+        sample_count > 0 and existing_embeddings_count == sample_count
+    )
+    return existing_embeddings_count, embeddings_up_to_date
+
+
 def sync_project_to_fiftyone(
     project_id: int,
     version_id: int | None,
@@ -4764,39 +4894,65 @@ def sync_project_to_fiftyone(
             }
             try:
                 from src.app.embedding_service import is_embedding_service_available
-                from src.app.embeddings_viz import (
-                    compute_embeddings_and_viz,
-                    has_embeddings,
-                )
+                from src.app.embeddings_viz import compute_embeddings_and_viz
 
                 embeddings_field = model_info["embeddings_field"]
-                # When bypass was used (cached JSONL), skip embedding computation if embeddings already exist in MongoDB
-                if use_cached_jsonl and has_embeddings(dataset, embeddings_field):
+                # Detect partial embeddings coverage regardless of whether this run used the
+                # cached-JSONL bypass: `has_embeddings`/`compute_embeddings_and_viz`'s own cache
+                # check only look at whether *any* sample has embeddings, not whether *every*
+                # sample does. Without this, a dataset left with partial embeddings (e.g. after
+                # manually clearing some samples' embeddings, or gaining new samples since
+                # embeddings were last computed) would silently stay partial forever on every
+                # subsequent sync, on both bypass and non-bypass runs.
+                existing_embeddings_count, embeddings_up_to_date = _embeddings_coverage(
+                    dataset, embeddings_field, sample_count
+                )
+                if existing_embeddings_count and not embeddings_up_to_date:
                     logger.info(
-                        f"Bypass used and embeddings already exist in dataset '{embeddings_field}'; "
-                        "skipping embedding computation"
+                        f"Embeddings count ({existing_embeddings_count}) does not match "
+                        f"sample count ({sample_count}) in '{embeddings_field}'; "
+                        f"computing embeddings for the {sample_count - existing_embeddings_count} "
+                        "missing samples"
+                    )
+
+                if use_cached_jsonl and embeddings_up_to_date:
+                    logger.info(
+                        f"Bypass used and embeddings already exist in dataset '{embeddings_field}' "
+                        f"for all {sample_count} samples; skipping embedding computation"
                     )
                 elif not is_embedding_service_available():
                     logger.info(
                         "Embedding service unavailable; skipping embeddings/UMAP (dataset still available)"
                     )
                 else:
+                    from src.app.embeddings_viz import DEFAULT_EMBEDDING_CONCURRENCY
+
                     batch_size = embeddings_config.get("batch_size", 32)
+                    concurrency = int(
+                        embeddings_config.get("concurrency", DEFAULT_EMBEDDING_CONCURRENCY)
+                    )
                     logger.info(
-                        f"Computing embeddings with batch size {batch_size}, UMAP, and similarity for dataset '{dataset_name}'..."
+                        f"Computing embeddings with batch size {batch_size}, concurrency {concurrency}, "
+                        f"UMAP, and similarity for dataset '{dataset_name}'..."
+                    )
+                    # Only honor an explicit force_embeddings from config here.
+                    # compute_embeddings_and_viz now fills in missing embeddings
+                    # incrementally (skip_existing), so incomplete coverage no longer
+                    # requires re-embedding the whole dataset.
+                    force_embeddings = bool(
+                        embeddings_config.get("force_embeddings", False)
                     )
                     compute_embeddings_and_viz(
                         dataset,
                         model_info,
                         umap_seed=int(embeddings_config.get("umap_seed", 51)),
-                        force_embeddings=bool(
-                            embeddings_config.get("force_embeddings", False)
-                        ),
+                        force_embeddings=force_embeddings,
                         force_umap=bool(embeddings_config.get("force_umap", False)),
                         batch_size=batch_size,
                         project_name=vss_project,
                         service_url=embeddings_config.get("service_url")
                         or os.environ.get("FASTVSS_API_URL"),
+                        concurrency=concurrency,
                     )
                     logger.info(
                         f"Embeddings, UMAP, and similarity completed for dataset '{dataset_name}'"
