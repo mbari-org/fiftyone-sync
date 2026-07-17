@@ -9,6 +9,7 @@ Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping u
 from __future__ import annotations
 
 from collections import defaultdict
+import ast
 import glob
 import json
 import logging
@@ -2981,6 +2982,106 @@ def _create_sample_from_loc(
     return sample
 
 
+# FiftyOne/mongoengine: "The fields "{'embeddings'}" do not exist on the document "samples.<id>""
+_FIELD_DOES_NOT_EXIST_RE = re.compile(
+    r'The fields "(?P<fields>\{.*?\})" do not exist on the document'
+)
+
+
+def _parse_undeclared_fields_from_error(exc: BaseException) -> set[str]:
+    """Extract undeclared field names from a mongoengine FieldDoesNotExist message."""
+    match = _FIELD_DOES_NOT_EXIST_RE.search(str(exc))
+    if not match:
+        return set()
+    try:
+        parsed = ast.literal_eval(match.group("fields"))
+    except (ValueError, SyntaxError):
+        return set()
+    if isinstance(parsed, (set, frozenset, list, tuple)):
+        return {str(name) for name in parsed}
+    return set()
+
+
+def _schema_sample_db_keys(dataset: fo.Dataset) -> set[str]:
+    """MongoDB top-level keys that belong to the dataset sample schema."""
+    keys: set[str] = {"_id", "_cls"}
+    for name, field in dataset.get_field_schema(include_private=True).items():
+        keys.add(name)
+        db_field = getattr(field, "db_field", None)
+        if db_field:
+            keys.add(db_field)
+    return keys
+
+
+def _find_undeclared_sample_fields(
+    dataset: fo.Dataset, *, sample_limit: int = 100
+) -> set[str]:
+    """Return top-level sample keys present in MongoDB but absent from the schema."""
+    allowed = _schema_sample_db_keys(dataset)
+    undeclared: set[str] = set()
+    for doc in dataset._sample_collection.find({}).limit(sample_limit):
+        for key in doc:
+            if key not in allowed:
+                undeclared.add(key)
+    return undeclared
+
+
+def _purge_undeclared_sample_fields(
+    dataset: fo.Dataset, field_names: list[str] | set[str]
+) -> list[str]:
+    """Unset the given fields from all sample documents and reload the dataset."""
+    fields = sorted({str(name) for name in field_names if name})
+    if not fields:
+        return []
+    logger.warning(
+        "Purging undeclared sample field(s) %s so samples can load "
+        "(schema/document mismatch — often after manually deleting embeddings "
+        "without dataset.delete_sample_field)",
+        fields,
+    )
+    # Works even when the field is already gone from the schema (unlike delete_sample_field).
+    dataset._sample_doc_cls._delete_fields_simple(fields)
+    fo.Sample._purge_fields(dataset._sample_collection_name, fields)
+    dataset.reload()
+    return fields
+
+
+def repair_undeclared_sample_fields(
+    dataset: fo.Dataset,
+    *,
+    preferred_fields: list[str] | None = None,
+) -> list[str]:
+    """
+    Fix sample docs that still contain fields removed from the dataset schema.
+
+    After an incomplete embeddings delete (schema cleared, values left on documents),
+    FiftyOne fails on ``iter_samples()`` / ``sample.save()`` with FieldDoesNotExist
+    for ``embeddings``. This purges orphaned top-level fields so reconcile can proceed;
+    embeddings can then be recomputed normally.
+    """
+    preferred = list(preferred_fields or [])
+    # Fast path: if preferred fields are absent from schema but still on docs, purge them.
+    to_check = [f for f in preferred if f and not dataset.has_field(f)]
+    if to_check:
+        coll = dataset._sample_collection
+        present = [
+            f for f in to_check if coll.find_one({f: {"$exists": True}}, {"_id": 1})
+        ]
+        if present:
+            return _purge_undeclared_sample_fields(dataset, present)
+
+    # Probe full sample load (values()/aggregations can succeed while iter_samples fails).
+    try:
+        next(dataset.iter_samples(autosave=False), None)
+        return []
+    except Exception as exc:
+        from_error = _parse_undeclared_fields_from_error(exc)
+        if not from_error:
+            raise
+        undeclared = _find_undeclared_sample_fields(dataset) | from_error
+        return _purge_undeclared_sample_fields(dataset, undeclared)
+
+
 def reconcile_dataset_with_tator(
     dataset: fo.Dataset,
     loc_index: dict[str, dict],
@@ -2995,6 +3096,14 @@ def reconcile_dataset_with_tator(
     - Update samples whose modified_datetime changed (crop file already overwritten)
     - Add samples for new elemental_ids in Tator
     """
+    embeddings_cfg = config.get("embeddings") if isinstance(config, dict) else None
+    embeddings_field = "embeddings"
+    if isinstance(embeddings_cfg, dict):
+        embeddings_field = embeddings_cfg.get("embeddings_field") or "embeddings"
+    repair_undeclared_sample_fields(
+        dataset, preferred_fields=[embeddings_field]
+    )
+
     tator_eids = set(loc_index.keys())
     include_classes = set(config.get("include_classes") or [])
 

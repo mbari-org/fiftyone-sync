@@ -327,6 +327,16 @@ pip install umap-learn
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
+To clear embeddings before a recompute, delete the field through FiftyOne so both the schema and sample documents are updated:
+
+```python
+import fiftyone as fo
+dataset = fo.load_dataset("your_dataset_name")
+dataset.delete_sample_field("embeddings")  # also clears brain keys that use it if needed
+```
+
+If embeddings were removed only from the schema (or cleared incompletely in MongoDB), sync may hit `FieldDoesNotExist: The fields "{'embeddings'}" do not exist on the document ...` during reconcile. Reconcile now detects that mismatch and purges the orphaned field data automatically so the sync can continue and recompute embeddings.
+
 ### Data layout
 
 - Media: `/tmp/fiftyone_sync_project_{id}/download/{media_id}_{name}.jpg`
