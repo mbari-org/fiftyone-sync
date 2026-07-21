@@ -1094,6 +1094,78 @@ async def delete_dataset(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app_launch.post("/rename-dataset")
+async def rename_dataset(
+    project_id: int = Query(..., description="Tator project ID"),
+    version_id: int = Query(..., description="Tator version ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    port: int = Query(..., description="Port for this project"),
+    new_name: str = Query(
+        ...,
+        min_length=1,
+        max_length=60,
+        description="New dataset name (sanitized to safe characters; max 60 characters)",
+    ),
+    section_id: int | None = Query(
+        None, description="Optional Tator media section ID (matches section-scoped datasets)"
+    ),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> dict:
+    """
+    Rename the FiftyOne dataset for a specific version/port/section, e.g. to replace
+    the default traceability-oriented name (project_v{version}[_s{section}]_{port})
+    with a more descriptive one. `new_name` is sanitized and truncated to 60 characters.
+    Requires authentication. Returns
+    {"status": "ok", "old_name": str | None, "new_name": str | None, "database_name": str}.
+    """
+    token = _token_from_authorization(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid Authorization header"
+        )
+    project_name: str | None = None
+    try:
+        import tator
+
+        api = tator.get_api(_resolve_api_url(api_url), token)
+        proj = api.get_project(project_id)
+        project_name = getattr(proj, "name", None) or str(project_id)
+    except Exception as e:
+        logger.warning(f"rename_dataset get_project({project_id}) failed: {e}")
+    if not project_name or not project_name.strip():
+        project_name = str(project_id)
+    project_name = project_name.strip()
+
+    database_entry = get_database_entry_or_enterprise_default(
+        project_id, port, project_name=project_name
+    )
+    if database_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No DatabaseUriConfig entry for project_id={project_id}",
+        )
+
+    try:
+        from src.app.sync import rename_dataset_for_version
+
+        result = rename_dataset_for_version(
+            project_id=project_id,
+            version_id=version_id,
+            port=database_entry.port,
+            api_url=_resolve_api_url(api_url),
+            token=token,
+            new_name=new_name,
+            project_name=project_name,
+            database_name=database_name_from_uri(database_entry.uri),
+            section_id=section_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/metrics")
 @app.get("/voxel51/metrics")
 async def metrics() -> Response:

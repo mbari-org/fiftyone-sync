@@ -94,6 +94,8 @@ flowchart TD
 
 - **Launcher** (HostedTemplate): `/render` (Open FiftyOne + Sync from Tator), `/launch`, `/sync` + `/sync/status/{job_id}`, `/recompute-crops` (+ status/logs), `/sync-to-tator`, `/versions`. Token entered in applet via **Verify Token**; FiftyOne opens in a new tab (`iframe_host` = app host).
 
+- **Dataset management**: `/datasets` (list), `/dataset-exists`, `/delete-dataset`, `/rename-dataset`. Datasets are named `project_v{version}[_s{section}]_{port}` by default for traceability; `POST /rename-dataset?new_name=...` lets you replace this with a more descriptive name (sanitized to safe characters, max **60** characters).
+
 - **Sync queue (Redis)**: Background worker: `python -m src.app.sync_worker`. Env: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_USE_SSL`, or `REDIS_URL`.
 
 ## Run (Docker)

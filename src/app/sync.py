@@ -3470,6 +3470,7 @@ def _ensure_field_indexes(dataset: fo.Dataset) -> None:
 
 DEFAULT_LABEL_ATTR = "Label"
 DEFAULT_SCORE_ATTR = "score"
+MAX_DATASET_NAME_LENGTH = 60
 
 
 def _sanitize_dataset_name(name: str) -> str:
@@ -3479,6 +3480,18 @@ def _sanitize_dataset_name(name: str) -> str:
     # Replace anything that isn't alphanumeric, underscore, or hyphen with underscore
     s = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(name).strip())
     return re.sub(r"_+", "_", s).strip("_") or "default"
+
+
+def _prepare_new_dataset_name(name: str) -> str:
+    """Sanitize a user-supplied dataset name and enforce MAX_DATASET_NAME_LENGTH.
+
+    Raises ValueError if nothing usable remains after sanitizing/truncating.
+    """
+    sanitized = _sanitize_dataset_name(name)
+    truncated = sanitized[:MAX_DATASET_NAME_LENGTH].rstrip("_-")
+    if not truncated:
+        raise ValueError(f"Invalid dataset name: {name!r}")
+    return truncated
 
 
 def _section_slug(section_id: int | None) -> str:
@@ -5419,6 +5432,105 @@ def delete_dataset_for_version(
         "deleted": target,
         "database_name": resolved_db,
         "jsonl_deleted": jsonl_deleted,
+    }
+
+
+def rename_dataset_for_version(
+    project_id: int,
+    version_id: int,
+    port: int,
+    api_url: str,
+    token: str,
+    new_name: str,
+    project_name: str | None = None,
+    database_uri: str | None = None,
+    database_name: str | None = None,
+    section_id: int | None = None,
+) -> dict[str, Any]:
+    """Rename the FiftyOne dataset (MongoDB) for a specific version/port/section.
+
+    `new_name` is sanitized to safe FiftyOne/MongoDB characters and truncated to
+    MAX_DATASET_NAME_LENGTH (60) characters. This lets teams replace the default
+    traceability-oriented name (e.g. "901221-MidwaterTimeSeries_v82_s477_5151")
+    with a more descriptive one while keeping it short enough to browse easily.
+
+    Returns {"status": "ok", "old_name": str | None, "new_name": str | None,
+    "database_name": str}.
+    """
+    cleaned_name = _prepare_new_dataset_name(new_name)
+
+    resolved_db = (
+        database_name.strip() if database_name and database_name.strip() else None
+    ) or get_database_name(project_id, port, project_name=project_name)
+    resolved_uri = (
+        database_uri.strip() if database_uri and database_uri.strip() else None
+    ) or get_database_uri(project_id, port, project_name=project_name)
+
+    if not get_is_enterprise():
+        fo.config.database_uri = resolved_uri
+        fo.config.database_name = resolved_db
+        os.environ["FIFTYONE_DATABASE_URI"] = fo.config.database_uri
+        os.environ["FIFTYONE_DATABASE_NAME"] = fo.config.database_name
+
+    try:
+        if get_is_enterprise():
+            _test_fiftyone_connection()
+        else:
+            _test_mongodb_connection(resolved_uri)
+    except ConnectionError as exc:
+        raise RuntimeError(f"Connection check failed: {exc}") from exc
+
+    host = api_url.rstrip("/")
+    api = tator.get_api(host, token)
+    ds_name = _default_dataset_name(
+        api, project_id, version_id, section_id=section_id
+    )
+    ds_name_with_port = _dataset_name_with_port(ds_name, port)
+
+    project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
+
+    available = fo.list_datasets()
+    target = _find_dataset_match(
+        available,
+        ds_name=ds_name,
+        ds_name_with_port=ds_name_with_port,
+        project_prefix=project_prefix,
+        version_id=version_id,
+        port=port,
+        section_id=section_id,
+    )
+    if target is None:
+        return {
+            "status": "ok",
+            "old_name": None,
+            "new_name": None,
+            "database_name": resolved_db,
+            "message": f"No dataset found for version {version_id} (looked for '{ds_name_with_port}')",
+        }
+
+    if cleaned_name == target:
+        return {
+            "status": "ok",
+            "old_name": target,
+            "new_name": target,
+            "database_name": resolved_db,
+            "message": "New name is identical to the current name; no change made.",
+        }
+
+    if cleaned_name in available:
+        raise ValueError(f"A dataset named '{cleaned_name}' already exists")
+
+    dataset = fo.load_dataset(target)
+    dataset.name = cleaned_name
+    logger.info(
+        f"Renamed dataset '{target}' -> '{cleaned_name}' in database {resolved_db}"
+    )
+
+    return {
+        "status": "ok",
+        "old_name": target,
+        "new_name": cleaned_name,
+        "database_name": resolved_db,
     }
 
 
