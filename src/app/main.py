@@ -385,6 +385,21 @@ def _token_from_authorization(authorization: str | None) -> str | None:
     return s
 
 
+def _resolve_token(authorization: str | None, token: str | None = None) -> str | None:
+    """Resolve a Tator API token from either an explicit `token` query parameter
+    or the `Authorization` header (`Token <token>` / `Bearer <token>`).
+
+    Some endpoints in this service (`/sync`, `/sync-to-tator`, `/recompute-crops`,
+    `/dimreduce`) accept the token as a `token` query parameter, while the
+    dataset-management endpoints historically required the `Authorization`
+    header. Accepting either here means a token that already works against one
+    convention (or directly against the Tator REST API) works here too.
+    """
+    if token and token.strip():
+        return token.strip()
+    return _token_from_authorization(authorization)
+
+
 @app_launch.get("/versions")
 async def get_versions(
     project_id: int = Query(..., description="Tator project ID"),
@@ -937,10 +952,13 @@ async def dataset_exists(
     section_id: int | None = Query(
         None, description="Optional Tator media section ID (matches section-scoped datasets)"
     ),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """Check whether a FiftyOne dataset exists for a specific version/port/section."""
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
@@ -987,10 +1005,13 @@ async def datasets(
     project_id: int = Query(..., description="Tator project ID"),
     api_url: str = Query(..., description="Tator REST API base URL"),
     port: int = Query(..., description="Port for this project"),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """List available FiftyOne datasets for the selected project DB context."""
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
@@ -1043,13 +1064,16 @@ async def delete_dataset(
     section_id: int | None = Query(
         None, description="Optional Tator media section ID (matches section-scoped datasets)"
     ),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """
     Delete the FiftyOne dataset for a specific version/port/section. Requires authentication.
     Returns {"status": "ok", "deleted": str | None, "database_name": str}.
     """
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
@@ -1109,16 +1133,20 @@ async def rename_dataset(
     section_id: int | None = Query(
         None, description="Optional Tator media section ID (matches section-scoped datasets)"
     ),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """
     Rename the FiftyOne dataset for a specific version/port/section, e.g. to replace
     the default traceability-oriented name (project_v{version}[_s{section}]_{port})
     with a more descriptive one. `new_name` is sanitized and truncated to 60 characters.
-    Requires authentication. Returns
-    {"status": "ok", "old_name": str | None, "new_name": str | None, "database_name": str}.
+    Requires authentication (Authorization header or `token` query parameter).
+    Returns {"status": "ok", "old_name": str | None, "new_name": str | None,
+    "database_name": str}.
     """
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
