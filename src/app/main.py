@@ -188,7 +188,7 @@ async def post_embed(
             detail="Embedding service unavailable: FASTVSS_API_URL is not set",
         )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(f"{FASTVSS_BASE_URL}/projects")
             resp.raise_for_status()
     except Exception as e:
@@ -226,7 +226,7 @@ async def get_vss_embedding() -> dict:
             detail="FASTVSS_API_URL is not set",
         )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(f"{FASTVSS_BASE_URL}/projects")
             resp.raise_for_status()
             return resp.json()

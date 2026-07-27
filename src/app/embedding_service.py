@@ -42,7 +42,7 @@ def is_embedding_service_available() -> bool:
     if not FASTVSS_BASE_URL:
         return False
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=30.0) as client:
             resp = client.get(f"{FASTVSS_BASE_URL}/projects")
             resp.raise_for_status()
             return True
