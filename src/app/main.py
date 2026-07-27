@@ -188,7 +188,7 @@ async def post_embed(
             detail="Embedding service unavailable: FASTVSS_API_URL is not set",
         )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(f"{FASTVSS_BASE_URL}/projects")
             resp.raise_for_status()
     except Exception as e:
@@ -226,7 +226,7 @@ async def get_vss_embedding() -> dict:
             detail="FASTVSS_API_URL is not set",
         )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(f"{FASTVSS_BASE_URL}/projects")
             resp.raise_for_status()
             return resp.json()
@@ -383,6 +383,21 @@ def _token_from_authorization(authorization: str | None) -> str | None:
     if s.lower().startswith("bearer "):
         return s[7:].strip()
     return s
+
+
+def _resolve_token(authorization: str | None, token: str | None = None) -> str | None:
+    """Resolve a Tator API token from either an explicit `token` query parameter
+    or the `Authorization` header (`Token <token>` / `Bearer <token>`).
+
+    Some endpoints in this service (`/sync`, `/sync-to-tator`, `/recompute-crops`,
+    `/dimreduce`) accept the token as a `token` query parameter, while the
+    dataset-management endpoints historically required the `Authorization`
+    header. Accepting either here means a token that already works against one
+    convention (or directly against the Tator REST API) works here too.
+    """
+    if token and token.strip():
+        return token.strip()
+    return _token_from_authorization(authorization)
 
 
 @app_launch.get("/versions")
@@ -937,10 +952,13 @@ async def dataset_exists(
     section_id: int | None = Query(
         None, description="Optional Tator media section ID (matches section-scoped datasets)"
     ),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """Check whether a FiftyOne dataset exists for a specific version/port/section."""
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
@@ -987,10 +1005,13 @@ async def datasets(
     project_id: int = Query(..., description="Tator project ID"),
     api_url: str = Query(..., description="Tator REST API base URL"),
     port: int = Query(..., description="Port for this project"),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """List available FiftyOne datasets for the selected project DB context."""
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
@@ -1043,13 +1064,16 @@ async def delete_dataset(
     section_id: int | None = Query(
         None, description="Optional Tator media section ID (matches section-scoped datasets)"
     ),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """
     Delete the FiftyOne dataset for a specific version/port/section. Requires authentication.
     Returns {"status": "ok", "deleted": str | None, "database_name": str}.
     """
-    token = _token_from_authorization(authorization)
+    token = _resolve_token(authorization, token)
     if not token:
         raise HTTPException(
             status_code=401, detail="Missing or invalid Authorization header"
@@ -1090,6 +1114,82 @@ async def delete_dataset(
             section_id=section_id,
         )
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app_launch.post("/rename-dataset")
+async def rename_dataset(
+    project_id: int = Query(..., description="Tator project ID"),
+    version_id: int = Query(..., description="Tator version ID"),
+    api_url: str = Query(..., description="Tator REST API base URL"),
+    port: int = Query(..., description="Port for this project"),
+    new_name: str = Query(
+        ...,
+        min_length=1,
+        max_length=60,
+        description="New dataset name (sanitized to safe characters; max 60 characters)",
+    ),
+    section_id: int | None = Query(
+        None, description="Optional Tator media section ID (matches section-scoped datasets)"
+    ),
+    token: str | None = Query(
+        None, description="Tator API token (alternative to Authorization header)"
+    ),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> dict:
+    """
+    Rename the FiftyOne dataset for a specific version/port/section, e.g. to replace
+    the default traceability-oriented name (project_v{version}[_s{section}]_{port})
+    with a more descriptive one. `new_name` is sanitized and truncated to 60 characters.
+    Requires authentication (Authorization header or `token` query parameter).
+    Returns {"status": "ok", "old_name": str | None, "new_name": str | None,
+    "database_name": str}.
+    """
+    token = _resolve_token(authorization, token)
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid Authorization header"
+        )
+    project_name: str | None = None
+    try:
+        import tator
+
+        api = tator.get_api(_resolve_api_url(api_url), token)
+        proj = api.get_project(project_id)
+        project_name = getattr(proj, "name", None) or str(project_id)
+    except Exception as e:
+        logger.warning(f"rename_dataset get_project({project_id}) failed: {e}")
+    if not project_name or not project_name.strip():
+        project_name = str(project_id)
+    project_name = project_name.strip()
+
+    database_entry = get_database_entry_or_enterprise_default(
+        project_id, port, project_name=project_name
+    )
+    if database_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No DatabaseUriConfig entry for project_id={project_id}",
+        )
+
+    try:
+        from src.app.sync import rename_dataset_for_version
+
+        result = rename_dataset_for_version(
+            project_id=project_id,
+            version_id=version_id,
+            port=database_entry.port,
+            api_url=_resolve_api_url(api_url),
+            token=token,
+            new_name=new_name,
+            project_name=project_name,
+            database_name=database_name_from_uri(database_entry.uri),
+            section_id=section_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
