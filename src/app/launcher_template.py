@@ -118,6 +118,9 @@ LAUNCHER_TEMPLATE = r"""
               <label class="force-sync-option" title="Re-fetch media and localizations from Tator instead of using cached data when available.">
                 <input type="checkbox" id="force-sync-checkbox" name="force_sync" value="1"> Force sync
               </label>
+              <label class="force-sync-option" title="Only include localizations whose verified attribute is set to true in the built dataset.">
+                <input type="checkbox" id="verified-only-checkbox" name="verified_only" value="1"> Verified only
+              </label>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
             </div>
@@ -706,6 +709,10 @@ LAUNCHER_TEMPLATE = r"""
             params.set('force_sync', 'true');
             params.set('force_embeddings', 'true');
             params.set('force_umap', 'true');
+          }
+          var verifiedOnlyEl = document.getElementById('verified-only-checkbox');
+          if (verifiedOnlyEl && verifiedOnlyEl.checked) {
+            params.set('verified_only', 'true');
           }
           if (isEnterprise) {
             var s3BucketEl = document.getElementById('s3-bucket-input');
