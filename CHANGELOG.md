@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-07-27)
+
+### Features
+
+- **app**: Add dataset rename support with flexible token auth (#28)
+  ([#28](https://github.com/mbari-org/fiftyone-sync/pull/28),
+  [`08ccb6a`](https://github.com/mbari-org/fiftyone-sync/commit/08ccb6abf121f7303d3e5882489702d0c26f973d))
+
+
 ## v0.9.2 (2026-07-17)
 
 ### Bug Fixes
