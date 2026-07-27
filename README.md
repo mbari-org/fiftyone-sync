@@ -416,3 +416,16 @@ curl -X POST http://localhost:8000/embed \
 curl http://localhost:8000/embed/{uuid}
 # Returns: {"status": "completed", "embeddings": [[...], [...]]}
 ```
+
+## Scripts
+
+One-off utility scripts in `scripts/` for direct MongoDB/FiftyOne Enterprise access (outside the sync service).
+
+- `scripts/set_verified.py` — Sets `verified=True` on every sample in specific FiftyOne Enterprise datasets. Requires `FIFTYONE_API_KEY`.
+- `scripts/export_dataset_csv.py` — Exports a FiftyOne dataset to CSV (metadata only; no images, no embeddings).
+  - `--verified-only` — Exclude samples that are not marked `verified=True` (samples missing the `verified` field are treated as unverified).
+
+  ```bash
+  python scripts/export_dataset_csv.py -o ~/Desktop/export.csv
+  python scripts/export_dataset_csv.py --verified-only -o ~/Desktop/export_verified.csv
+  ```
