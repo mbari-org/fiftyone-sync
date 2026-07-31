@@ -357,10 +357,14 @@ If embeddings were removed only from the schema (or cleared incompletely in Mong
 - Crops: `/tmp/fiftyone_sync_project_{id}/crops/{media_stem}/{elemental_id}.png`
 
 Image media are downloaded and cropped **concurrently** (thread pool); video
-media are still downloaded and cropped **one at a time** so large source videos
-do not accumulate on local disk. Existing non-empty crop files are reused even
-when the crop manifest is missing or stale; localizations are recropped when
-their recorded modification time changes.
+media are still downloaded and cropped **one at a time**. Either way, each
+downloaded source file (image or video) is deleted immediately after its own
+crop completes, so downloaded media never accumulates beyond
+`MEDIA_DOWNLOAD_WORKERS` files (images) or 1 file (videos) at a time on local
+disk — FiftyOne samples are always built from the crops directory, never from
+the raw downloaded file. Existing non-empty crop files are reused even when the
+crop manifest is missing or stale; localizations are recropped when their
+recorded modification time changes.
 
 Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 

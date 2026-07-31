@@ -1712,6 +1712,22 @@ def _media_locs_already_cropped(
     return True
 
 
+def _cleanup_downloaded_image(download_dir: str, media_id: int, media_name: str) -> None:
+    """Remove a single downloaded image file to reclaim space as soon as its crop is done.
+
+    Mirrors _cleanup_downloaded_videos but scoped to one media's file, since images
+    are downloaded/cropped concurrently (many at once) rather than one at a time.
+    """
+    if not download_dir or not media_name:
+        return
+    path = os.path.join(download_dir, f"{media_id}_{media_name}")
+    try:
+        if os.path.isfile(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
 def _download_and_crop_one_media(
     api: Any,
     project_id: int,
@@ -1723,7 +1739,8 @@ def _download_and_crop_one_media(
     dl_dir: str,
     size: int,
 ) -> tuple[int, Any | None, int, int]:
-    """Download (if resolved) and crop a single media's localizations.
+    """Download (if resolved), crop, and immediately delete a single media's
+    downloaded file to reclaim disk space.
 
     Runs on a worker thread from the image download pool in
     _download_and_crop_media_sequentially. Returns (mid, media_obj, num_ok, num_fail).
@@ -1738,6 +1755,14 @@ def _download_and_crop_one_media(
         locs_to_crop=locs_for_media,
         media_objects=[media_obj] if media_obj is not None else [],
     )
+    if media_obj is not None:
+        # Delete now (mirroring the video path below) so at most
+        # MEDIA_DOWNLOAD_WORKERS downloaded images occupy local disk at once,
+        # instead of every image accumulating until the whole-sync cleanup.
+        # FiftyOne samples are always built from crops_dir, never from this
+        # raw downloaded file, so it's safe to remove as soon as its crop(s)
+        # are written.
+        _cleanup_downloaded_image(dl_dir, mid, getattr(media_obj, "name", "") or "")
     return mid, media_obj, ok, fail
 
 
@@ -1760,10 +1785,13 @@ def _download_and_crop_media_sequentially(
     Videos are excluded from the concurrent pool because large videos (several
     GB each) sitting on local disk simultaneously would blow out disk usage;
     interleaving download/crop/delete per video keeps at most one video file
-    on local disk at a time. Images have no such disk-usage concern, and for
-    image-heavy projects the per-media network round-trip (one HTTP download
-    per media) -- not crop CPU work -- is the actual bottleneck, so images are
-    fanned out across a thread pool instead of processed one at a time.
+    on local disk at a time. For image-heavy projects the per-media network
+    round-trip (one HTTP download per media) -- not crop CPU work -- is the
+    actual bottleneck, so images are fanned out across a thread pool instead
+    of processed one at a time; each image is still deleted immediately after
+    its own crop completes (mirroring the video cleanup), so at most
+    MEDIA_DOWNLOAD_WORKERS downloaded images occupy local disk at once instead
+    of every image accumulating until the whole-sync cleanup.
 
     Returns (download_dir, processed_media_objects, num_cropped, num_failed).
     """
@@ -1864,9 +1892,8 @@ def _download_and_crop_media_sequentially(
             num_fail += fail
             processed_media.append(media_obj)
             # Delete the video immediately so at most one large video occupies
-            # local disk at a time; images are left in place (existing behavior)
-            # until the final download-dir cleanup, since they're small and some
-            # sample types reference the downloaded image directly.
+            # local disk at a time. Images are cleaned up the same way, right
+            # after their own crop completes (see _download_and_crop_one_media).
             _cleanup_downloaded_videos(dl_dir)
 
     return dl_dir, processed_media, num_ok, num_fail
