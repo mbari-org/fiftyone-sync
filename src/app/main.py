@@ -564,6 +564,10 @@ async def sync(
     s3_prefix: str | None = Query(
         None, description="Optional S3 prefix (folder) for crop image upload"
     ),
+    verified_only: bool = Query(
+        False,
+        description="Only include localizations whose `verified` attribute is truthy in the built dataset",
+    ),
 ) -> dict:
     """
     Trigger sync: enqueues a job to fetch Tator media + localizations, build FiftyOne dataset, launch App.
@@ -628,6 +632,7 @@ async def sync(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            verified_only=verified_only,
         )
         return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:

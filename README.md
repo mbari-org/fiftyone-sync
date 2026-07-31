@@ -278,6 +278,8 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `version_id` | no | Version ID filter for localizations |
 | `section_id` | no | Tator media section ID; ANDed with `query` when both set |
 | `query` | no | Tator `encoded_search` filter (base64 Object_Search); ANDed with `section_id` when both set |
+| `localization_type_id` | no | Restrict sync to a single Tator box (localization) type |
+| `verified_only` | no | Only include localizations whose `verified` attribute is truthy in the built dataset (default: false). Exposed as the **Verified only** checkbox in the launcher applet. On subsequent syncs, samples that later become unverified are removed from the dataset (they are re-added automatically if re-verified). |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
@@ -296,6 +298,8 @@ include_classes: [Larvacean, Copepod]   # optional: filter labels
 image_extensions: ["*.png", "*.jpg"]
 max_samples: 500                         # optional: limit for testing
 ```
+
+`verified_only` is set from the `verified_only` query param (or the applet's **Verified only** checkbox), not from this config file.
 
 The FiftyOne dataset name is always `project_name_v{version_id}_{port}` and cannot be set in config.
 
@@ -416,3 +420,16 @@ curl -X POST http://localhost:8000/embed \
 curl http://localhost:8000/embed/{uuid}
 # Returns: {"status": "completed", "embeddings": [[...], [...]]}
 ```
+
+## Scripts
+
+One-off utility scripts in `scripts/` for direct MongoDB/FiftyOne Enterprise access (outside the sync service).
+
+- `scripts/set_verified.py` — Sets `verified=True` on every sample in specific FiftyOne Enterprise datasets. Requires `FIFTYONE_API_KEY`.
+- `scripts/export_dataset_csv.py` — Exports a FiftyOne dataset to CSV (metadata only; no images, no embeddings).
+  - `--verified-only` — Exclude samples that are not marked `verified=True` (samples missing the `verified` field are treated as unverified).
+
+  ```bash
+  python scripts/export_dataset_csv.py -o ~/Desktop/export.csv
+  python scripts/export_dataset_csv.py --verified-only -o ~/Desktop/export_verified.csv
+  ```

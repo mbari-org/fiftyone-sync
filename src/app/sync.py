@@ -2951,6 +2951,7 @@ def _create_sample_from_loc(
     s3_bucket: str | None = None,
     s3_prefix: str | None = None,
     media_attributes_map: dict[int, dict[str, Any]] | None = None,
+    verified_only: bool = False,
 ) -> fo.Sample | None:
     """Create a FiftyOne sample from a localization (for reconcile add-new)."""
     elemental_id = loc.get("elemental_id") or loc.get("id")
@@ -2959,6 +2960,8 @@ def _create_sample_from_loc(
     elemental_id = str(elemental_id)
     label = _get_label_from_loc(loc)
     if include_classes and label not in include_classes:
+        return None
+    if verified_only and not _loc_is_verified(loc):
         return None
     filepath = _crop_filepath_for_sample(
         media_stem, elemental_id, crops_dir, s3_bucket=s3_bucket, s3_prefix=s3_prefix
@@ -3093,6 +3096,7 @@ def reconcile_dataset_with_tator(
     """
     Reconcile existing dataset with current Tator localizations:
     - Remove samples whose elemental_id was deleted in Tator
+    - Remove samples that are no longer verified, when config["verified_only"] is set
     - Update samples whose modified_datetime changed (crop file already overwritten)
     - Add samples for new elemental_ids in Tator
     """
@@ -3106,6 +3110,7 @@ def reconcile_dataset_with_tator(
 
     tator_eids = set(loc_index.keys())
     include_classes = set(config.get("include_classes") or [])
+    verified_only = bool(config.get("verified_only"))
 
     # Optimize media_id_to_stem creation - compute once and reuse
     media_id_to_stem = None
@@ -3114,19 +3119,28 @@ def reconcile_dataset_with_tator(
     if not media_id_to_stem:
         media_id_to_stem = _media_id_to_stem_from_crops(crops_dir)
 
-    # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator)
+    # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator),
+    # and (when verified_only) samples that are still in Tator but no longer verified.
     # values() with a single field returns a flat list; calling it twice and zipping avoids the
     # multi-field return format (which yields one list-per-field, not one tuple-per-sample).
     logger.info("Reconcile: Remove samples deleted in Tator")
     all_sample_ids = dataset.values("id", _enforce_natural_order=False)
     all_eids = dataset.values("elemental_id", _enforce_natural_order=False)
     to_remove: list[str] = []
+    to_remove_unverified: list[str] = []
     dataset_eids: set[str] = set()
     for sample_id, eid in zip(all_sample_ids, all_eids):
         if eid is not None:
             eid_str = str(eid)
             if eid_str in tator_eids:
-                dataset_eids.add(eid_str)
+                if verified_only and not _loc_is_verified(loc_index.get(eid_str)):
+                    # Still exists in Tator but no longer verified; drop from the
+                    # verified_only dataset. Not added to dataset_eids, so step 3
+                    # ("add new") will consider re-adding it, but _create_sample_from_loc
+                    # will skip it again since it remains unverified.
+                    to_remove_unverified.append(sample_id)
+                else:
+                    dataset_eids.add(eid_str)
             elif tator_eids:
                 to_remove.append(sample_id)
 
@@ -3140,6 +3154,13 @@ def reconcile_dataset_with_tator(
     else:
         logger.info(
             "Reconcile: 0 localizations from Tator; skipping delete step (keeping existing samples)"
+        )
+
+    if to_remove_unverified:
+        dataset.delete_samples(to_remove_unverified)
+        logger.info(
+            f"Reconcile: removed {len(to_remove_unverified)} samples "
+            "(no longer verified; verified_only enabled)"
         )
 
     # 2. Update samples with changed modified_datetime (crop already overwritten by crop_localizations_parallel)
@@ -3272,6 +3293,7 @@ def reconcile_dataset_with_tator(
                 s3_bucket=s3_bucket,
                 s3_prefix=s3_prefix,
                 media_attributes_map=media_attributes_map,
+                verified_only=verified_only,
             )
 
             if sample:
@@ -3302,6 +3324,18 @@ def _get_label_from_loc(loc: dict) -> str:
     return "Unknown"
 
 
+def _loc_is_verified(loc: dict | None) -> bool:
+    """True if the localization's `verified` attribute is truthy.
+
+    Missing localizations or a missing/False/None `verified` attribute are
+    treated as unverified (used by the verified_only sync/UI filter).
+    """
+    if not loc:
+        return False
+    attrs = loc.get("attributes") or {}
+    return bool(attrs.get("verified"))
+
+
 def build_fiftyone_dataset_from_crops(
     crops_dir: str,
     localizations_jsonl_path: str,
@@ -3317,6 +3351,8 @@ def build_fiftyone_dataset_from_crops(
 
     Config keys (optional):
         include_classes: list of labels to include (None = all)
+        verified_only: bool; when True, only include localizations whose
+            `verified` attribute is truthy (missing/False/no-loc = excluded)
         image_extensions: glob patterns (default: ["*.png", "*.jpg", ...])
         max_samples: max samples to load (None = no limit)
 
@@ -3324,6 +3360,7 @@ def build_fiftyone_dataset_from_crops(
     """
     config = config or {}
     include_classes = set(config.get("include_classes") or [])
+    verified_only = bool(config.get("verified_only"))
     image_extensions = config.get("image_extensions") or [
         "*.png",
         "*.jpg",
@@ -3361,6 +3398,8 @@ def build_fiftyone_dataset_from_crops(
             label = _get_label_from_loc(loc) if loc else (media_stem or "Unknown")
 
             if include_classes and label not in include_classes:
+                continue
+            if verified_only and not _loc_is_verified(loc):
                 continue
 
             sample_filepath = _crop_filepath_for_sample(
@@ -4278,6 +4317,7 @@ def run_sync_job(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> dict[str, Any]:
     """
     Entrypoint for RQ worker: all args are serializable. Calls sync_project_to_fiftyone.
@@ -4288,7 +4328,7 @@ def run_sync_job(
     logger.info(
         f"run_sync_job received project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
-        f"localization_type_id={localization_type_id}"
+        f"localization_type_id={localization_type_id} verified_only={verified_only}"
     )
 
     job_meta_handler: logging.Handler | None = None
@@ -4321,6 +4361,7 @@ def run_sync_job(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            verified_only=verified_only,
         )
     finally:
         if job_meta_handler is not None:
@@ -4650,6 +4691,7 @@ def sync_project_to_fiftyone(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch Tator media and localizations, build FiftyOne dataset, launch App on given port.
@@ -4675,7 +4717,7 @@ def sync_project_to_fiftyone(
     logger.info(
         f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
-        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'}"
+        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only}"
     )
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
@@ -4810,6 +4852,7 @@ def sync_project_to_fiftyone(
         config["project_id"] = project_id
         config["version_id"] = version_id
         config["force_sync"] = force_sync
+        config["verified_only"] = verified_only
         # In enterprise/production, use S3 URIs for sample filepaths so FiftyOne loads from S3
         if s3_bucket:
             config["s3_bucket"] = s3_bucket
