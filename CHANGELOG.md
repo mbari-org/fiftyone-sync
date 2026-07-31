@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-07-31)
+
+### Features
+
+- Filter verified samples in CSV export (#30)
+  ([#30](https://github.com/mbari-org/fiftyone-sync/pull/30),
+  [`157341c`](https://github.com/mbari-org/fiftyone-sync/commit/157341c42d1d8991c87704cabd5829a49d6740cc))
+
+
 ## v0.10.0 (2026-07-27)
 
 ### Features
