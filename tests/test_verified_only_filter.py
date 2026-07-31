@@ -127,3 +127,120 @@ def test_reconcile_forwards_verified_only_to_create_sample_from_loc(monkeypatch)
     )
 
     assert captured_kwargs.get("verified_only") is True
+
+
+class _FakeSample:
+    """Minimal fo.Sample stand-in for reconcile's remove/update passes."""
+
+    def __init__(self, sample_id, elemental_id):
+        self.id = sample_id
+        self.elemental_id = elemental_id
+
+    def has_field(self, _name):
+        return False
+
+    def __contains__(self, _key):
+        return False
+
+    def save(self):
+        pass
+
+
+class _FakeReconcileDataset:
+    """Minimal fo.Dataset stand-in that tracks delete_samples/add_samples calls."""
+
+    def __init__(self, samples):
+        self._samples = list(samples)
+        self.deleted_ids: list[str] = []
+        self.added: list = []
+
+    def values(self, field, **_kwargs):
+        if field == "id":
+            return [s.id for s in self._samples]
+        if field == "elemental_id":
+            return [s.elemental_id for s in self._samples]
+        return []
+
+    def iter_samples(self, **_kwargs):
+        return list(self._samples)
+
+    def delete_samples(self, ids):
+        self.deleted_ids.extend(ids)
+        self._samples = [s for s in self._samples if s.id not in ids]
+
+    def add_samples(self, samples):
+        self.added.extend(samples)
+
+    def __len__(self):
+        return len(self._samples)
+
+
+def test_reconcile_removes_samples_that_became_unverified(monkeypatch):
+    """
+    A sample still present in Tator (not deleted) but whose `verified` attribute
+    flipped to False must be removed when verified_only is enabled, and must not
+    be re-added by the "add new samples" step (since it's still unverified).
+    """
+    monkeypatch.setattr(sync, "repair_undeclared_sample_fields", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sync, "_media_id_to_stem_from_crops", lambda *_a, **_k: {1: "media1", 2: "media2"}
+    )
+    monkeypatch.setattr(sync, "_apply_loc_to_sample", lambda *a, **k: None)
+
+    keep_sample = _FakeSample("sample-keep", "keep-verified")
+    drop_sample = _FakeSample("sample-drop", "drop-unverified")
+    dataset = _FakeReconcileDataset([keep_sample, drop_sample])
+
+    loc_index = {
+        "keep-verified": _make_loc(
+            {"Label": "A", "verified": True}, elemental_id="keep-verified", media=1
+        ),
+        "drop-unverified": _make_loc(
+            {"Label": "B", "verified": False}, elemental_id="drop-unverified", media=2
+        ),
+    }
+
+    sync.reconcile_dataset_with_tator(
+        dataset=dataset,
+        loc_index=loc_index,
+        crops_dir="/tmp/crops",
+        download_dir=None,
+        config={"verified_only": True, "s3_bucket": "test-bucket"},
+        max_samples=None,
+    )
+
+    assert dataset.deleted_ids == ["sample-drop"]
+    assert dataset.added == []
+
+
+def test_reconcile_keeps_unverified_samples_when_verified_only_disabled(monkeypatch):
+    """Default behavior (verified_only=False) must not remove unverified samples."""
+    monkeypatch.setattr(sync, "repair_undeclared_sample_fields", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sync, "_media_id_to_stem_from_crops", lambda *_a, **_k: {1: "media1", 2: "media2"}
+    )
+    monkeypatch.setattr(sync, "_apply_loc_to_sample", lambda *a, **k: None)
+
+    keep_sample = _FakeSample("sample-keep", "keep-verified")
+    unverified_sample = _FakeSample("sample-unverified", "still-unverified")
+    dataset = _FakeReconcileDataset([keep_sample, unverified_sample])
+
+    loc_index = {
+        "keep-verified": _make_loc(
+            {"Label": "A", "verified": True}, elemental_id="keep-verified", media=1
+        ),
+        "still-unverified": _make_loc(
+            {"Label": "B", "verified": False}, elemental_id="still-unverified", media=2
+        ),
+    }
+
+    sync.reconcile_dataset_with_tator(
+        dataset=dataset,
+        loc_index=loc_index,
+        crops_dir="/tmp/crops",
+        download_dir=None,
+        config={},
+        max_samples=None,
+    )
+
+    assert dataset.deleted_ids == []

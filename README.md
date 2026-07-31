@@ -279,7 +279,7 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `section_id` | no | Tator media section ID; ANDed with `query` when both set |
 | `query` | no | Tator `encoded_search` filter (base64 Object_Search); ANDed with `section_id` when both set |
 | `localization_type_id` | no | Restrict sync to a single Tator box (localization) type |
-| `verified_only` | no | Only include localizations whose `verified` attribute is truthy in the built dataset (default: false). Exposed as the **Verified only** checkbox in the launcher applet. |
+| `verified_only` | no | Only include localizations whose `verified` attribute is truthy in the built dataset (default: false). Exposed as the **Verified only** checkbox in the launcher applet. On subsequent syncs, samples that later become unverified are removed from the dataset (they are re-added automatically if re-verified). |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |

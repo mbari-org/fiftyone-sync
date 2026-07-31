@@ -3096,6 +3096,7 @@ def reconcile_dataset_with_tator(
     """
     Reconcile existing dataset with current Tator localizations:
     - Remove samples whose elemental_id was deleted in Tator
+    - Remove samples that are no longer verified, when config["verified_only"] is set
     - Update samples whose modified_datetime changed (crop file already overwritten)
     - Add samples for new elemental_ids in Tator
     """
@@ -3118,19 +3119,28 @@ def reconcile_dataset_with_tator(
     if not media_id_to_stem:
         media_id_to_stem = _media_id_to_stem_from_crops(crops_dir)
 
-    # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator)
+    # 1. Remove samples deleted in Tator (only when we have a non-empty localization set from Tator),
+    # and (when verified_only) samples that are still in Tator but no longer verified.
     # values() with a single field returns a flat list; calling it twice and zipping avoids the
     # multi-field return format (which yields one list-per-field, not one tuple-per-sample).
     logger.info("Reconcile: Remove samples deleted in Tator")
     all_sample_ids = dataset.values("id", _enforce_natural_order=False)
     all_eids = dataset.values("elemental_id", _enforce_natural_order=False)
     to_remove: list[str] = []
+    to_remove_unverified: list[str] = []
     dataset_eids: set[str] = set()
     for sample_id, eid in zip(all_sample_ids, all_eids):
         if eid is not None:
             eid_str = str(eid)
             if eid_str in tator_eids:
-                dataset_eids.add(eid_str)
+                if verified_only and not _loc_is_verified(loc_index.get(eid_str)):
+                    # Still exists in Tator but no longer verified; drop from the
+                    # verified_only dataset. Not added to dataset_eids, so step 3
+                    # ("add new") will consider re-adding it, but _create_sample_from_loc
+                    # will skip it again since it remains unverified.
+                    to_remove_unverified.append(sample_id)
+                else:
+                    dataset_eids.add(eid_str)
             elif tator_eids:
                 to_remove.append(sample_id)
 
@@ -3144,6 +3154,13 @@ def reconcile_dataset_with_tator(
     else:
         logger.info(
             "Reconcile: 0 localizations from Tator; skipping delete step (keeping existing samples)"
+        )
+
+    if to_remove_unverified:
+        dataset.delete_samples(to_remove_unverified)
+        logger.info(
+            f"Reconcile: removed {len(to_remove_unverified)} samples "
+            "(no longer verified; verified_only enabled)"
         )
 
     # 2. Update samples with changed modified_datetime (crop already overwritten by crop_localizations_parallel)
