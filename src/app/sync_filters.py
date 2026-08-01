@@ -36,8 +36,14 @@ def localization_fetch_kwargs(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> dict:
-    """Tator kwargs for localization list/count (version, section, encoded_search, type)."""
+    """Tator kwargs for localization list/count (version, section, encoded_search, type).
+
+    When verified_only is True, adds an `attribute` filter for the localization's
+    own `verified::true` attribute so Tator excludes unverified localizations
+    server-side, instead of downloading everything and filtering client-side.
+    """
     kw: dict = {}
     if version_id is not None:
         kw["version"] = [version_id]
@@ -48,6 +54,8 @@ def localization_fetch_kwargs(
         kw["encoded_search"] = q
     if localization_type_id is not None:
         kw["type"] = [localization_type_id]
+    if verified_only:
+        kw["attribute"] = ["verified::true"]
     return kw
 
 
@@ -55,11 +63,22 @@ def media_fetch_kwargs(
     *,
     version_id: int | None = None,
     section_id: int | None = None,
+    verified_only: bool = False,
 ) -> dict:
-    """Tator kwargs for media list (version via related_attribute, section)."""
+    """Tator kwargs for media list (version via related_attribute, section).
+
+    When verified_only is True, adds `verified::true` to the `related_attribute`
+    filter so Tator only returns media with at least one verified localization,
+    instead of downloading all media and filtering client-side.
+    """
     kw: dict = {}
+    related_attribute: list[str] = []
     if version_id is not None:
-        kw["related_attribute"] = [f"$version::{version_id}"]
+        related_attribute.append(f"$version::{version_id}")
+    if verified_only:
+        related_attribute.append("verified::true")
+    if related_attribute:
+        kw["related_attribute"] = related_attribute
     if section_id is not None:
         kw["section"] = section_id
     return kw

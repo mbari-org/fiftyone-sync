@@ -332,6 +332,7 @@ def _get_localization_count_from_api(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> int | None:
     """
     Return total localization count from Tator API (same batching as fetch_and_save_localizations).
@@ -352,6 +353,7 @@ def _get_localization_count_from_api(
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
+        verified_only=verified_only,
     )
 
     try:
@@ -374,20 +376,26 @@ def fetch_project_media_ids(
     media_ids_filter: list[int] | None = None,
     version_id: int | None = None,
     section_id: int | None = None,
+    verified_only: bool = False,
 ) -> list[int]:
     """
     Fetch all media in the project. Returns list of media ids.
     If media_ids_filter is set, only those media are returned (and must exist in the project).
     If version_id is set, filters media by that version via related_attribute.
     If section_id is set, filters media to that Tator section.
+    If verified_only is set, filters media to those with at least one verified
+    localization (related_attribute=verified::true) so unverified-only media are
+    never fetched or downloaded.
     """
     logger.info(
         f"fetch_project_media_ids: project_id={project_id} filter={media_ids_filter} "
-        f"version_id={version_id} section_id={section_id}"
+        f"version_id={version_id} section_id={section_id} verified_only={verified_only}"
     )
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
-    kwargs = _media_fetch_kwargs(version_id=version_id, section_id=section_id)
+    kwargs = _media_fetch_kwargs(
+        version_id=version_id, section_id=section_id, verified_only=verified_only
+    )
     if media_ids_filter:
         # Chunk filter to avoid "Request Line is too large" from nginx (e.g. 4094 bytes).
         chunk = _MAX_SAFE_MEDIA_ID_BATCH_SIZE
@@ -1299,6 +1307,7 @@ def fetch_and_save_localizations(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> str:
     """
     Fetch all current localizations from Tator and write to a JSONL file.
@@ -1308,6 +1317,8 @@ def fetch_and_save_localizations(
     If media_ids is provided, only localizations for those media are fetched (required when syncing
     a subset of media; avoids empty results when project localizations are scoped to media).
     If localization_type_id is provided, only localizations of that box type are fetched.
+    If verified_only is set, only localizations whose own `verified` attribute is true are
+    fetched (attribute=verified::true), so unverified localizations are never downloaded.
 
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
     414 Request-URI Too Large errors from nginx when the project has many media.
@@ -1353,6 +1364,7 @@ def fetch_and_save_localizations(
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
+        verified_only=verified_only,
     )
 
     try:
@@ -2217,9 +2229,13 @@ def _resolve_localizations_jsonl(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> tuple[str, list[int], bool]:
     """
     Resolve localizations JSONL and media ids for crop work.
+
+    When verified_only is True, media and localization fetches are scoped
+    server-side to verified::true so unverified data is never downloaded.
 
     Returns (localizations_path, media_ids_list, use_cached_jsonl).
     """
@@ -2247,6 +2263,7 @@ def _resolve_localizations_jsonl(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            verified_only=verified_only,
         )
         if api_count is not None and line_count == api_count:
             use_cached_jsonl = True
@@ -2262,10 +2279,11 @@ def _resolve_localizations_jsonl(
         loc_media_ids: list[int] | None = None
         if not has_query:
             logger.info(
-                "Fetching media IDs... host=%s project_id=%s api_url=%s",
+                "Fetching media IDs... host=%s project_id=%s api_url=%s verified_only=%s",
                 api_url.rstrip("/"),
                 project_id,
                 api_url,
+                verified_only,
             )
             media_ids_list = fetch_project_media_ids(
                 api_url,
@@ -2273,6 +2291,7 @@ def _resolve_localizations_jsonl(
                 project_id,
                 version_id=version_id,
                 section_id=section_id,
+                verified_only=verified_only,
             )
             loc_media_ids = media_ids_list or None
         else:
@@ -2290,6 +2309,7 @@ def _resolve_localizations_jsonl(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            verified_only=verified_only,
         )
         if has_query and localizations_path:
             _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
@@ -2376,11 +2396,15 @@ def _run_crop_pipeline(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    verified_only: bool = False,
 ) -> dict[str, Any]:
     """
     Run crop refresh pipeline and return counts/paths/context.
 
-    This function is shared by full sync and crop-recompute jobs.
+    This function is shared by full sync and crop-recompute jobs. When
+    verified_only is True, media/localization fetches are scoped server-side
+    to verified::true, so unverified media/localizations are never downloaded
+    or cropped.
     """
     dl_dir = _download_dir(project_id)
     crops = _crops_dir(
@@ -2415,6 +2439,7 @@ def _run_crop_pipeline(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            verified_only=verified_only,
         )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
@@ -4801,6 +4826,7 @@ def sync_project_to_fiftyone(
                 section_id=section_id,
                 query=query,
                 localization_type_id=localization_type_id,
+                verified_only=verified_only,
             )
             if crop_result.get("status") != "ok":
                 return {
@@ -5089,6 +5115,7 @@ def main() -> None:
     localization_batch_size_cli = (
         config.get("localization_batch_size") or _DEFAULT_LOCALIZATION_BATCH_SIZE
     )
+    verified_only_cli = bool(config.get("verified_only"))
 
     # Fetch media IDs (lightweight)
     media_ids = fetch_project_media_ids(
@@ -5097,6 +5124,7 @@ def main() -> None:
         project_id,
         media_ids_filter=media_ids_filter,
         version_id=version_id,
+        verified_only=verified_only_cli,
     )
     logger.info(f"media_ids: {media_ids}")
 
@@ -5108,6 +5136,7 @@ def main() -> None:
         media_ids=media_ids if media_ids else None,
         localization_batch_size=localization_batch_size_cli,
         media_id_batch_size=media_id_batch_size_cli,
+        verified_only=verified_only_cli,
     )
     if localizations_path:
         logger.info(f"saved_localizations_path (JSONL): {localizations_path}")
