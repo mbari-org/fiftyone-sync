@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.12.1 (2026-08-01)
+
+### Bug Fixes
+
+- **infra**: Shorten README.md for Docker Hub push limit; serialize release workflow (#33)
+  ([#33](https://github.com/mbari-org/fiftyone-sync/pull/33),
+  [`1c692d4`](https://github.com/mbari-org/fiftyone-sync/commit/1c692d4436fd52761edc36b13b927324294f35bb))
+
+
 ## v0.12.0 (2026-08-01)
 
 ### Features
