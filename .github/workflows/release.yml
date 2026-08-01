@@ -4,6 +4,15 @@ on:
   push:
     branches:
       - main
+
+# Serialize releases so back-to-back pushes to main (e.g. two PRs merged close
+# together) don't race: each run must finish (including the semantic-release
+# push) before the next one starts, otherwise a queued run's "upstream SHA"
+# check can fail with "Upstream branch 'origin/main' has changed!".
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   semantic_release:
     runs-on: ubuntu-latest
