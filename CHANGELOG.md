@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.12.0 (2026-08-01)
+
+### Features
+
+- **app**: Push verified_only filtering into Tator media/localization queries (#32)
+  ([#32](https://github.com/mbari-org/fiftyone-sync/pull/32),
+  [`c92b134`](https://github.com/mbari-org/fiftyone-sync/commit/c92b1341276d9a7fb4050ee096935f4ad8a45ded))
+
+### Performance Improvements
+
+- **app**: Parallelize image media download+crop in sequential sync path (#31)
+  ([#31](https://github.com/mbari-org/fiftyone-sync/pull/31),
+  [`b44e1fe`](https://github.com/mbari-org/fiftyone-sync/commit/b44e1fe43ca8b6feec7b9b28b631bfeab26ba3b6))
+
+
 ## v0.11.0 (2026-07-31)
 
 ### Features
