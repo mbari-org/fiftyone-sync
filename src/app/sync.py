@@ -748,6 +748,10 @@ def _ffprobe_dimensions(input_path_or_url: str | Path, _cache: dict[str, tuple[i
 _DEFAULT_CROP_TIMEOUT = int(os.environ.get("CROP_TIMEOUT", "300"))
 _DEFAULT_VIDEO_WORKERS = int(os.environ.get("CROP_VIDEO_WORKERS", "8"))
 _FRAME_BATCH_SIZE = int(os.environ.get("CROP_FRAME_BATCH_SIZE", "20"))
+# Number of image media downloaded + cropped concurrently in
+# _download_and_crop_media_sequentially. Videos are excluded from this pool and
+# always processed one at a time (see that function's docstring).
+_MEDIA_DOWNLOAD_WORKERS = int(os.environ.get("MEDIA_DOWNLOAD_WORKERS", "8"))
 
 _PIL_RESAMPLE = Image.LANCZOS
 
@@ -1708,6 +1712,60 @@ def _media_locs_already_cropped(
     return True
 
 
+def _cleanup_downloaded_image(download_dir: str, media_id: int, media_name: str) -> None:
+    """Remove a single downloaded image file to reclaim space as soon as its crop is done.
+
+    Mirrors _cleanup_downloaded_videos but scoped to one media's file, since images
+    are downloaded/cropped concurrently (many at once) rather than one at a time.
+    """
+    if not download_dir or not media_name:
+        return
+    path = os.path.join(download_dir, f"{media_id}_{media_name}")
+    try:
+        if os.path.isfile(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def _download_and_crop_one_media(
+    api: Any,
+    project_id: int,
+    mid: int,
+    media_obj: Any | None,
+    locs_for_media: list[dict],
+    localizations_path: str,
+    crops_dir: str,
+    dl_dir: str,
+    size: int,
+) -> tuple[int, Any | None, int, int]:
+    """Download (if resolved), crop, and immediately delete a single media's
+    downloaded file to reclaim disk space.
+
+    Runs on a worker thread from the image download pool in
+    _download_and_crop_media_sequentially. Returns (mid, media_obj, num_ok, num_fail).
+    """
+    if media_obj is not None:
+        save_media_to_tmp(api, project_id, [media_obj], media_ids_filter={mid})
+    ok, fail = crop_localizations_parallel(
+        dl_dir,
+        localizations_path,
+        crops_dir,
+        size=size,
+        locs_to_crop=locs_for_media,
+        media_objects=[media_obj] if media_obj is not None else [],
+    )
+    if media_obj is not None:
+        # Delete now (mirroring the video path below) so at most
+        # MEDIA_DOWNLOAD_WORKERS downloaded images occupy local disk at once,
+        # instead of every image accumulating until the whole-sync cleanup.
+        # FiftyOne samples are always built from crops_dir, never from this
+        # raw downloaded file, so it's safe to remove as soon as its crop(s)
+        # are written.
+        _cleanup_downloaded_image(dl_dir, mid, getattr(media_obj, "name", "") or "")
+    return mid, media_obj, ok, fail
+
+
 def _download_and_crop_media_sequentially(
     api: Any,
     project_id: int,
@@ -1719,16 +1777,21 @@ def _download_and_crop_media_sequentially(
     size: int = 224,
 ) -> tuple[str, list[Any], int, int]:
     """
-    Download and crop one media at a time: download media N -> crop only media N's
-    localizations -> delete media N's video file (if any) -> move to media N+1.
+    Download and crop media: images are downloaded + cropped concurrently
+    (up to MEDIA_DOWNLOAD_WORKERS at a time); videos are still processed
+    strictly one at a time -- download video N -> crop only video N's
+    localizations -> delete video N's file -> move to video N+1.
 
-    Downloading every needed media before cropping any of them means the whole
-    download phase (which can take minutes per video) has to finish before
-    cropping starts on even the first one, and every downloaded video sits on
-    local disk simultaneously (large videos can be several GB each). Interleaving
-    keeps at most one media file on local disk at a time and lets cropping start
-    as soon as the first media finishes downloading instead of waiting on the
-    whole batch.
+    Videos are excluded from the concurrent pool because large videos (several
+    GB each) sitting on local disk simultaneously would blow out disk usage;
+    interleaving download/crop/delete per video keeps at most one video file
+    on local disk at a time. For image-heavy projects the per-media network
+    round-trip (one HTTP download per media) -- not crop CPU work -- is the
+    actual bottleneck, so images are fanned out across a thread pool instead
+    of processed one at a time; each image is still deleted immediately after
+    its own crop completes (mirroring the video cleanup), so at most
+    MEDIA_DOWNLOAD_WORKERS downloaded images occupy local disk at once instead
+    of every image accumulating until the whole-sync cleanup.
 
     Returns (download_dir, processed_media_objects, num_cropped, num_failed).
     """
@@ -1736,8 +1799,11 @@ def _download_and_crop_media_sequentially(
     processed_media: list[Any] = []
     num_ok = 0
     num_fail = 0
-    total = len(needed_ids)
-    for idx, mid in enumerate(needed_ids, 1):
+
+    image_work: list[tuple[int, Any | None, list[dict]]] = []
+    video_work: list[tuple[int, Any, list[dict]]] = []
+
+    for mid in needed_ids:
         media_obj = media_by_id.get(mid)
         locs_for_media = locs_by_media.get(mid) or []
         if not locs_for_media:
@@ -1749,48 +1815,87 @@ def _download_and_crop_media_sequentially(
             # (potentially large) video only to discover during cropping that
             # every localization on it was already cropped.
             logger.info(
-                "Skipping download for media %s/%s (id=%s, name=%s): all %s "
+                "Skipping download for media id=%s (name=%s): all %s "
                 "crop(s) already on disk",
-                idx, total, mid, getattr(media_obj, "name", ""), len(locs_for_media),
+                mid, getattr(media_obj, "name", ""), len(locs_for_media),
             )
             processed_media.append(media_obj)
             continue
-        if media_obj is not None:
+        if media_obj is not None and _is_video_name(getattr(media_obj, "name", "") or ""):
+            video_work.append((mid, media_obj, locs_for_media))
+        else:
+            # Images, plus media ids with no Media object resolved (e.g. lookup
+            # failed) -- still attempted in case the file is already present in
+            # the download dir from an earlier run, matching the previous
+            # always-attempt-crop fallback behavior. Neither case grows local
+            # disk usage unboundedly, so both are safe to run concurrently.
+            image_work.append((mid, media_obj, locs_for_media))
+
+    if image_work:
+        workers = max(1, min(_MEDIA_DOWNLOAD_WORKERS, len(image_work)))
+        logger.info(
+            "Downloading and cropping %s image media with %s worker(s) (concurrent)...",
+            len(image_work), workers,
+        )
+        completed = 0
+        log_interval = max(1, len(image_work) // 10)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(
+                    _download_and_crop_one_media,
+                    api, project_id, mid, media_obj, locs_for_media,
+                    localizations_path, crops_dir, dl_dir, size,
+                ): mid
+                for mid, media_obj, locs_for_media in image_work
+            }
+            for fut in as_completed(futures):
+                completed += 1
+                try:
+                    mid, media_obj, ok, fail = fut.result()
+                except Exception as e:
+                    num_fail += 1
+                    logger.warning(
+                        "Image download/crop failed for id=%s: %s", futures[fut], e
+                    )
+                else:
+                    num_ok += ok
+                    num_fail += fail
+                    if media_obj is not None:
+                        processed_media.append(media_obj)
+                if completed % log_interval == 0 or completed == len(image_work):
+                    logger.info(
+                        "Image download/crop progress: %s/%s", completed, len(image_work)
+                    )
+
+    if video_work:
+        logger.info(
+            "Downloading and cropping %s video media one at a time...",
+            len(video_work),
+        )
+        for idx, (mid, media_obj, locs_for_media) in enumerate(video_work, 1):
             logger.info(
                 "Downloading media %s/%s (id=%s, name=%s)...",
-                idx, total, mid, getattr(media_obj, "name", ""),
+                idx, len(video_work), mid, getattr(media_obj, "name", ""),
             )
             dl_dir = save_media_to_tmp(
                 api, project_id, [media_obj], media_ids_filter={mid}
             )
-        else:
-            # No Media metadata resolved for this id (e.g. lookup failed) -- still
-            # attempt the crop in case the file is already present in the
-            # download dir from an earlier run, matching the previous
-            # always-attempt-crop behavior instead of silently dropping it.
-            logger.info(
-                "No Media object resolved for id=%s (%s/%s); attempting crop from "
-                "existing download dir",
-                mid, idx, total,
+            ok, fail = crop_localizations_parallel(
+                dl_dir,
+                localizations_path,
+                crops_dir,
+                size=size,
+                locs_to_crop=locs_for_media,
+                media_objects=[media_obj],
             )
-        ok, fail = crop_localizations_parallel(
-            dl_dir,
-            localizations_path,
-            crops_dir,
-            size=size,
-            locs_to_crop=locs_for_media,
-            media_objects=[media_obj] if media_obj is not None else [],
-        )
-        num_ok += ok
-        num_fail += fail
-        if media_obj is not None:
+            num_ok += ok
+            num_fail += fail
             processed_media.append(media_obj)
             # Delete the video immediately so at most one large video occupies
-            # local disk at a time; images are left in place (existing behavior)
-            # until the final download-dir cleanup, since they're small and some
-            # sample types reference the downloaded image directly.
-            if _is_video_name(getattr(media_obj, "name", "") or ""):
-                _cleanup_downloaded_videos(dl_dir)
+            # local disk at a time. Images are cleaned up the same way, right
+            # after their own crop completes (see _download_and_crop_one_media).
+            _cleanup_downloaded_videos(dl_dir)
+
     return dl_dir, processed_media, num_ok, num_fail
 
 

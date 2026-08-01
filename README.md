@@ -356,12 +356,28 @@ If embeddings were removed only from the schema (or cleared incompletely in Mong
 - Localizations: `/tmp/fiftyone_sync_project_{id}/localizations.jsonl` (JSONL)
 - Crops: `/tmp/fiftyone_sync_project_{id}/crops/{media_stem}/{elemental_id}.png`
 
-Media are downloaded and cropped one at a time so large source videos do not
-accumulate on local disk. Existing non-empty crop files are reused even when the
-crop manifest is missing or stale; localizations are recropped when their recorded
-modification time changes.
+Image media are downloaded and cropped **concurrently** (thread pool); video
+media are still downloaded and cropped **one at a time**. Either way, each
+downloaded source file (image or video) is deleted immediately after its own
+crop completes, so downloaded media never accumulates beyond
+`MEDIA_DOWNLOAD_WORKERS` files (images) or 1 file (videos) at a time on local
+disk — FiftyOne samples are always built from the crops directory, never from
+the raw downloaded file. Existing non-empty crop files are reused even when the
+crop manifest is missing or stale; localizations are recropped when their
+recorded modification time changes.
 
 Labels come from `attributes.Label` (or `attributes.label`) in localizations.
+
+**Crop/download tuning** (set on the sync service; restart to apply):
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MEDIA_DOWNLOAD_WORKERS` | `8` | Number of image media downloaded + cropped concurrently in the "one media at a time" sync path. Videos always process one at a time regardless of this setting. |
+| `CROP_FRAME_BATCH_SIZE` | `20` | Number of image crop tasks batched per `ThreadPoolExecutor` cycle inside `crop_localizations_parallel`, and number of video frames extracted per ffmpeg invocation. |
+| `CROP_VIDEO_WORKERS` | `8` | Max concurrent workers used to crop frames extracted from a single video. |
+| `CROP_TIMEOUT` | `300` | Timeout (seconds) for ffmpeg frame-extraction batches. |
+
+If downloads from Tator are slow (network-bound), raising `MEDIA_DOWNLOAD_WORKERS` has the biggest effect on wall-clock time for image-heavy projects; `CROP_FRAME_BATCH_SIZE` only matters for bulk/recompute crop paths that hand many media to `crop_localizations_parallel` at once.
 
 ### Sync edits back to Tator
 
