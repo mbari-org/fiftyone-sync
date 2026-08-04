@@ -247,6 +247,11 @@ the raw downloaded file. Existing non-empty crop files are reused even when the
 crop manifest is missing or stale; localizations are recropped when their
 recorded modification time changes.
 
+Media fetched for download are requested with presigned URLs (`presigned=86400`,
+`no_cache=true`), so media stored in an object store can be downloaded directly.
+Tator deployments that do not support presigning fall back to unsigned object
+keys automatically (a warning is logged).
+
 Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 
 **Crop/download tuning** (set on the sync service; restart to apply):

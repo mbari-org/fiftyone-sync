@@ -74,6 +74,10 @@ _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
 
+# Lifetime (seconds) of presigned media URLs requested from Tator. 86400 is the
+# maximum Tator allows; downloads can start hours after the media list is fetched.
+PRESIGN_EXPIRATION = 86400
+
 # sync_edits_to_tator: batch LocalizationList PUT/PATCH (elemental_ids / bulk update).
 # Chunk sizes are tunable via env vars so production can throttle bursts that would
 # otherwise overwhelm the Tator API (defaults reduced from 500 to 100/100).
@@ -411,15 +415,41 @@ def fetch_project_media_ids(
     return media_ids
 
 
+def _get_media_list_presigned(
+    api: Any, project_id: int, media_ids: list[int]
+) -> list[Any]:
+    """
+    Get Media for the given ids with presigned media file URLs.
+
+    Object-store backed deployments return unsigned object keys unless presigning
+    is requested, and downloading those fails with 403. Tator versions without
+    presign support fall back to the unsigned response.
+    """
+    try:
+        return api.get_media_list_by_id(
+            project_id,
+            {"ids": media_ids},
+            presigned=PRESIGN_EXPIRATION,
+            no_cache=True,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not presign media URLs ({e}); falling back to unsigned object keys"
+        )
+        return api.get_media_list_by_id(project_id, {"ids": media_ids})
+
+
 def get_media_chunked(
     api: Any,
     project_id: int,
     media_ids: list[int],
     media_id_batch_size: int | None = None,
+    presigned: bool = False,
 ) -> list[Any]:
     """
     Get media objects in chunks. Uses get_media_list_by_id for reliable Media objects.
     Filters out non-Media responses (API quirk). Returns list of tator.models.Media.
+    Set presigned=True when the media files will be downloaded.
     """
     chunk_size = (
         media_id_batch_size
@@ -436,7 +466,11 @@ def get_media_chunked(
     all_media = []
     for start in range(0, len(media_ids), chunk_size):
         chunk_ids = media_ids[start : start + chunk_size]
-        media = api.get_media_list_by_id(project_id, {"ids": chunk_ids})
+        media = (
+            _get_media_list_presigned(api, project_id, chunk_ids)
+            if presigned
+            else api.get_media_list_by_id(project_id, {"ids": chunk_ids})
+        )
         new_media = [m for m in media if isinstance(m, tator.models.Media)]
         all_media += new_media
         logger.info(
@@ -2622,7 +2656,11 @@ def _run_crop_pipeline(
                 len(media_ids_list),
             )
             media_for_crop = get_media_chunked(
-                api, project_id, needed_ids, media_id_batch_size=media_id_batch_size
+                api,
+                project_id,
+                needed_ids,
+                media_id_batch_size=media_id_batch_size,
+                presigned=True,
             )
             if not media_for_crop:
                 logger.info(
@@ -5265,7 +5303,11 @@ def main() -> None:
         if media_ids and media_ids_needed:
             needed_ids = [mid for mid in media_ids if mid in media_ids_needed]
             all_media_cli = get_media_chunked(
-                api, project_id, needed_ids, media_id_batch_size=media_id_batch_size_cli
+                api,
+                project_id,
+                needed_ids,
+                media_id_batch_size=media_id_batch_size_cli,
+                presigned=True,
             )
             if all_media_cli:
                 save_media_to_tmp(
