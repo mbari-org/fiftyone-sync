@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.12.2 (2026-08-04)
+
+### Bug Fixes
+
+- **app**: Request presigned media URLs when downloading from Tator (#34)
+  ([#34](https://github.com/mbari-org/fiftyone-sync/pull/34),
+  [`97172cb`](https://github.com/mbari-org/fiftyone-sync/commit/97172cb2fb91e752e59e48410eab98f2a3b77611))
+
+
 ## v0.12.1 (2026-08-01)
 
 ### Bug Fixes
