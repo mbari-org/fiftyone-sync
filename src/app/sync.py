@@ -72,6 +72,8 @@ _DEFAULT_MEDIA_ID_BATCH_SIZE = 200
 _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
 # add_samples / reconcile add-new batch size (bounds memory on large datasets).
 _DATASET_ADD_BATCH_SIZE = 100
+# Reconcile field-update batch size for FiftyOne save_context / Mongo bulk_write.
+_DATASET_UPDATE_BATCH_SIZE = 1000
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
@@ -3255,6 +3257,27 @@ def repair_undeclared_sample_fields(
         return _purge_undeclared_sample_fields(dataset, undeclared)
 
 
+class _ImmediateSampleSaveContext:
+    """Fallback when the dataset has no FiftyOne save_context (tests)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def save(self, sample: Any) -> None:
+        sample.save()
+
+
+def _sample_save_context(dataset: Any, batch_size: int) -> Any:
+    """Bulk-save via dataset.save_context when available; else per-sample save."""
+    factory = getattr(dataset, "save_context", None)
+    if callable(factory):
+        return factory(batch_size=batch_size)
+    return _ImmediateSampleSaveContext()
+
+
 def reconcile_dataset_with_tator(
     dataset: fo.Dataset,
     loc_index: dict[str, dict],
@@ -3333,8 +3356,13 @@ def reconcile_dataset_with_tator(
             "(no longer verified; verified_only enabled)"
         )
 
-    # 2. Update changed samples. Save immediately; do not retain every fo.Sample.
-    logger.info("Reconcile: Update samples with changed modified_datetime")
+    # 2. Update changed samples via save_context (Mongo bulk_write in chunks).
+    update_batch = _DATASET_UPDATE_BATCH_SIZE
+    logger.info(
+        "Reconcile: Update samples with changed modified_datetime "
+        "(batch_size=%s)",
+        update_batch,
+    )
     updated = 0
     api_url = config.get("api_url")
     project_id = config.get("project_id")
@@ -3344,50 +3372,61 @@ def reconcile_dataset_with_tator(
     if force_sync:
         logger.info("Reconcile: force_sync enabled — rewriting all samples")
 
-    for sample in dataset.iter_samples(autosave=False):
-        elemental_id = getattr(sample, "elemental_id", None)
-        if not elemental_id or str(elemental_id) not in loc_index:
-            continue
-        eid = str(elemental_id)
-        loc = loc_index[eid]
-        apply_update = force_sync
-        was_fixed = False
-        if not apply_update:
-            modified_at = _to_datetime(
-                loc.get("modified_datetime") or loc.get("created_datetime")
-            )
-            tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
-            mod_ts = _normalize_modified_at(modified_at)
-            last_ts = _normalize_modified_at(tator_modified_at)
-            has_prediction = (
-                sample.has_field("top1_prediction")
-                and sample["top1_prediction"] is not None
-            )
-            logger.debug(
-                f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} "
-                f"{TATOR_MODIFIED_AT_FIELD}: {tator_modified_at} has_prediction: {has_prediction}"
-            )
-            apply_update = (mod_ts is not None and mod_ts != last_ts) or not has_prediction
-            if apply_update:
-                reason = (
-                    "timestamp_changed"
-                    if (mod_ts is not None and mod_ts != last_ts)
-                    else "missing_prediction"
+    progress_every = update_batch * 10
+    with _sample_save_context(dataset, update_batch) as save_ctx:
+        for sample in dataset.iter_samples(autosave=False):
+            elemental_id = getattr(sample, "elemental_id", None)
+            if not elemental_id or str(elemental_id) not in loc_index:
+                continue
+            eid = str(elemental_id)
+            loc = loc_index[eid]
+            apply_update = force_sync
+            was_fixed = False
+            if not apply_update:
+                modified_at = _to_datetime(
+                    loc.get("modified_datetime") or loc.get("created_datetime")
                 )
-                logger.debug(f"Sample {sample.id} needs update ({reason}): {eid}")
-        if apply_update:
-            _apply_loc_to_sample(
-                sample,
-                loc,
-                api_url=api_url,
-                project_id=project_id,
-                version_id=version_id,
-                media_attributes_map=media_attributes_map,
-            )
-            sample.save()
-            updated += 1
-        elif was_fixed:
-            sample.save()
+                tator_modified_at, was_fixed = _get_tator_modified_at_datetime(
+                    sample
+                )
+                mod_ts = _normalize_modified_at(modified_at)
+                last_ts = _normalize_modified_at(tator_modified_at)
+                has_prediction = (
+                    sample.has_field("top1_prediction")
+                    and sample["top1_prediction"] is not None
+                )
+                logger.debug(
+                    f"Checking sample {sample.id} for update: {eid} "
+                    f"modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: "
+                    f"{tator_modified_at} has_prediction: {has_prediction}"
+                )
+                apply_update = (
+                    mod_ts is not None and mod_ts != last_ts
+                ) or not has_prediction
+                if apply_update:
+                    reason = (
+                        "timestamp_changed"
+                        if (mod_ts is not None and mod_ts != last_ts)
+                        else "missing_prediction"
+                    )
+                    logger.debug(
+                        f"Sample {sample.id} needs update ({reason}): {eid}"
+                    )
+            if apply_update:
+                _apply_loc_to_sample(
+                    sample,
+                    loc,
+                    api_url=api_url,
+                    project_id=project_id,
+                    version_id=version_id,
+                    media_attributes_map=media_attributes_map,
+                )
+                save_ctx.save(sample)
+                updated += 1
+                if progress_every and updated % progress_every == 0:
+                    logger.info("Reconcile: updated %s samples so far", updated)
+            elif was_fixed:
+                save_ctx.save(sample)
 
     if updated:
         logger.info(f"Reconcile: updated {updated} samples (box changed)")

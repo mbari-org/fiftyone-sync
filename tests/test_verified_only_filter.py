@@ -146,6 +146,35 @@ class _FakeSample:
         pass
 
 
+class _FakeSaveContext:
+    """Stand-in for FiftyOne dataset.save_context() that records flush sizes."""
+
+    def __init__(self, dataset, batch_size):
+        self._dataset = dataset
+        self._batch_size = batch_size or 1000
+        self._pending: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self._flush()
+        return False
+
+    def save(self, sample):
+        self._pending.append(sample)
+        if len(self._pending) >= self._batch_size:
+            self._flush()
+
+    def _flush(self):
+        if not self._pending:
+            return
+        self._dataset.save_batches.append([s.id for s in self._pending])
+        for sample in self._pending:
+            sample.save()
+        self._pending = []
+
+
 class _FakeReconcileDataset:
     """Minimal fo.Dataset stand-in that tracks delete_samples/add_samples calls."""
 
@@ -153,6 +182,7 @@ class _FakeReconcileDataset:
         self._samples = list(samples)
         self.deleted_ids: list[str] = []
         self.added: list = []
+        self.save_batches: list[list[str]] = []
 
     def values(self, field, **_kwargs):
         if field == "id":
@@ -170,6 +200,9 @@ class _FakeReconcileDataset:
 
     def add_samples(self, samples):
         self.added.extend(samples)
+
+    def save_context(self, batch_size=None, **_kwargs):
+        return _FakeSaveContext(self, batch_size)
 
     def __len__(self):
         return len(self._samples)

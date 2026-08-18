@@ -86,29 +86,31 @@ def test_build_new_dataset_adds_in_batches(monkeypatch, tmp_path):
     assert len(dataset) == 250
 
 
-def test_reconcile_force_sync_saves_each_sample_without_collecting(monkeypatch):
+def test_reconcile_force_sync_saves_in_batches(monkeypatch):
     monkeypatch.setattr(sync, "repair_undeclared_sample_fields", lambda *a, **k: None)
     monkeypatch.setattr(sync, "_media_id_to_stem_from_crops", lambda *_a, **_k: {})
     monkeypatch.setattr(sync, "_apply_loc_to_sample", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "_DATASET_UPDATE_BATCH_SIZE", 2)
     saves: list[str] = []
 
     class _SavingSample(_FakeSample):
         def save(self):
             saves.append(self.id)
 
-    dataset = _FakeReconcileDataset(
-        [_SavingSample("s1", "eid-1"), _SavingSample("s2", "eid-2")]
-    )
+    samples = [_SavingSample(f"s{i}", f"eid-{i}") for i in range(5)]
+    dataset = _FakeReconcileDataset(samples)
+    loc_index = {
+        f"eid-{i}": _make_loc({"Label": "A"}, elemental_id=f"eid-{i}")
+        for i in range(5)
+    }
     sync.reconcile_dataset_with_tator(
         dataset=dataset,
-        loc_index={
-            "eid-1": _make_loc({"Label": "A"}, elemental_id="eid-1"),
-            "eid-2": _make_loc({"Label": "B"}, elemental_id="eid-2"),
-        },
+        loc_index=loc_index,
         crops_dir="/tmp/crops",
         download_dir=None,
         config={"force_sync": True},
         max_samples=None,
     )
-    assert saves == ["s1", "s2"]
+    assert saves == ["s0", "s1", "s2", "s3", "s4"]
+    assert dataset.save_batches == [["s0", "s1"], ["s2", "s3"], ["s4"]]
     assert dataset.added == []

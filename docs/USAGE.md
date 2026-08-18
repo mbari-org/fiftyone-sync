@@ -217,7 +217,7 @@ pip install umap-learn
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
-**Large datasets:** Create and reconcile stream samples and call `add_samples` in batches of 100. An existing dataset is reconciled in place without first building a FiftyOne sample for every crop (that path OOM-killed the RQ work-horse around 3M ROIs).
+**Large datasets:** Create and reconcile stream samples and call `add_samples` in batches of 100. Field updates during reconcile use FiftyOne `save_context` with a batch size of **1000** (Mongo `bulk_write`), not one `sample.save()` per ROI. An existing dataset is reconciled in place without first building a FiftyOne sample for every crop (that path OOM-killed the RQ work-horse around 3M ROIs).
 
 **Incremental embeddings:** By default the sync counts how many samples already have embeddings and only computes the **missing** ones (rather than re-embedding the whole dataset). If any new embeddings are computed, the UMAP visualization and similarity index are automatically rebuilt to include the new points. Set `force_embeddings: true` to re-embed every sample regardless. When building UMAP/similarity, the stored embeddings are read out of Voxel51 into an in-memory NumPy array once and reused for both computations.
 
