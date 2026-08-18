@@ -217,7 +217,7 @@ pip install umap-learn
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
-**Large datasets:** Create and reconcile stream samples and call `add_samples` in batches of 100. Field updates during reconcile use FiftyOne `save_context` with a batch size of **1000** (Mongo `bulk_write`), not one `sample.save()` per ROI. An existing dataset is reconciled in place without first building a FiftyOne sample for every crop (that path OOM-killed the RQ work-horse around 3M ROIs).
+**Large datasets:** Create and reconcile stream samples and call `add_samples` in batches of 100. FiftyOne tty progress bars are disabled (`FIFTYONE_SHOW_PROGRESS_BARS=false`); long steps log `INFO` every 10,000 samples instead. Field updates during reconcile use FiftyOne `save_context` with a batch size of **1000** (Mongo `bulk_write`). An existing dataset is reconciled in place without first building a FiftyOne sample for every crop (that path OOM-killed the RQ work-horse around 3M ROIs).
 
 **Incremental embeddings:** By default the sync counts how many samples already have embeddings and only computes the **missing** ones (rather than re-embedding the whole dataset). If any new embeddings are computed, the UMAP visualization and similarity index are automatically rebuilt to include the new points. Set `force_embeddings: true` to re-embed every sample regardless. When building UMAP/similarity, the stored embeddings are read out of Voxel51 into an in-memory NumPy array once and reused for both computations.
 
@@ -264,6 +264,7 @@ Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 | `CROP_FRAME_BATCH_SIZE` | `20` | Number of image crop tasks batched per `ThreadPoolExecutor` cycle inside `crop_localizations_parallel`, and number of video frames extracted per ffmpeg invocation. |
 | `CROP_VIDEO_WORKERS` | `8` | Max concurrent workers used to crop frames extracted from a single video. |
 | `CROP_TIMEOUT` | `300` | Timeout (seconds) for ffmpeg frame-extraction batches. |
+| `FASTVSS_WS_MAX_WAIT` | `300` | Seconds to wait for one Fast-VSS embedding job over WebSocket. Raise this if queued batches time out on large syncs. |
 
 If downloads from Tator are slow (network-bound), raising `MEDIA_DOWNLOAD_WORKERS` has the biggest effect on wall-clock time for image-heavy projects; `CROP_FRAME_BATCH_SIZE` only matters for bulk/recompute crop paths that hand many media to `crop_localizations_parallel` at once.
 

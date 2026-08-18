@@ -26,6 +26,11 @@ from pathlib import Path
 from typing import Any
 
 import fiftyone as fo
+
+# FiftyOne tty bars (e.g. "100% | 100/100") flood RQ/applet logs on large jobs.
+# Progress is reported via logger.info on an interval instead.
+fo.config.show_progress_bars = False
+
 import tator
 import yaml
 from PIL import Image
@@ -3278,6 +3283,16 @@ def _sample_save_context(dataset: Any, batch_size: int) -> Any:
     return _ImmediateSampleSaveContext()
 
 
+def _add_samples_quiet(dataset: Any, samples: list) -> None:
+    """add_samples without FiftyOne's per-batch 100/100 progress bars."""
+    if not samples:
+        return
+    try:
+        dataset.add_samples(samples, progress=False)
+    except TypeError:
+        dataset.add_samples(samples)
+
+
 def reconcile_dataset_with_tator(
     dataset: fo.Dataset,
     loc_index: dict[str, dict],
@@ -3358,12 +3373,15 @@ def reconcile_dataset_with_tator(
 
     # 2. Update changed samples via save_context (Mongo bulk_write in chunks).
     update_batch = _DATASET_UPDATE_BATCH_SIZE
+    scan_total = len(all_sample_ids)
     logger.info(
         "Reconcile: Update samples with changed modified_datetime "
-        "(batch_size=%s)",
+        "(batch_size=%s, samples=%s)",
         update_batch,
+        scan_total,
     )
     updated = 0
+    scanned = 0
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
@@ -3372,9 +3390,19 @@ def reconcile_dataset_with_tator(
     if force_sync:
         logger.info("Reconcile: force_sync enabled — rewriting all samples")
 
-    progress_every = update_batch * 10
+    progress_every = 10000
+    scan_started = time.monotonic()
     with _sample_save_context(dataset, update_batch) as save_ctx:
         for sample in dataset.iter_samples(autosave=False):
+            scanned += 1
+            if scanned % progress_every == 0:
+                logger.info(
+                    "Reconcile: checked %s/%s samples (updated=%s, %.0fs)",
+                    scanned,
+                    scan_total,
+                    updated,
+                    time.monotonic() - scan_started,
+                )
             elemental_id = getattr(sample, "elemental_id", None)
             if not elemental_id or str(elemental_id) not in loc_index:
                 continue
@@ -3423,13 +3451,15 @@ def reconcile_dataset_with_tator(
                 )
                 save_ctx.save(sample)
                 updated += 1
-                if progress_every and updated % progress_every == 0:
-                    logger.info("Reconcile: updated %s samples so far", updated)
             elif was_fixed:
                 save_ctx.save(sample)
 
-    if updated:
-        logger.info(f"Reconcile: updated {updated} samples (box changed)")
+    logger.info(
+        "Reconcile: update pass done checked=%s updated=%s elapsed=%.0fs",
+        scanned,
+        updated,
+        time.monotonic() - scan_started,
+    )
 
     # 3. Add new samples (elemental_id in Tator but not in dataset)
     # dataset_eids was built in step 1 via per-field values() calls
@@ -3450,6 +3480,11 @@ def reconcile_dataset_with_tator(
         added = 0
         batch_size = _DATASET_ADD_BATCH_SIZE
         samples_to_add = []
+        logger.info(
+            "Reconcile: adding up to %s new samples (batch_size=%s)",
+            len(new_eids),
+            batch_size,
+        )
 
         # Pre-filter valid media_ids to avoid repeated checks
         valid_media_ids = set()
@@ -3495,12 +3530,14 @@ def reconcile_dataset_with_tator(
 
                 # Add in batches to avoid memory issues with large datasets
                 if len(samples_to_add) >= batch_size:
-                    dataset.add_samples(samples_to_add)
+                    _add_samples_quiet(dataset, samples_to_add)
                     samples_to_add = []
+                    if added % (batch_size * 10) == 0:
+                        logger.info("Reconcile: added %s new samples so far", added)
 
         # Add any remaining samples
         if samples_to_add:
-            dataset.add_samples(samples_to_add)
+            _add_samples_quiet(dataset, samples_to_add)
 
         if added:
             logger.info(f"Reconcile: added {added} new samples")
@@ -3685,10 +3722,10 @@ def build_fiftyone_dataset_from_crops(
         batch.append(sample)
         added += 1
         if len(batch) >= batch_size:
-            dataset.add_samples(batch)
+            _add_samples_quiet(dataset, batch)
             batch = []
     if batch:
-        dataset.add_samples(batch)
+        _add_samples_quiet(dataset, batch)
     if added == 0:
         raise ValueError(f"No crops found in {crops_dir} (checked {seen} files)")
     _ensure_field_indexes(dataset)

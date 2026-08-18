@@ -138,7 +138,7 @@ class _FakeDataset:
     def __len__(self):
         return len(self._samples)
 
-    def iter_samples(self):
+    def iter_samples(self, **_kwargs):
         return iter(self._samples)
 
     def reload(self):
@@ -505,3 +505,13 @@ def test_compute_embeddings_via_service_async_returns_zero_when_all_present(
     )
 
     assert new_count == 0
+
+
+def test_ws_job_timeout_defaults_to_300(monkeypatch):
+    monkeypatch.delenv("FASTVSS_WS_MAX_WAIT", raising=False)
+    assert embeddings_viz._ws_job_timeout_seconds() == 300.0
+
+
+def test_ws_job_timeout_reads_env(monkeypatch):
+    monkeypatch.setenv("FASTVSS_WS_MAX_WAIT", "600")
+    assert embeddings_viz._ws_job_timeout_seconds() == 600.0

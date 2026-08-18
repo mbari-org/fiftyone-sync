@@ -17,6 +17,9 @@ import sys
 
 import fiftyone as fo
 
+# Disable FiftyOne tty progress bars in the RQ worker (see sync.py).
+fo.config.show_progress_bars = False
+
 from rq import Queue, Worker
 
 from src.app.database_manager import get_is_enterprise, require_sync_config_path

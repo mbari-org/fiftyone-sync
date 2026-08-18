@@ -8,6 +8,10 @@ import src.app.sync as sync
 from tests.test_verified_only_filter import _FakeReconcileDataset, _FakeSample, _make_loc
 
 
+def test_fiftyone_progress_bars_disabled():
+    assert sync.fo.config.show_progress_bars is False
+
+
 def test_iter_crop_filepaths_streams_and_skips_non_images(tmp_path):
     assert sync._crop_suffixes(["*.png", "*.JPG"]) == {".png", ".jpg"}
     media = tmp_path / "1_frame"

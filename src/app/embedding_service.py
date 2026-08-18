@@ -30,7 +30,17 @@ _queue_results: dict[str, dict[str, Any]] = {}
 _queue_lock = asyncio.Lock()
 
 # Align with Fast-VSS WS_MAX_WAIT (max time to wait for job result over WebSocket)
-_WS_MAX_WAIT = 300
+def _ws_max_wait_seconds() -> int:
+    raw = os.environ.get("FASTVSS_WS_MAX_WAIT", "").strip()
+    if raw:
+        try:
+            return max(1, int(float(raw)))
+        except ValueError:
+            pass
+    return 300
+
+
+_WS_MAX_WAIT = _ws_max_wait_seconds()
 _WS_CONNECT_TIMEOUT = 30
 
 

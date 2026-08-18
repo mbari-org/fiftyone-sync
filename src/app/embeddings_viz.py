@@ -22,6 +22,9 @@ from typing import Optional
 
 import fiftyone as fo
 
+# Same as sync.py: no FiftyOne tty progress bars; we log periodically instead.
+fo.config.show_progress_bars = False
+
 logger = logging.getLogger(__name__)
 
 # Base URL for embed service (POST /embed/{project}, job status via WS /ws/predict/job/{job_id}/{project})
@@ -38,8 +41,24 @@ EMBEDDING_FETCH_MAX_RETRIES = 3
 # to prevent, while still parallelizing the network round-trip wait across batches.
 DEFAULT_EMBEDDING_CONCURRENCY = 4
 
+def _ws_job_timeout_seconds() -> float:
+    """Max seconds to wait for one embed job over WebSocket.
+
+    Override with FASTVSS_WS_MAX_WAIT. Default 300 matches Fast-VSS WS_MAX_WAIT
+    and embedding_service._WS_MAX_WAIT. The previous 10s default timed out
+    queued batches on large syncs.
+    """
+    raw = os.environ.get("FASTVSS_WS_MAX_WAIT", "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return 300.0
+
+
 # Max time to wait for one job over WebSocket (align with Fast-VSS WS_MAX_WAIT)
-_WS_JOB_TIMEOUT = 10.0
+_WS_JOB_TIMEOUT = _ws_job_timeout_seconds()
 
 # Rough throughput estimate for the upfront ETA logged before processing starts;
 # actual progress logs below use the measured rate instead once a few batches complete.
@@ -287,7 +306,9 @@ async def _poll_and_save_batch_with_retries(
             # Reload only this batch's samples by ID (ordered=True preserves submission order)
             batch_view = dataset.select(batch_ids, ordered=True)
             saved_count = 0
-            for s, emb in zip(batch_view.iter_samples(autosave=True), emb_list):
+            for s, emb in zip(
+                batch_view.iter_samples(autosave=True, progress=False), emb_list
+            ):
                 if isinstance(emb, np.ndarray):
                     emb = emb.tolist()
                 elif not isinstance(emb, (list, tuple)):
@@ -346,14 +367,24 @@ async def _compute_embeddings_via_service_async(
     valid_ids: list[str] = []
     valid_paths: list[str] = []
     skipped_existing = 0
-    for s in dataset.iter_samples():
+    scan_started = time.monotonic()
+    for scanned, s in enumerate(dataset.iter_samples(progress=False), 1):
         if skip_existing and s.id in existing_ids:
             skipped_existing += 1
-            continue
-        path = s["local_filepath"] if "local_filepath" in s else None
-        if path and os.path.isfile(path):
-            valid_ids.append(s.id)
-            valid_paths.append(path)
+        else:
+            path = s["local_filepath"] if "local_filepath" in s else None
+            if path and os.path.isfile(path):
+                valid_ids.append(s.id)
+                valid_paths.append(path)
+        if scanned % 10000 == 0:
+            logger.info(
+                "Scanning filepaths: %s/%s (valid=%s, skipped_existing=%s, %.0fs)",
+                scanned,
+                total_samples,
+                len(valid_ids),
+                skipped_existing,
+                time.monotonic() - scan_started,
+            )
 
     if not valid_ids:
         if skipped_existing:
@@ -469,7 +500,7 @@ def _compute_embeddings_via_service(
     embeddings_field: str,
     service_url: str,
     batch_size: int = 32,
-    poll_timeout: float = 10.0,
+    poll_timeout: float = _WS_JOB_TIMEOUT,
     concurrency: int = DEFAULT_EMBEDDING_CONCURRENCY,
     skip_existing: bool = True,
 ) -> int:
@@ -544,7 +575,8 @@ def compute_embeddings_and_viz(
 
     logger.info(
         f"Embeddings from service: {base_url}/embed/ | project={project_name} field={embeddings_field} "
-        f"brain_key={brain_key} batch_size={batch_size} concurrency={concurrency or DEFAULT_EMBEDDING_CONCURRENCY}"
+        f"brain_key={brain_key} batch_size={batch_size} concurrency={concurrency or DEFAULT_EMBEDDING_CONCURRENCY} "
+        f"ws_timeout={_WS_JOB_TIMEOUT}s"
     )
 
     # --- Embeddings (from service) ---
@@ -635,7 +667,8 @@ def compute_embeddings_and_viz(
             embeddings=embeddings_array,
             brain_key=brain_key,
             method="umap",
-            verbose=True,
+            verbose=False,
+            progress=False,
             seed=umap_seed,
         )
         logger.info(f"Visualization stored with brain key: {brain_key}")
@@ -663,6 +696,7 @@ def compute_embeddings_and_viz(
                 embeddings=embeddings_array,
                 metric=similarity_metric,
                 brain_key=similarity_brain_key,
+                progress=False,
             )
             logger.info(f"Similarity stored with brain key: {similarity_brain_key}")
 
@@ -724,7 +758,8 @@ def compute_dimensionality_reduction(
         embeddings=embeddings_field,
         brain_key=brain_key,
         method=method,
-        verbose=True,
+        verbose=False,
+        progress=False,
         num_dims=num_dims,
     )
 
