@@ -9,8 +9,8 @@ Phase 2 implementation. Requires fiftyone, tator, PyYAML and MongoDB. Cropping u
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 import ast
-import glob
 import json
 import logging
 import os
@@ -70,6 +70,8 @@ logger.addHandler(handler)
 # Fallback batch sizes when not set in config (see config.yml: media_id_batch_size, localization_batch_size)
 _DEFAULT_MEDIA_ID_BATCH_SIZE = 200
 _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
+# add_samples / reconcile add-new batch size (bounds memory on large datasets).
+_DATASET_ADD_BATCH_SIZE = 100
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
@@ -3331,20 +3333,9 @@ def reconcile_dataset_with_tator(
             "(no longer verified; verified_only enabled)"
         )
 
-    # 2. Update samples with changed modified_datetime (crop already overwritten by crop_localizations_parallel)
+    # 2. Update changed samples. Save immediately; do not retain every fo.Sample.
     logger.info("Reconcile: Update samples with changed modified_datetime")
     updated = 0
-
-    # Pre-collect all samples that need checking to avoid multiple passes
-    # Create a dict mapping elemental_id to sample for faster lookups
-    eid_to_sample = {}
-    samples_to_update = []
-
-    for sample in dataset.iter_samples(autosave=False):
-        elemental_id = getattr(sample, "elemental_id", None)
-        if elemental_id and str(elemental_id) in loc_index:
-            eid_to_sample[str(elemental_id)] = sample
-
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
@@ -3353,57 +3344,52 @@ def reconcile_dataset_with_tator(
     if force_sync:
         logger.info("Reconcile: force_sync enabled — rewriting all samples")
 
-    samples_to_fix_storage: list[fo.Sample] = []
-    for eid, sample in eid_to_sample.items():
-        loc = loc_index[eid]
-
-        if force_sync:
-            samples_to_update.append((sample, loc))
-            updated += 1
+    for sample in dataset.iter_samples(autosave=False):
+        elemental_id = getattr(sample, "elemental_id", None)
+        if not elemental_id or str(elemental_id) not in loc_index:
             continue
-
-        modified_at = _to_datetime(
-            loc.get("modified_datetime") or loc.get("created_datetime")
-        )
-        tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
-        if was_fixed:
-            samples_to_fix_storage.append(sample)
-        mod_ts = _normalize_modified_at(modified_at)
-        last_ts = _normalize_modified_at(tator_modified_at)
-
-        has_prediction = sample.has_field("top1_prediction") and sample["top1_prediction"] is not None
-        logger.debug(
-            f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} {TATOR_MODIFIED_AT_FIELD}: {tator_modified_at} has_prediction: {has_prediction}"
-        )
-        needs_update = (mod_ts is not None and mod_ts != last_ts) or not has_prediction
-        if needs_update:
-            reason = "timestamp_changed" if (mod_ts is not None and mod_ts != last_ts) else "missing_prediction"
-            logger.debug(
-                f"Sample {sample.id} needs update ({reason}): {eid}"
+        eid = str(elemental_id)
+        loc = loc_index[eid]
+        apply_update = force_sync
+        was_fixed = False
+        if not apply_update:
+            modified_at = _to_datetime(
+                loc.get("modified_datetime") or loc.get("created_datetime")
             )
-            samples_to_update.append((sample, loc))
-            updated += 1
-
-    # Persist samples whose tator_modified_at was normalized from non-datetime
-    for sample in samples_to_fix_storage:
-        sample.save()
-
-    # Apply current localization data to changed samples and save
-    if samples_to_update:
-        batch_size = 1000
-        for i in range(0, len(samples_to_update), batch_size):
-            batch = samples_to_update[i : i + batch_size]
-            for sample, loc in batch:
-                _apply_loc_to_sample(
-                    sample,
-                    loc,
-                    api_url=api_url,
-                    project_id=project_id,
-                    version_id=version_id,
-                    media_attributes_map=media_attributes_map,
+            tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
+            mod_ts = _normalize_modified_at(modified_at)
+            last_ts = _normalize_modified_at(tator_modified_at)
+            has_prediction = (
+                sample.has_field("top1_prediction")
+                and sample["top1_prediction"] is not None
+            )
+            logger.debug(
+                f"Checking sample {sample.id} for update: {eid} modified_at: {modified_at} "
+                f"{TATOR_MODIFIED_AT_FIELD}: {tator_modified_at} has_prediction: {has_prediction}"
+            )
+            apply_update = (mod_ts is not None and mod_ts != last_ts) or not has_prediction
+            if apply_update:
+                reason = (
+                    "timestamp_changed"
+                    if (mod_ts is not None and mod_ts != last_ts)
+                    else "missing_prediction"
                 )
-                sample.save()
+                logger.debug(f"Sample {sample.id} needs update ({reason}): {eid}")
+        if apply_update:
+            _apply_loc_to_sample(
+                sample,
+                loc,
+                api_url=api_url,
+                project_id=project_id,
+                version_id=version_id,
+                media_attributes_map=media_attributes_map,
+            )
+            sample.save()
+            updated += 1
+        elif was_fixed:
+            sample.save()
 
+    if updated:
         logger.info(f"Reconcile: updated {updated} samples (box changed)")
 
     # 3. Add new samples (elemental_id in Tator but not in dataset)
@@ -3423,7 +3409,7 @@ def reconcile_dataset_with_tator(
     if new_eids:
         # Batch create samples for better performance
         added = 0
-        batch_size = 100  # Adjust based on your needs
+        batch_size = _DATASET_ADD_BATCH_SIZE
         samples_to_add = []
 
         # Pre-filter valid media_ids to avoid repeated checks
@@ -3492,6 +3478,80 @@ def _get_label_from_loc(loc: dict) -> str:
     return "Unknown"
 
 
+def _crop_suffixes(image_extensions: list[str] | None) -> set[str]:
+    """Normalize config globs like '*.png' to lowercase suffixes {'.png', ...}."""
+    suffixes: set[str] = set()
+    for pat in image_extensions or []:
+        name = str(pat).rsplit("/", 1)[-1]
+        if name.startswith("*."):
+            suffixes.add(name[1:].lower())
+        elif name.startswith("."):
+            suffixes.add(name.lower())
+        elif name:
+            suffixes.add(f".{name.lower()}")
+    return suffixes or {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
+
+
+def _iter_crop_filepaths(
+    crops_dir: str, image_extensions: list[str] | None = None
+) -> Iterator[str]:
+    """Yield crop file paths under crops_dir without materializing the full list."""
+    if not crops_dir or not os.path.isdir(crops_dir):
+        return
+    suffixes = _crop_suffixes(image_extensions)
+    for dirpath, _dirnames, filenames in os.walk(crops_dir):
+        for name in filenames:
+            if Path(name).suffix.lower() in suffixes:
+                yield os.path.join(dirpath, name)
+
+
+def _sample_from_crop_filepath(
+    filepath: str,
+    crops_dir: str,
+    loc_index: dict[str, dict],
+    config: dict[str, Any],
+    include_classes: set[str],
+    verified_only: bool,
+) -> Any | None:
+    """Build one FiftyOne sample from a crop path, or None if filtered out."""
+    rel = os.path.relpath(filepath, crops_dir)
+    parts = Path(rel).parts
+    if len(parts) < 2:
+        return None
+    media_stem = parts[0]
+    elemental_id = Path(filepath).stem
+    loc = loc_index.get(elemental_id)
+    label = _get_label_from_loc(loc) if loc else (media_stem or "Unknown")
+    if include_classes and label not in include_classes:
+        return None
+    if verified_only and not _loc_is_verified(loc):
+        return None
+    sample = fo.Sample(
+        filepath=_crop_filepath_for_sample(
+            media_stem,
+            elemental_id,
+            crops_dir,
+            s3_bucket=config.get("s3_bucket"),
+            s3_prefix=config.get("s3_prefix"),
+        )
+    )
+    sample["local_filepath"] = filepath
+    sample["elemental_id"] = elemental_id
+    sample["media_stem"] = media_stem
+    if loc:
+        _apply_loc_to_sample(
+            sample,
+            loc,
+            api_url=config.get("api_url"),
+            project_id=config.get("project_id"),
+            version_id=config.get("version_id"),
+            media_attributes_map=config.get("media_attributes_map") or {},
+        )
+    else:
+        sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
+    return sample
+
+
 def _loc_is_verified(loc: dict | None) -> bool:
     """True if the localization's `verified` attribute is truthy.
 
@@ -3537,81 +3597,17 @@ def build_fiftyone_dataset_from_crops(
         "*.tiff",
     ]
     max_samples = config.get("max_samples")
-    force_sync = bool(config.get("force_sync"))
     dataset_already_exists = dataset_name in fo.list_datasets()
 
     # Load localizations index by elemental_id
     loc_index = _load_localizations_index(localizations_jsonl_path)
     logger.info(f"Loaded {len(loc_index)} localizations from JSONL")
 
-    # Collect crop filepaths
-    samples: list = []
-    seen = 0
-    s3_bucket = config.get("s3_bucket")
-    s3_prefix = config.get("s3_prefix")
-    for ext in image_extensions:
-        pat = os.path.join(crops_dir, "**", ext)
-        for filepath in glob.glob(pat):
-            seen += 1
-            if max_samples and len(samples) >= max_samples:
-                break
-            rel = os.path.relpath(filepath, crops_dir)
-            parts = Path(rel).parts
-            if len(parts) < 2:
-                continue
-            media_stem = parts[0]
-            elemental_id = Path(filepath).stem
-
-            loc = loc_index.get(elemental_id)
-            label = _get_label_from_loc(loc) if loc else (media_stem or "Unknown")
-
-            if include_classes and label not in include_classes:
-                continue
-            if verified_only and not _loc_is_verified(loc):
-                continue
-
-            sample_filepath = _crop_filepath_for_sample(
-                media_stem,
-                elemental_id,
-                crops_dir,
-                s3_bucket=s3_bucket,
-                s3_prefix=s3_prefix,
-            )
-            sample = fo.Sample(filepath=sample_filepath)
-            sample["local_filepath"] = filepath
-            sample["elemental_id"] = elemental_id
-            sample["media_stem"] = media_stem
-            media_attrs_map = config.get("media_attributes_map") or {}
-            if loc:
-                if not dataset_already_exists or force_sync:
-                    _apply_loc_to_sample(
-                        sample,
-                        loc,
-                        api_url=config.get("api_url"),
-                        project_id=config.get("project_id"),
-                        version_id=config.get("version_id"),
-                        media_attributes_map=media_attrs_map,
-                    )
-                else:
-                    _apply_media_attrs_to_sample(sample, loc, media_attrs_map)
-            else:
-                sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
-            samples.append(sample)
-        if max_samples and len(samples) >= max_samples:
-            break
-
-    if not samples:
-        raise ValueError(f"No crops found in {crops_dir} (checked {seen} files)")
-
-    logger.info(f"Collected {len(samples)} samples for dataset")
-
-    # Handle existing dataset: always reconcile, never delete
+    # Existing dataset: reconcile in place without materializing every crop.
     if dataset_already_exists:
         logger.info(f"Reconcile: loading dataset {dataset_name}...")
         dataset = fo.load_dataset(dataset_name)
-        dataset.persistent = (
-            True  # Ensure dataset persists in MongoDB after session ends
-        )
+        dataset.persistent = True
         dataset = reconcile_dataset_with_tator(
             dataset=dataset,
             loc_index=loc_index,
@@ -3628,10 +3624,36 @@ def build_fiftyone_dataset_from_crops(
         f"Reconcile: creating new dataset {dataset_name} in database {fo.config.database_name}"
     )
     dataset = fo.Dataset(dataset_name)
-    dataset.persistent = True  # Persist dataset in MongoDB after session ends
-    dataset.add_samples(samples)
+    dataset.persistent = True
+    batch: list = []
+    added = 0
+    seen = 0
+    batch_size = _DATASET_ADD_BATCH_SIZE
+    for filepath in _iter_crop_filepaths(crops_dir, image_extensions):
+        seen += 1
+        if max_samples and added >= max_samples:
+            break
+        sample = _sample_from_crop_filepath(
+            filepath,
+            crops_dir,
+            loc_index,
+            config,
+            include_classes,
+            verified_only,
+        )
+        if sample is None:
+            continue
+        batch.append(sample)
+        added += 1
+        if len(batch) >= batch_size:
+            dataset.add_samples(batch)
+            batch = []
+    if batch:
+        dataset.add_samples(batch)
+    if added == 0:
+        raise ValueError(f"No crops found in {crops_dir} (checked {seen} files)")
     _ensure_field_indexes(dataset)
-    logger.info(f"Created dataset '{dataset_name}' with {len(samples)} samples")
+    logger.info(f"Created dataset '{dataset_name}' with {added} samples")
     return dataset
 
 
