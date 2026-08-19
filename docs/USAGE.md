@@ -219,11 +219,11 @@ To recompute dimensionality reduction without re-embedding, use `POST /dimreduce
 
 For UMAP visualization, install `umap-learn` in the sync service venv:
 
-When using nested `vss_projects` in `FIFTYONE_SYNC_CONFIG_PATH`, the **dict key** (e.g. `MBARI UAV Images`) is sent to Fast-VSS as `/embed/{key}` and in the WebSocket job path. It must match the slug Fast-VSS accepts (often the same string listed by `GET /projects`), not the Tator numeric project ID. The nested `vss_project:` value is shown in the applet dropdown and used to check registration against `/projects`.
-
 ```bash
 pip install umap-learn
 ```
+
+When using nested `vss_projects` in `FIFTYONE_SYNC_CONFIG_PATH`, the **dict key** (e.g. `MBARI UAV Images`) is sent to Fast-VSS as `/embed/{key}` and in the WebSocket job path. It must match the slug Fast-VSS accepts (often the same string listed by `GET /projects`), not the Tator numeric project ID. The nested `vss_project:` value is shown in the applet dropdown and used to check registration against `/projects`.
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 
