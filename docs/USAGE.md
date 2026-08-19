@@ -214,6 +214,8 @@ To recompute dimensionality reduction without re-embedding, use `POST /dimreduce
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `FASTVSS_WS_TEST_TIMEOUT` | `120` | Max wait for applet `GET /vss-embedding/ws-test` |
+
+`GET /vss-embedding/ws-test` succeeds only when Fast-VSS returns embeddings (sync) or a `job_id` whose WebSocket completes. A 200 with only `Comment`/`error` and no vectors (e.g. prefix names like `MBARI`) is treated as failure.
 | `FASTVSS_WS_MAX_WAIT` | `300` | Max wait per embed job over WebSocket (ws-test background + sync) |
 | `FASTVSS_WS_CONNECT_TIMEOUT` | `30` | WebSocket handshake timeout |
 

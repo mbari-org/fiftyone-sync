@@ -2,7 +2,11 @@
 # Filename: tests/test_fastvss_ws_url.py
 # Description: Tests for Fast-VSS WebSocket URL helpers (issue #36).
 
-from src.app.embedding_service import fastvss_ws_job_url, fastvss_ws_origin_from_base
+from src.app.embedding_service import (
+    extract_sync_embeddings,
+    fastvss_ws_job_url,
+    fastvss_ws_origin_from_base,
+)
 
 
 def test_fastvss_ws_job_url_encodes_spaces_in_project():
@@ -48,3 +52,25 @@ def test_fastvss_ws_test_timeout_env(monkeypatch):
 
     monkeypatch.delenv("FASTVSS_WS_TEST_TIMEOUT", raising=False)
     assert es.fastvss_ws_test_timeout_seconds() == 120.0
+
+
+def test_extract_sync_embeddings_accepts_vector_list():
+    assert extract_sync_embeddings({"embeddings": [[0.1, 0.2]]}) == [[0.1, 0.2]]
+    assert extract_sync_embeddings([[0.1, 0.2], [0.3, 0.4]]) == [
+        [0.1, 0.2],
+        [0.3, 0.4],
+    ]
+
+
+def test_extract_sync_embeddings_rejects_comment_or_error_without_vectors():
+    assert (
+        extract_sync_embeddings(
+            {
+                "Comment": "Use /predict/job/abc/MBARI UAV Images to check status.",
+            }
+        )
+        is None
+    )
+    assert extract_sync_embeddings({"error": "Invalid project name MBARI"}) is None
+    assert extract_sync_embeddings({"embeddings": []}) is None
+    assert extract_sync_embeddings({"embeddings": ["not-a-vector"]}) is None

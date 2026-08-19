@@ -73,6 +73,37 @@ def fastvss_ws_origin_from_base(ws_base: str) -> str:
     return f"{scheme}://{netloc}"
 
 
+def extract_sync_embeddings(data: Any) -> list[Any] | None:
+    """
+    Return embedding vectors from a synchronous Fast-VSS POST body, or None.
+
+    A 200 without job_id is only a success when the body contains a non-empty
+    embeddings list (or is itself a list of vectors). Prefix / unknown project
+    names that return Comment/error JSON must not be treated as completed.
+    """
+    if isinstance(data, list):
+        return data if _looks_like_embedding_list(data) else None
+    if not isinstance(data, dict):
+        return None
+    if data.get("error"):
+        return None
+    emb = data.get("embeddings")
+    if isinstance(emb, list) and _looks_like_embedding_list(emb):
+        return emb
+    return None
+
+
+def _looks_like_embedding_list(emb: list[Any]) -> bool:
+    if not emb:
+        return False
+    first = emb[0]
+    if isinstance(first, (int, float)):
+        return True
+    if isinstance(first, list) and first and isinstance(first[0], (int, float)):
+        return True
+    return False
+
+
 def is_embedding_service_available() -> bool:
     """
     Return True if the Fast-VSS embedding service is reachable (GET /projects).
@@ -269,13 +300,17 @@ async def queue_embedding_job(
 
                 asyncio.create_task(wait_job())
             else:
-                # Sync response with embeddings (no job_id, embeddings in response)
+                keys = (
+                    list(data.keys())
+                    if isinstance(data, dict)
+                    else type(data).__name__
+                )
                 logger.info(
                     "[embedding_service] Sync response (no job_id) keys=%s",
-                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                    keys,
                 )
-                emb = data.get("embeddings") or data
-                if isinstance(emb, list):
+                emb = extract_sync_embeddings(data)
+                if emb is not None:
                     async with _queue_lock:
                         _queue_results[job_id] = {
                             "status": "completed",
@@ -283,11 +318,25 @@ async def queue_embedding_job(
                             "error": None,
                         }
                 else:
+                    if isinstance(data, dict):
+                        err_msg = (
+                            data.get("error")
+                            or data.get("message")
+                            or data.get("Comment")
+                            or f"no job_id and no embeddings (keys={keys})"
+                        )
+                    else:
+                        err_msg = f"no job_id and no embeddings ({type(data).__name__})"
+                    logger.warning(
+                        "[embedding_service] POST has no job_id/embeddings project=%r: %s",
+                        project,
+                        err_msg,
+                    )
                     async with _queue_lock:
                         _queue_results[job_id] = {
-                            "status": "completed",
-                            "embeddings": [emb],
-                            "error": None,
+                            "status": "failed",
+                            "embeddings": None,
+                            "error": str(err_msg),
                         }
         except Exception as e:
             err_detail = str(e)
