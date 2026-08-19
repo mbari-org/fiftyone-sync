@@ -38,3 +38,13 @@ def test_fastvss_ws_origin_from_base_http():
         fastvss_ws_origin_from_base("ws://localhost:8000/vss")
         == "http://localhost:8000"
     )
+
+
+def test_fastvss_ws_test_timeout_env(monkeypatch):
+    from src.app import embedding_service as es
+
+    monkeypatch.setenv("FASTVSS_WS_TEST_TIMEOUT", "90")
+    assert es.fastvss_ws_test_timeout_seconds() == 90.0
+
+    monkeypatch.delenv("FASTVSS_WS_TEST_TIMEOUT", raising=False)
+    assert es.fastvss_ws_test_timeout_seconds() == 120.0

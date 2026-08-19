@@ -31,8 +31,33 @@ _queue_results: dict[str, dict[str, Any]] = {}
 _queue_lock = asyncio.Lock()
 
 # Align with Fast-VSS WS_MAX_WAIT (max time to wait for job result over WebSocket)
-_WS_MAX_WAIT = 300
-_WS_CONNECT_TIMEOUT = 30
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def fastvss_ws_max_wait_seconds() -> float:
+    """Max seconds to wait for one Fast-VSS job over WebSocket (FASTVSS_WS_MAX_WAIT, default 300)."""
+    return _env_float("FASTVSS_WS_MAX_WAIT", 300.0)
+
+
+def fastvss_ws_connect_timeout_seconds() -> float:
+    """WebSocket handshake timeout (FASTVSS_WS_CONNECT_TIMEOUT, default 30)."""
+    return _env_float("FASTVSS_WS_CONNECT_TIMEOUT", 30.0)
+
+
+def fastvss_ws_test_timeout_seconds() -> float:
+    """Max seconds for /vss-embedding/ws-test to wait for a fake job (FASTVSS_WS_TEST_TIMEOUT, default 120)."""
+    return _env_float("FASTVSS_WS_TEST_TIMEOUT", 120.0)
+
+
+_WS_MAX_WAIT = fastvss_ws_max_wait_seconds()
+_WS_CONNECT_TIMEOUT = fastvss_ws_connect_timeout_seconds()
 
 
 def fastvss_ws_job_url(ws_base: str, job_id: str, project: str) -> str:
@@ -305,7 +330,6 @@ _FAKE_IMAGE_PNG = (
     b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
-_WS_TEST_TIMEOUT = 30.0
 _WS_TEST_POLL_INTERVAL = 0.5
 
 
@@ -322,7 +346,7 @@ async def test_embedding_websocket(project: str = "default") -> tuple[bool, str 
             ["test_1x1.png"],
             project=project,
         )
-        deadline = time.monotonic() + _WS_TEST_TIMEOUT
+        deadline = time.monotonic() + fastvss_ws_test_timeout_seconds()
         while time.monotonic() < deadline:
             result = _queue_results.get(job_id)
             if result is None:
