@@ -22,6 +22,8 @@ from typing import Optional
 
 import fiftyone as fo
 
+from src.app.embedding_service import fastvss_ws_job_url
+
 logger = logging.getLogger(__name__)
 
 # Base URL for embed service (POST /embed/{project}, job status via WS /ws/predict/job/{job_id}/{project})
@@ -240,7 +242,7 @@ async def _poll_and_save_batch_with_retries(
     """Poll the WebSocket for a job's result and save embeddings onto the given samples. Returns saved count."""
     import numpy as np
 
-    ws_url = f"{ws_base}/ws/predict/job/{job_id}/{project_name}"
+    ws_url = fastvss_ws_job_url(ws_base, job_id, project_name)
     logger.debug(f"WebSocket URL: {ws_url}")
     last_error: Exception | None = None
     for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):

@@ -211,6 +211,8 @@ To recompute dimensionality reduction without re-embedding, use `POST /dimreduce
 
 **Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
 
+When using nested `vss_projects` in `FIFTYONE_SYNC_CONFIG_PATH`, the **dict key** (e.g. `MBARI UAV Images`) is sent to Fast-VSS as `/embed/{key}` and in the WebSocket job path. It must match the slug Fast-VSS accepts (often the same string listed by `GET /projects`), not the Tator numeric project ID. The nested `vss_project:` value is shown in the applet dropdown and used to check registration against `/projects`.
+
 ```bash
 pip install umap-learn
 ```

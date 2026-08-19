@@ -15,6 +15,7 @@ import os
 import time
 import uuid
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import httpx
 import websockets
@@ -32,6 +33,19 @@ _queue_lock = asyncio.Lock()
 # Align with Fast-VSS WS_MAX_WAIT (max time to wait for job result over WebSocket)
 _WS_MAX_WAIT = 300
 _WS_CONNECT_TIMEOUT = 30
+
+
+def fastvss_ws_job_url(ws_base: str, job_id: str, project: str) -> str:
+    """Build Fast-VSS WebSocket URL with URL-encoded project path segment."""
+    return f"{ws_base.rstrip('/')}/ws/predict/job/{job_id}/{quote(project, safe='')}"
+
+
+def fastvss_ws_origin_from_base(ws_base: str) -> str:
+    """Derive HTTP Origin from WebSocket base (wss://host -> https://host)."""
+    parsed = urlparse(ws_base if "://" in ws_base else f"ws://{ws_base}")
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    netloc = parsed.netloc or parsed.path.split("/")[0] or "localhost"
+    return f"{scheme}://{netloc}"
 
 
 def is_embedding_service_available() -> bool:
@@ -132,7 +146,8 @@ async def queue_embedding_job(
                         ws_base = "ws://" + FASTVSS_BASE_URL[7:]
                     else:
                         ws_base = "ws://" + FASTVSS_BASE_URL
-                    url = f"{ws_base}/ws/predict/job/{str(fastvss_job_id)}/{project}"
+                    url = fastvss_ws_job_url(ws_base, str(fastvss_job_id), project)
+                    origin = fastvss_ws_origin_from_base(ws_base)
                     logger.info(
                         "[embedding_service] WebSocket connect ws_base=%s job_id=%s project=%s url=%s",
                         ws_base,
@@ -146,6 +161,7 @@ async def queue_embedding_job(
                             open_timeout=_WS_CONNECT_TIMEOUT,
                             close_timeout=5,
                             max_size=10 * 1024 * 1024,
+                            additional_headers={"Origin": origin},
                         ) as ws:
                             deadline = time.monotonic() + _WS_MAX_WAIT
                             while True:
