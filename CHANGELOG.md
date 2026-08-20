@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.12.3 (2026-08-20)
+
+### Bug Fixes
+
+- **app**: Encode Fast-VSS WebSocket project paths and reject empty embed POSTs (#37)
+  ([#37](https://github.com/mbari-org/fiftyone-sync/pull/37),
+  [`372ad98`](https://github.com/mbari-org/fiftyone-sync/commit/372ad9861c93e4776acd2b8b6a9a7d2a60f43c85))
+
+
 ## v0.12.2 (2026-08-04)
 
 ### Bug Fixes

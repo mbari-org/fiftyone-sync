@@ -8,6 +8,6 @@ try:
     try:
         __version__: str = _pkg_version("fiftyone-sync")
     except PackageNotFoundError:
-        __version__ = "0.12.2"
+        __version__ = "0.12.3"
 except ImportError:
-    __version__ = "0.12.2"
+    __version__ = "0.12.3"
