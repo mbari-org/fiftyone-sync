@@ -209,11 +209,23 @@ To recompute dimensionality reduction without re-embedding, use `POST /dimreduce
 
 `concurrency` bounds how many batches are submitted to and awaited from the embed service at the same time (default 4). Increasing it speeds up embedding computation on services with spare capacity; at most `concurrency` jobs are ever in flight at once, regardless of how many batches remain, so it never overwhelms the service or risks jobs expiring while waiting to be polled.
 
-**Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. For UMAP visualization, install `umap-learn` in the sync service venv:
+**Requirements:** The embed service must be running (e.g. Fast-VSS at the URL above). Set `FASTVSS_API_URL` to override the base URL. Optional timeouts (seconds) on the sync API / worker:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `FASTVSS_WS_TEST_TIMEOUT` | `120` | Max wait for applet `GET /vss-embedding/ws-test` |
+
+`GET /vss-embedding/ws-test` succeeds only when Fast-VSS returns embeddings (sync) or a `job_id` whose WebSocket completes. A 200 with only `Comment`/`error` and no vectors (e.g. prefix names like `MBARI`) is treated as failure.
+| `FASTVSS_WS_MAX_WAIT` | `300` | Max wait per embed job over WebSocket (ws-test background + sync) |
+| `FASTVSS_WS_CONNECT_TIMEOUT` | `30` | WebSocket handshake timeout |
+
+For UMAP visualization, install `umap-learn` in the sync service venv:
 
 ```bash
 pip install umap-learn
 ```
+
+When using nested `vss_projects` in `FIFTYONE_SYNC_CONFIG_PATH`, the **dict key** (e.g. `MBARI UAV Images`) is sent to Fast-VSS as `/embed/{key}` and in the WebSocket job path. It must match the slug Fast-VSS accepts (often the same string listed by `GET /projects`), not the Tator numeric project ID. The nested `vss_project:` value is shown in the applet dropdown and used to check registration against `/projects`.
 
 If the embed service is unavailable or UMAP is not installed, sync still runs; embeddings/UMAP/similarity are skipped and a message is logged. Embeddings, UMAP, and similarity results are cached on the dataset; use `force_embeddings` / `force_umap` / `force_similarity` to recompute.
 

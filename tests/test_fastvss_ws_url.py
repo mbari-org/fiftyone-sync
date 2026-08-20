@@ -1,0 +1,76 @@
+# fiftyone-sync, Apache-2.0 license
+# Filename: tests/test_fastvss_ws_url.py
+# Description: Tests for Fast-VSS WebSocket URL helpers (issue #36).
+
+from src.app.embedding_service import (
+    extract_sync_embeddings,
+    fastvss_ws_job_url,
+    fastvss_ws_origin_from_base,
+)
+
+
+def test_fastvss_ws_job_url_encodes_spaces_in_project():
+    url = fastvss_ws_job_url(
+        "wss://cortex.example.org/vss-uav",
+        "abc-123",
+        "MBARI UAV Images",
+    )
+    assert (
+        url
+        == "wss://cortex.example.org/vss-uav/ws/predict/job/abc-123/MBARI%20UAV%20Images"
+    )
+
+
+def test_fastvss_ws_job_url_leaves_simple_project_unchanged():
+    url = fastvss_ws_job_url(
+        "wss://cortex.example.org/vss-uav",
+        "job-1",
+        "high-mag",
+    )
+    assert url == "wss://cortex.example.org/vss-uav/ws/predict/job/job-1/high-mag"
+
+
+def test_fastvss_ws_origin_from_base_https():
+    assert (
+        fastvss_ws_origin_from_base("wss://cortex.example.org/vss-uav")
+        == "https://cortex.example.org"
+    )
+
+
+def test_fastvss_ws_origin_from_base_http():
+    assert (
+        fastvss_ws_origin_from_base("ws://localhost:8000/vss")
+        == "http://localhost:8000"
+    )
+
+
+def test_fastvss_ws_test_timeout_env(monkeypatch):
+    from src.app import embedding_service as es
+
+    monkeypatch.setenv("FASTVSS_WS_TEST_TIMEOUT", "90")
+    assert es.fastvss_ws_test_timeout_seconds() == 90.0
+
+    monkeypatch.delenv("FASTVSS_WS_TEST_TIMEOUT", raising=False)
+    assert es.fastvss_ws_test_timeout_seconds() == 120.0
+
+
+def test_extract_sync_embeddings_accepts_vector_list():
+    assert extract_sync_embeddings({"embeddings": [[0.1, 0.2]]}) == [[0.1, 0.2]]
+    assert extract_sync_embeddings([[0.1, 0.2], [0.3, 0.4]]) == [
+        [0.1, 0.2],
+        [0.3, 0.4],
+    ]
+
+
+def test_extract_sync_embeddings_rejects_comment_or_error_without_vectors():
+    assert (
+        extract_sync_embeddings(
+            {
+                "Comment": "Use /predict/job/abc/MBARI UAV Images to check status.",
+            }
+        )
+        is None
+    )
+    assert extract_sync_embeddings({"error": "Invalid project name MBARI"}) is None
+    assert extract_sync_embeddings({"embeddings": []}) is None
+    assert extract_sync_embeddings({"embeddings": ["not-a-vector"]}) is None

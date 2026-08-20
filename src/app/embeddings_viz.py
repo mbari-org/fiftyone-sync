@@ -22,6 +22,8 @@ from typing import Optional
 
 import fiftyone as fo
 
+from src.app.embedding_service import fastvss_ws_job_url, fastvss_ws_max_wait_seconds
+
 logger = logging.getLogger(__name__)
 
 # Base URL for embed service (POST /embed/{project}, job status via WS /ws/predict/job/{job_id}/{project})
@@ -38,8 +40,8 @@ EMBEDDING_FETCH_MAX_RETRIES = 3
 # to prevent, while still parallelizing the network round-trip wait across batches.
 DEFAULT_EMBEDDING_CONCURRENCY = 4
 
-# Max time to wait for one job over WebSocket (align with Fast-VSS WS_MAX_WAIT)
-_WS_JOB_TIMEOUT = 10.0
+# Max time to wait for one job over WebSocket (FASTVSS_WS_MAX_WAIT, default 300)
+_WS_JOB_TIMEOUT = fastvss_ws_max_wait_seconds()
 
 # Rough throughput estimate for the upfront ETA logged before processing starts;
 # actual progress logs below use the measured rate instead once a few batches complete.
@@ -240,7 +242,7 @@ async def _poll_and_save_batch_with_retries(
     """Poll the WebSocket for a job's result and save embeddings onto the given samples. Returns saved count."""
     import numpy as np
 
-    ws_url = f"{ws_base}/ws/predict/job/{job_id}/{project_name}"
+    ws_url = fastvss_ws_job_url(ws_base, job_id, project_name)
     logger.debug(f"WebSocket URL: {ws_url}")
     last_error: Exception | None = None
     for attempt in range(EMBEDDING_FETCH_MAX_RETRIES):

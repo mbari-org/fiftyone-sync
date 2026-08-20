@@ -15,6 +15,7 @@ import os
 import time
 import uuid
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import httpx
 import websockets
@@ -30,8 +31,77 @@ _queue_results: dict[str, dict[str, Any]] = {}
 _queue_lock = asyncio.Lock()
 
 # Align with Fast-VSS WS_MAX_WAIT (max time to wait for job result over WebSocket)
-_WS_MAX_WAIT = 300
-_WS_CONNECT_TIMEOUT = 30
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def fastvss_ws_max_wait_seconds() -> float:
+    """Max seconds to wait for one Fast-VSS job over WebSocket (FASTVSS_WS_MAX_WAIT, default 300)."""
+    return _env_float("FASTVSS_WS_MAX_WAIT", 300.0)
+
+
+def fastvss_ws_connect_timeout_seconds() -> float:
+    """WebSocket handshake timeout (FASTVSS_WS_CONNECT_TIMEOUT, default 30)."""
+    return _env_float("FASTVSS_WS_CONNECT_TIMEOUT", 30.0)
+
+
+def fastvss_ws_test_timeout_seconds() -> float:
+    """Max seconds for /vss-embedding/ws-test to wait for a fake job (FASTVSS_WS_TEST_TIMEOUT, default 120)."""
+    return _env_float("FASTVSS_WS_TEST_TIMEOUT", 120.0)
+
+
+_WS_MAX_WAIT = fastvss_ws_max_wait_seconds()
+_WS_CONNECT_TIMEOUT = fastvss_ws_connect_timeout_seconds()
+
+
+def fastvss_ws_job_url(ws_base: str, job_id: str, project: str) -> str:
+    """Build Fast-VSS WebSocket URL with URL-encoded project path segment."""
+    return f"{ws_base.rstrip('/')}/ws/predict/job/{job_id}/{quote(project, safe='')}"
+
+
+def fastvss_ws_origin_from_base(ws_base: str) -> str:
+    """Derive HTTP Origin from WebSocket base (wss://host -> https://host)."""
+    parsed = urlparse(ws_base if "://" in ws_base else f"ws://{ws_base}")
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    netloc = parsed.netloc or parsed.path.split("/")[0] or "localhost"
+    return f"{scheme}://{netloc}"
+
+
+def extract_sync_embeddings(data: Any) -> list[Any] | None:
+    """
+    Return embedding vectors from a synchronous Fast-VSS POST body, or None.
+
+    A 200 without job_id is only a success when the body contains a non-empty
+    embeddings list (or is itself a list of vectors). Prefix / unknown project
+    names that return Comment/error JSON must not be treated as completed.
+    """
+    if isinstance(data, list):
+        return data if _looks_like_embedding_list(data) else None
+    if not isinstance(data, dict):
+        return None
+    if data.get("error"):
+        return None
+    emb = data.get("embeddings")
+    if isinstance(emb, list) and _looks_like_embedding_list(emb):
+        return emb
+    return None
+
+
+def _looks_like_embedding_list(emb: list[Any]) -> bool:
+    if not emb:
+        return False
+    first = emb[0]
+    if isinstance(first, (int, float)):
+        return True
+    if isinstance(first, list) and first and isinstance(first[0], (int, float)):
+        return True
+    return False
 
 
 def is_embedding_service_available() -> bool:
@@ -132,7 +202,8 @@ async def queue_embedding_job(
                         ws_base = "ws://" + FASTVSS_BASE_URL[7:]
                     else:
                         ws_base = "ws://" + FASTVSS_BASE_URL
-                    url = f"{ws_base}/ws/predict/job/{str(fastvss_job_id)}/{project}"
+                    url = fastvss_ws_job_url(ws_base, str(fastvss_job_id), project)
+                    origin = fastvss_ws_origin_from_base(ws_base)
                     logger.info(
                         "[embedding_service] WebSocket connect ws_base=%s job_id=%s project=%s url=%s",
                         ws_base,
@@ -146,6 +217,7 @@ async def queue_embedding_job(
                             open_timeout=_WS_CONNECT_TIMEOUT,
                             close_timeout=5,
                             max_size=10 * 1024 * 1024,
+                            additional_headers={"Origin": origin},
                         ) as ws:
                             deadline = time.monotonic() + _WS_MAX_WAIT
                             while True:
@@ -228,13 +300,17 @@ async def queue_embedding_job(
 
                 asyncio.create_task(wait_job())
             else:
-                # Sync response with embeddings (no job_id, embeddings in response)
+                keys = (
+                    list(data.keys())
+                    if isinstance(data, dict)
+                    else type(data).__name__
+                )
                 logger.info(
                     "[embedding_service] Sync response (no job_id) keys=%s",
-                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                    keys,
                 )
-                emb = data.get("embeddings") or data
-                if isinstance(emb, list):
+                emb = extract_sync_embeddings(data)
+                if emb is not None:
                     async with _queue_lock:
                         _queue_results[job_id] = {
                             "status": "completed",
@@ -242,11 +318,25 @@ async def queue_embedding_job(
                             "error": None,
                         }
                 else:
+                    if isinstance(data, dict):
+                        err_msg = (
+                            data.get("error")
+                            or data.get("message")
+                            or data.get("Comment")
+                            or f"no job_id and no embeddings (keys={keys})"
+                        )
+                    else:
+                        err_msg = f"no job_id and no embeddings ({type(data).__name__})"
+                    logger.warning(
+                        "[embedding_service] POST has no job_id/embeddings project=%r: %s",
+                        project,
+                        err_msg,
+                    )
                     async with _queue_lock:
                         _queue_results[job_id] = {
-                            "status": "completed",
-                            "embeddings": [emb],
-                            "error": None,
+                            "status": "failed",
+                            "embeddings": None,
+                            "error": str(err_msg),
                         }
         except Exception as e:
             err_detail = str(e)
@@ -289,7 +379,6 @@ _FAKE_IMAGE_PNG = (
     b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
-_WS_TEST_TIMEOUT = 30.0
 _WS_TEST_POLL_INTERVAL = 0.5
 
 
@@ -306,7 +395,7 @@ async def test_embedding_websocket(project: str = "default") -> tuple[bool, str 
             ["test_1x1.png"],
             project=project,
         )
-        deadline = time.monotonic() + _WS_TEST_TIMEOUT
+        deadline = time.monotonic() + fastvss_ws_test_timeout_seconds()
         while time.monotonic() < deadline:
             result = _queue_results.get(job_id)
             if result is None:
