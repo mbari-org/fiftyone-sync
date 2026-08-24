@@ -51,12 +51,15 @@ cleanvision:
   n_jobs: null
   # CleanVision issue types and params. Map an issue type to null to switch it off.
   # near_duplicates groups by perceptual-hash collision: a smaller hash_size is coarser
-  # and therefore more aggressive. One image is always kept per near-duplicate set.
+  # and therefore more aggressive. hash_size is the side of the hash grid, so it means
+  # hash_size**2 bits -- 4 is only a 16-bit hash (65,536 possible values), coarse enough
+  # that a large crop set collapses into very few distinct buckets. 8 is the conventional
+  # 64-bit phash. One image is always kept per near-duplicate set.
   # Blur detection is not part of the pipeline: it misread soft-edged specimens as blurred
   # photographs and culled usable crops.
   issue_types:
     low_information: {}
     dark: {}
     near_duplicates:
-      hash_size: 4
+      hash_size: 8
       hash_type: phash

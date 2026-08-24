@@ -35,7 +35,10 @@ logger = logging.getLogger(__name__)
 # code change.
 #
 # `near_duplicates` groups images by perceptual-hash collision, so `hash_size` is the
-# sensitivity knob: a smaller hash is coarser and therefore more aggressive.
+# sensitivity knob: a smaller hash is coarser and therefore more aggressive. It is the side
+# of the hash grid, i.e. hash_size**2 bits -- `4` is a 16-bit hash with only 65,536 possible
+# values, coarse enough that a large crop set collapses into very few distinct buckets. `8`
+# is the conventional 64-bit phash.
 #
 # Blur detection is deliberately absent. CleanVision's `blurry` check scores global image
 # sharpness, which misreads the plankton/ROV crops this pipeline builds: a small, genuinely
@@ -45,7 +48,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ISSUE_TYPES: dict[str, dict[str, Any]] = {
     "low_information": {},
     "dark": {},
-    "near_duplicates": {"hash_size": 4, "hash_type": "phash"},
+    "near_duplicates": {"hash_size": 8, "hash_type": "phash"},
 }
 
 # Issue types whose flagged images are removed outright.

@@ -31,5 +31,5 @@ projects:
 #   enabled: false
 #   issue_types:
 #     near_duplicates:
-#       hash_size: 4
+#       hash_size: 8
 #       hash_type: phash

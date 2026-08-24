@@ -227,7 +227,7 @@ cleanvision:
     low_information: {}
     dark: {}
     near_duplicates:
-      hash_size: 4        # perceptual-hash size; smaller is coarser, so more aggressive
+      hash_size: 8        # hash grid side, so hash_size**2 bits; smaller is coarser, so more aggressive
       hash_type: phash
 ```
 

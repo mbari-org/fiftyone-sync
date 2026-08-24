@@ -16,13 +16,13 @@ import src.app.cleanvision_filter as cvf
 def test_normalize_issue_types_defaults():
     resolved = cvf.normalize_issue_types(None)
     assert set(resolved) == {"low_information", "dark", "near_duplicates"}
-    assert resolved["near_duplicates"]["hash_size"] == 4
+    assert resolved["near_duplicates"]["hash_size"] == 8
     assert resolved["near_duplicates"]["hash_type"] == "phash"
 
 
 def test_normalize_issue_types_merges_over_defaults():
-    resolved = cvf.normalize_issue_types({"near_duplicates": {"hash_size": 8}})
-    assert resolved["near_duplicates"] == {"hash_size": 8, "hash_type": "phash"}
+    resolved = cvf.normalize_issue_types({"near_duplicates": {"hash_size": 16}})
+    assert resolved["near_duplicates"] == {"hash_size": 16, "hash_type": "phash"}
     # untouched defaults survive
     assert resolved["dark"] == {}
     assert resolved["low_information"] == {}
@@ -53,7 +53,7 @@ def test_normalize_issue_types_explicit_hash_type_wins():
 
 def test_normalize_issue_types_does_not_mutate_defaults():
     cvf.normalize_issue_types({"near_duplicates": {"hash_size": 16}})
-    assert cvf.DEFAULT_ISSUE_TYPES["near_duplicates"]["hash_size"] == 4
+    assert cvf.DEFAULT_ISSUE_TYPES["near_duplicates"]["hash_size"] == 8
 
 
 def test_blur_detection_is_absent_from_the_pipeline():
@@ -327,10 +327,10 @@ def test_find_bad_images_deduplicates_paths(fake_cleanvision, monkeypatch):
 
 
 def test_find_bad_images_passes_resolved_issue_types(fake_cleanvision):
-    cvf.find_bad_images(["/c/a.png"], issue_types={"near_duplicates": {"hash_size": 8}}, n_jobs=2)
+    cvf.find_bad_images(["/c/a.png"], issue_types={"near_duplicates": {"hash_size": 16}}, n_jobs=2)
     kwargs = _FakeImagelab.last_kwargs
     assert kwargs["n_jobs"] == 2
-    assert kwargs["issue_types"]["near_duplicates"]["hash_size"] == 8
+    assert kwargs["issue_types"]["near_duplicates"]["hash_size"] == 16
     assert "blurry" not in kwargs["issue_types"]
 
 
