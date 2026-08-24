@@ -66,6 +66,7 @@ def enqueue_sync(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    remove_near_duplicates: bool = False,
 ) -> str:
     """
     Enqueue a sync job. Returns RQ job id. Requires Redis.
@@ -73,6 +74,8 @@ def enqueue_sync(
     vss_project_key is used to select a specific VSS project configuration for embeddings.
     localization_type_id restricts the sync to a single Tator box (localization) type.
     verified_only restricts the built dataset to localizations with a truthy `verified` attribute.
+    remove_near_duplicates prunes CleanVision-flagged near duplicates / blurry / dark /
+    low-information samples from the built FiftyOne dataset (Voxel51 samples only).
     """
     from rq import Queue
 
@@ -96,6 +99,7 @@ def enqueue_sync(
         query=query,
         localization_type_id=localization_type_id,
         verified_only=verified_only,
+        remove_near_duplicates=remove_near_duplicates,
         job_timeout=3600 * 24,  # 24h for large projects
         result_ttl=3600 * 24,
         failure_ttl=3600,

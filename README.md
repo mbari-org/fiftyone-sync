@@ -96,6 +96,8 @@ flowchart TD
 
 - **Dataset management**: `/datasets` (list), `/dataset-exists`, `/delete-dataset`, `/rename-dataset`. Datasets are named `project_v{version}[_s{section}]_{port}` by default for traceability; `POST /rename-dataset?new_name=...` lets you replace this with a more descriptive name (sanitized to safe characters, max **60** characters). These four endpoints accept the Tator API token either via `Authorization: Token <token>` (or `Bearer <token>`) header, or as a `token` query parameter (the convention used by `/sync`, `/sync-to-tator`, `/recompute-crops`, `/dimreduce`).
 
+- **Near-duplicate removal (CleanVision)**: `remove_near_duplicates=true` on `POST /sync` (or the **Remove near duplicates** checkbox in the applet) prunes near-duplicate, blurry, dark, and low-information crops from the dataset before embeddings are computed, keeping one image per near-duplicate set. Fewer samples means less annotator overhead and less memory/GPU pressure. **Voxel51 samples only** — nothing is deleted in Tator and the crop files are kept. Tunable via the `cleanvision` block in `config.yml`; see [docs/USAGE.md](docs/USAGE.md#near-duplicate-and-low-quality-sample-removal-cleanvision).
+
 - **Sync queue (Redis)**: Background worker: `python -m src.app.sync_worker`. Env: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_USE_SSL`, or `REDIS_URL`.
 
 ## Run (Docker)

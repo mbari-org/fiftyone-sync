@@ -161,6 +161,7 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `query` | no | Tator `encoded_search` filter (base64 Object_Search); ANDed with `section_id` when both set |
 | `localization_type_id` | no | Restrict sync to a single Tator box (localization) type |
 | `verified_only` | no | Only include localizations whose `verified` attribute is truthy (default: false). Exposed as the **Verified only** checkbox in the launcher applet. When set, the Tator media (`related_attribute=verified::true`) and localization (`attribute=verified::true`) queries are filtered server-side, so unverified media/localizations are never fetched, downloaded, or cropped — this minimizes data transfer, not just what's shown in the dataset. On subsequent syncs, samples that later become unverified are removed from the dataset (they are re-added automatically if re-verified). |
+| `remove_near_duplicates` | no | Remove CleanVision-flagged near-duplicate, blurry, dark, and low-information samples from the built dataset (default: false). Exposed as the **Remove near duplicates** checkbox in the launcher applet. See [Near-duplicate and low-quality sample removal](#near-duplicate-and-low-quality-sample-removal-cleanvision). |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
@@ -183,6 +184,56 @@ max_samples: 500                         # optional: limit for testing
 `verified_only` is set from the `verified_only` query param (or the applet's **Verified only** checkbox), not from this config file.
 
 The FiftyOne dataset name is always `project_name_v{version_id}_{port}` and cannot be set in config.
+
+### Near-duplicate and low-quality sample removal (CleanVision)
+
+Datasets built from Tator crops often contain near duplicates (successive video frames,
+overlapping boxes on the same target) plus crops that are unusable for annotation
+(blurry, dark, near-empty). Set `remove_near_duplicates=true` on `POST /sync` — or tick
+**Remove near duplicates** in the launcher applet — to prune them with
+[CleanVision](https://github.com/cleanlab/cleanvision).
+
+- Runs **after** the dataset is built and **before** embeddings/UMAP, so pruned samples
+  are never embedded. Fewer samples means less annotator overhead and less memory/GPU
+  pressure for the embedding and dimensionality-reduction passes.
+- Removes every image flagged `low_information`, `dark`, or `blurry`, and all but one
+  image of each near-duplicate set (the **least blurry** member is kept).
+- **Voxel51 samples only.** Nothing is deleted in Tator, and the cropped image files on
+  disk / in S3 are left in place, so the crop cache stays valid and a later sync does not
+  have to re-crop.
+- Because nothing is removed upstream, a later sync re-adds these samples during
+  reconcile and prunes them again — CleanVision hashing/scoring is deterministic for the
+  same crops, so the result is stable. Run the sync without the flag to get the full
+  dataset back.
+- The sync result (`GET /sync/status/{job_id}`) carries a `cleanvision` summary with
+  `num_samples_before`, `num_removed`, and `num_samples_after`.
+- `cleanvision` is in `requirements.txt`; if it is not installed the step logs a warning
+  and is skipped, leaving the full dataset in place.
+
+Defaults come from the module and are overridden by the `cleanvision` block in the config
+file (`config_path` / `FIFTYONE_SYNC_CONFIG_PATH`):
+
+```yaml
+cleanvision:
+  enabled: false          # true = always prune, even without the query param
+  dry_run: false          # true = report what would be removed, delete nothing
+  n_jobs: null            # worker processes for hashing/scoring (null = CleanVision decides)
+  issue_types:            # map an issue type to null to switch it off
+    low_information: {}
+    dark: {}
+    blurry:
+      threshold: 0.52     # CleanVision default is 0.5; higher is stricter
+    near_duplicates:
+      hash_size: 4        # perceptual-hash size; smaller is coarser, so more aggressive
+      hash_type: phash
+```
+
+`near_duplicates` groups images by perceptual-hash collision, so `hash_size` is the
+sensitivity knob rather than a distance threshold. `hash_types: [whash, phash]` is also
+accepted and maps onto the singular `hash_type` that CleanVision >= 0.3 reads.
+
+> CleanVision's `imagelab.report()` is deliberately never called — it segfaults on large
+> datasets. Counts are logged instead.
 
 ### Embeddings, UMAP, and similarity search
 

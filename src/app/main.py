@@ -568,6 +568,14 @@ async def sync(
         False,
         description="Only include localizations whose `verified` attribute is truthy in the built dataset",
     ),
+    remove_near_duplicates: bool = Query(
+        False,
+        description=(
+            "Remove CleanVision-flagged near-duplicate, blurry, dark, and low-information "
+            "samples from the built FiftyOne dataset. Voxel51 samples only: nothing is "
+            "deleted in Tator and the crop files are kept"
+        ),
+    ),
 ) -> dict:
     """
     Trigger sync: enqueues a job to fetch Tator media + localizations, build FiftyOne dataset, launch App.
@@ -633,6 +641,7 @@ async def sync(
             query=query,
             localization_type_id=localization_type_id,
             verified_only=verified_only,
+            remove_near_duplicates=remove_near_duplicates,
         )
         return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:

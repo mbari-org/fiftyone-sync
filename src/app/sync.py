@@ -4486,6 +4486,7 @@ def run_sync_job(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    remove_near_duplicates: bool = False,
 ) -> dict[str, Any]:
     """
     Entrypoint for RQ worker: all args are serializable. Calls sync_project_to_fiftyone.
@@ -4496,7 +4497,8 @@ def run_sync_job(
     logger.info(
         f"run_sync_job received project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
-        f"localization_type_id={localization_type_id} verified_only={verified_only}"
+        f"localization_type_id={localization_type_id} verified_only={verified_only} "
+        f"remove_near_duplicates={remove_near_duplicates}"
     )
 
     job_meta_handler: logging.Handler | None = None
@@ -4530,6 +4532,7 @@ def run_sync_job(
             query=query,
             localization_type_id=localization_type_id,
             verified_only=verified_only,
+            remove_near_duplicates=remove_near_duplicates,
         )
     finally:
         if job_meta_handler is not None:
@@ -4843,6 +4846,55 @@ def _embeddings_coverage(
     return existing_embeddings_count, embeddings_up_to_date
 
 
+def _cleanvision_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the `cleanvision` config block (empty dict when absent or invalid)."""
+    cfg = config.get("cleanvision") if isinstance(config, dict) else None
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _remove_near_duplicate_samples(
+    dataset: Any,
+    config: dict[str, Any],
+    enabled: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Drop CleanVision-flagged samples (near duplicates, blurry, dark, low information)
+    from the FiftyOne dataset.
+
+    Runs when the `remove_near_duplicates` query param is set or `cleanvision.enabled`
+    is true in config. Only Voxel51 samples are deleted -- Tator localizations and the
+    cropped image files are left untouched, so the crop cache stays valid. Never raises:
+    a failure here leaves the full dataset in place.
+
+    Returns a summary dict, or None when the step did not run.
+    """
+    cleanvision_cfg = _cleanvision_config(config)
+    if not (enabled or bool(cleanvision_cfg.get("enabled"))):
+        return None
+    try:
+        from src.app.cleanvision_filter import (
+            is_cleanvision_available,
+            remove_bad_images,
+        )
+
+        if not is_cleanvision_available():
+            logger.warning(
+                "Near-duplicate removal requested but cleanvision is not installed; "
+                "skipping (pip install cleanvision)"
+            )
+            return {"status": "skipped", "reason": "cleanvision not installed"}
+
+        return remove_bad_images(
+            dataset,
+            issue_types=cleanvision_cfg.get("issue_types"),
+            n_jobs=cleanvision_cfg.get("n_jobs"),
+            dry_run=bool(cleanvision_cfg.get("dry_run", False)),
+        )
+    except Exception as e:
+        logger.exception("CleanVision duplicate/quality removal failed")
+        return {"status": "error", "message": str(e)}
+
+
 def sync_project_to_fiftyone(
     project_id: int,
     version_id: int | None,
@@ -4860,12 +4912,16 @@ def sync_project_to_fiftyone(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    remove_near_duplicates: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch Tator media and localizations, build FiftyOne dataset, launch App on given port.
     Uses per-project MongoDB database (database_uri when provided, else resolved via config; database_name override or get_database_name).
     Optional vss_project_key: selects a specific VSS project configuration for embeddings.
     Optional s3_bucket/s3_prefix: sync crop images to S3 (not full images) and build a second dataset from S3 (parent folder = label).
+    Optional remove_near_duplicates: after the dataset is built, drop CleanVision-flagged
+    near duplicates / blurry / dark / low-information samples from the FiftyOne dataset
+    (Voxel51 samples only; nothing is deleted in Tator and the crop files are kept).
     Returns {"status": "ok", "dataset_name": str, "database_name": str} or raises.
     """
     if not (s3_bucket and s3_bucket.strip()):
@@ -4885,7 +4941,8 @@ def sync_project_to_fiftyone(
     logger.info(
         f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
-        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only}"
+        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only} "
+        f"remove_near_duplicates={remove_near_duplicates}"
     )
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
@@ -5022,6 +5079,7 @@ def sync_project_to_fiftyone(
         config["version_id"] = version_id
         config["force_sync"] = force_sync
         config["verified_only"] = verified_only
+        config["remove_near_duplicates"] = remove_near_duplicates
         # In enterprise/production, use S3 URIs for sample filepaths so FiftyOne loads from S3
         if s3_bucket:
             config["s3_bucket"] = s3_bucket
@@ -5078,6 +5136,19 @@ def sync_project_to_fiftyone(
 
         sample_count = len(dataset)
         logger.info(f"Dataset '{dataset_name}' has {sample_count} samples")
+
+        # Optionally prune CleanVision-flagged samples (near duplicates, blurry, dark,
+        # low information) *before* embeddings so pruned samples are never embedded --
+        # fewer samples means less annotator overhead and less memory/GPU pressure.
+        cleanvision_result = _remove_near_duplicate_samples(
+            dataset, config, enabled=remove_near_duplicates
+        )
+        if cleanvision_result and cleanvision_result.get("num_removed"):
+            sample_count = len(dataset)
+            logger.info(
+                f"Dataset '{dataset_name}' has {sample_count} samples after "
+                "CleanVision duplicate/quality removal"
+            )
 
         # Always compute embeddings (from service) and UMAP; config.embeddings overrides defaults
         embeddings_config = config.get("embeddings") or {}
@@ -5206,6 +5277,8 @@ def sync_project_to_fiftyone(
             "saved_localizations_path": localizations_path or None,
             "saved_crops_dir": crops or None,
         }
+        if cleanvision_result is not None:
+            result["cleanvision"] = cleanvision_result
         if app_url is not None:
             result["app_url"] = app_url
         result["port"] = port
