@@ -252,6 +252,7 @@ embeddings:
   force_similarity: false             # set true to recompute similarity index
   batch_size: 32                     # batch size for embed service requests
   concurrency: 4                     # max batches submitted to the embed service concurrently
+  poll_timeout: null                  # optional; seconds to wait per embed job (default FASTVSS_WS_MAX_WAIT)
   service_url: null                   # optional; default FASTVSS_API_URL or http://localhost:8000
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
@@ -264,11 +265,26 @@ To recompute dimensionality reduction without re-embedding, use `POST /dimreduce
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
+| `FASTVSS_WS_MAX_WAIT` | `1800` | Total budget for one embed job, measured from when its WebSocket opens (ws-test background + sync) |
+| `FASTVSS_WS_IDLE_TIMEOUT` | `120` | Max gap between frames from Fast-VSS before the stream is treated as dead |
+| `FASTVSS_WS_CONNECT_TIMEOUT` | `30` | WebSocket handshake timeout |
+| `FASTVSS_HTTP_TIMEOUT` | `300` | Read/write timeout for the multipart POST that submits a batch |
 | `FASTVSS_WS_TEST_TIMEOUT` | `120` | Max wait for applet `GET /vss-embedding/ws-test` |
 
+`FASTVSS_WS_MAX_WAIT` and `FASTVSS_WS_IDLE_TIMEOUT` are deliberately separate. Fast-VSS runs one
+serial RQ worker per project, so a job queued behind `concurrency` others spends nearly all of its
+budget legitimately in the `pending` state — a job deadline must therefore be generous. What
+actually indicates a broken run is a *gap in the heartbeat*: Fast-VSS sends `{"status": "pending"}`
+every `WS_POLL_INTERVAL` (0.5s), so `FASTVSS_WS_IDLE_TIMEOUT` is what detects a wedged socket or
+service. Collapsing the two — waiting only on the remaining budget with a small floor — turns the
+job deadline into a one-second inter-frame watchdog that any momentary stall trips; that was the
+cause of the `WebSocket batch N/M attempt 1/3 failed:` storms at the start of a run.
+
+A batch that exhausts its retries now fails only that batch. The run continues, whatever succeeded
+is saved, and the next sync computes just the samples still missing embeddings. Only a run in which
+every batch failed raises.
+
 `GET /vss-embedding/ws-test` succeeds only when Fast-VSS returns embeddings (sync) or a `job_id` whose WebSocket completes. A 200 with only `Comment`/`error` and no vectors (e.g. prefix names like `MBARI`) is treated as failure.
-| `FASTVSS_WS_MAX_WAIT` | `300` | Max wait per embed job over WebSocket (ws-test background + sync) |
-| `FASTVSS_WS_CONNECT_TIMEOUT` | `30` | WebSocket handshake timeout |
 
 For UMAP visualization, install `umap-learn` in the sync service venv:
 

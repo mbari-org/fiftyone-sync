@@ -5227,6 +5227,11 @@ def sync_project_to_fiftyone(
                     concurrency = int(
                         embeddings_config.get("concurrency", DEFAULT_EMBEDDING_CONCURRENCY)
                     )
+                    # None -> resolved from FASTVSS_WS_MAX_WAIT inside embeddings_viz.
+                    raw_poll_timeout = embeddings_config.get("poll_timeout")
+                    poll_timeout = (
+                        float(raw_poll_timeout) if raw_poll_timeout else None
+                    )
                     logger.info(
                         f"Computing embeddings with batch size {batch_size}, concurrency {concurrency}, "
                         f"UMAP, and similarity for dataset '{dataset_name}'..."
@@ -5249,6 +5254,7 @@ def sync_project_to_fiftyone(
                         service_url=embeddings_config.get("service_url")
                         or os.environ.get("FASTVSS_API_URL"),
                         concurrency=concurrency,
+                        poll_timeout=poll_timeout,
                     )
                     logger.info(
                         f"Embeddings, UMAP, and similarity completed for dataset '{dataset_name}'"

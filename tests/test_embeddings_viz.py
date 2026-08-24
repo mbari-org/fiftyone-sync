@@ -3,6 +3,7 @@
 # Description: Tests for embeddings/brain-run coverage helpers and concurrent batch submission.
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -182,7 +183,8 @@ def test_compute_embeddings_via_service_async_bounds_concurrency(monkeypatch, tm
         return f"job-{batch_label}"
 
     async def fake_poll(
-        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label, poll_timeout
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
     ):
         await asyncio.sleep(0.01)
         state["current"] -= 1
@@ -224,7 +226,8 @@ def test_compute_embeddings_via_service_async_clamps_concurrency_to_num_batches(
         return f"job-{batch_label}"
 
     async def fake_poll(
-        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label, poll_timeout
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
     ):
         state["current"] -= 1
         return len(batch_ids)
@@ -248,7 +251,8 @@ def test_compute_embeddings_via_service_async_clamps_concurrency_to_num_batches(
     assert state["max_seen"] <= 3  # only 3 batches (batch_size=1, 3 samples) ever exist
 
 
-def test_compute_embeddings_via_service_async_propagates_batch_failure(monkeypatch, tmp_path):
+def test_compute_embeddings_via_service_async_raises_when_every_batch_fails(monkeypatch, tmp_path):
+    """Total failure is still an error -- there is nothing to fall back on."""
     dataset = _make_fake_dataset(tmp_path, num_samples=4)
 
     async def fake_submit(client, url, files, batch_label):
@@ -274,6 +278,108 @@ def test_compute_embeddings_via_service_async_propagates_batch_failure(monkeypat
         raised = True
 
     assert raised
+
+
+def test_compute_embeddings_via_service_async_isolates_one_failing_batch(monkeypatch, tmp_path):
+    """
+    One batch exhausting its retries must not take down the others.
+
+    Regression test for the cascade this used to cause: gather() without return_exceptions
+    propagated the first failure, which exited the `async with httpx.AsyncClient(...)` block
+    and closed the client while sibling batches were still in flight, so every one of them
+    then failed with "Cannot send a request, as the client has been closed".
+    """
+    dataset = _make_fake_dataset(tmp_path, num_samples=8)  # batch_size=2 -> 4 batches
+    submitted = []
+    polled = []
+
+    async def fake_submit(client, url, files, batch_label):
+        # Fail the second batch only, after a beat so siblings are genuinely mid-flight.
+        await asyncio.sleep(0.01)
+        if batch_label.startswith("batch 2/"):
+            raise RuntimeError(f"boom in {batch_label}")
+        submitted.append(batch_label)
+        return f"job-{batch_label}"
+
+    async def fake_poll(
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
+    ):
+        await asyncio.sleep(0.01)
+        polled.append(batch_label)
+        return len(batch_ids)
+
+    monkeypatch.setattr(embeddings_viz, "_submit_batch_with_retries", fake_submit)
+    monkeypatch.setattr(embeddings_viz, "_poll_and_save_batch_with_retries", fake_poll)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
+
+    processed = asyncio.run(
+        embeddings_viz._compute_embeddings_via_service_async(
+            dataset,
+            project_name="proj",
+            embeddings_field="embeddings",
+            service_url="http://embed.example",
+            batch_size=2,
+            poll_timeout=1.0,
+            concurrency=4,
+        )
+    )
+
+    # 3 of 4 batches survived; only the deliberately-failed one is missing.
+    assert len(polled) == 3
+    assert processed == 6
+    assert not any(label.startswith("batch 2/") for label in polled)
+
+
+def test_compute_embeddings_via_service_async_reads_files_inside_the_semaphore(
+    monkeypatch, tmp_path
+):
+    """
+    At most `concurrency` batches' image bytes are resident at once.
+
+    Reading the crops before acquiring the semaphore let every batch coroutine load its
+    images up front, blocking the event loop with synchronous disk I/O (and holding the whole
+    dataset in memory) while the first few batches' WebSockets went unread.
+    """
+    dataset = _make_fake_dataset(tmp_path, num_samples=12)  # batch_size=2 -> 6 batches
+    state = {"live": 0, "max_live": 0}
+    real_read = embeddings_viz._read_batch_files
+
+    def counting_read(batch_paths):
+        state["live"] += 1
+        state["max_live"] = max(state["max_live"], state["live"])
+        return real_read(batch_paths)
+
+    async def fake_submit(client, url, files, batch_label):
+        await asyncio.sleep(0.01)
+        return f"job-{batch_label}"
+
+    async def fake_poll(
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
+    ):
+        await asyncio.sleep(0.01)
+        state["live"] -= 1
+        return len(batch_ids)
+
+    monkeypatch.setattr(embeddings_viz, "_read_batch_files", counting_read)
+    monkeypatch.setattr(embeddings_viz, "_submit_batch_with_retries", fake_submit)
+    monkeypatch.setattr(embeddings_viz, "_poll_and_save_batch_with_retries", fake_poll)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
+
+    asyncio.run(
+        embeddings_viz._compute_embeddings_via_service_async(
+            dataset,
+            project_name="proj",
+            embeddings_field="embeddings",
+            service_url="http://embed.example",
+            batch_size=2,
+            poll_timeout=1.0,
+            concurrency=2,
+        )
+    )
+
+    assert state["max_live"] <= 2
 
 
 def test_compute_embeddings_via_service_uses_default_concurrency(monkeypatch):
@@ -407,7 +513,8 @@ def test_compute_embeddings_via_service_async_skips_existing(monkeypatch, tmp_pa
         return f"job-{batch_label}"
 
     async def fake_poll(
-        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label, poll_timeout
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
     ):
         submitted_ids.extend(batch_ids)
         return len(batch_ids)
@@ -449,7 +556,8 @@ def test_compute_embeddings_via_service_async_recomputes_all_when_not_skipping(
         return f"job-{batch_label}"
 
     async def fake_poll(
-        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label, poll_timeout
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
     ):
         submitted_ids.extend(batch_ids)
         return len(batch_ids)
@@ -505,3 +613,218 @@ def test_compute_embeddings_via_service_async_returns_zero_when_all_present(
     )
 
     assert new_count == 0
+
+
+# ---------------------------------------------------------------------------
+# WebSocket timeout semantics (_wait_job_result_ws) and error rendering
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedWS:
+    """
+    Fake Fast-VSS WebSocket.
+
+    ``script`` is a list of ``(delay, payload)`` pairs consumed in order; once exhausted,
+    ``heartbeat`` (if given) is emitted forever, otherwise recv() blocks indefinitely.
+    """
+
+    def __init__(self, script, heartbeat=None, heartbeat_delay=0.01):
+        self._script = list(script)
+        self._heartbeat = heartbeat
+        self._heartbeat_delay = heartbeat_delay
+        self.frames_sent = 0
+
+    async def recv(self):
+        if self._script:
+            delay, payload = self._script.pop(0)
+        elif self._heartbeat is not None:
+            delay, payload = self._heartbeat_delay, self._heartbeat
+        else:
+            await asyncio.sleep(3600)  # never resolves; caller must time out
+            raise AssertionError("unreachable")
+        await asyncio.sleep(delay)
+        self.frames_sent += 1
+        return json.dumps(payload)
+
+
+class _FakeConnect:
+    def __init__(self, ws):
+        self._ws = ws
+
+    async def __aenter__(self):
+        return self._ws
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _patch_ws(monkeypatch, ws):
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda url, **kw: _FakeConnect(ws))
+
+
+def test_wait_job_result_ws_returns_result_on_done(monkeypatch):
+    ws = _ScriptedWS(
+        [
+            (0.01, {"status": "pending"}),
+            (0.01, {"status": "pending"}),
+            (0.01, {"status": "done", "result": {"embeddings": [[1.0, 2.0]]}}),
+        ]
+    )
+    _patch_ws(monkeypatch, ws)
+
+    result = asyncio.run(
+        embeddings_viz._wait_job_result_ws(
+            "ws://embed.example/ws/predict/job/j/proj", timeout=30.0, idle_timeout=5.0
+        )
+    )
+
+    assert result == {"embeddings": [[1.0, 2.0]]}
+
+
+def test_wait_job_result_ws_enforces_total_job_budget(monkeypatch):
+    """
+    A heartbeating-but-never-finishing job must hit the *job* deadline.
+
+    Regression test for waiting on ``max(1.0, deadline - now)``: with heartbeats arriving
+    every 0.5s the one-second floor was always satisfied, so the total budget was never
+    actually enforced and this call looped forever.
+    """
+    ws = _ScriptedWS([], heartbeat={"status": "pending"}, heartbeat_delay=0.01)
+    _patch_ws(monkeypatch, ws)
+
+    async def run():
+        # Outer guard: if the budget is not enforced this hangs rather than raising.
+        return await asyncio.wait_for(
+            embeddings_viz._wait_job_result_ws(
+                "ws://embed.example/ws/predict/job/j/proj",
+                timeout=0.5,
+                idle_timeout=30.0,
+            ),
+            timeout=10.0,
+        )
+
+    try:
+        asyncio.run(run())
+        raised = None
+    except TimeoutError as e:
+        raised = e
+
+    assert raised is not None
+    assert "did not finish within" in str(raised)
+    assert ws.frames_sent > 1  # it really was receiving heartbeats the whole time
+
+
+def test_wait_job_result_ws_detects_stalled_stream_with_a_real_message(monkeypatch):
+    """
+    A silent socket trips the idle timeout, and the error must not stringify to "".
+
+    ``str(asyncio.TimeoutError())`` is empty, which is why these failures used to log as
+    "WebSocket batch 7/49 attempt 1/3 failed:" with no reason at all.
+    """
+    ws = _ScriptedWS([])  # never sends anything
+    _patch_ws(monkeypatch, ws)
+
+    try:
+        asyncio.run(
+            embeddings_viz._wait_job_result_ws(
+                "ws://embed.example/ws/predict/job/j/proj",
+                timeout=30.0,
+                idle_timeout=0.3,
+            )
+        )
+        raised = None
+    except TimeoutError as e:
+        raised = e
+
+    assert raised is not None
+    assert str(raised).strip()  # never empty
+    assert "no message from embed service" in str(raised)
+
+
+def test_wait_job_result_ws_tolerates_gaps_below_the_idle_timeout(monkeypatch):
+    """A slow-but-alive stream must survive gaps far longer than one second."""
+    ws = _ScriptedWS(
+        [
+            (1.5, {"status": "pending"}),
+            (1.5, {"status": "done", "result": {"embeddings": [[3.0]]}}),
+        ]
+    )
+    _patch_ws(monkeypatch, ws)
+
+    result = asyncio.run(
+        embeddings_viz._wait_job_result_ws(
+            "ws://embed.example/ws/predict/job/j/proj", timeout=60.0, idle_timeout=10.0
+        )
+    )
+
+    assert result == {"embeddings": [[3.0]]}
+
+
+def test_wait_job_result_ws_raises_on_service_error_status(monkeypatch):
+    ws = _ScriptedWS([(0.01, {"status": "error", "message": "Timed out waiting for job"})])
+    _patch_ws(monkeypatch, ws)
+
+    try:
+        asyncio.run(
+            embeddings_viz._wait_job_result_ws(
+                "ws://embed.example/ws/predict/job/j/proj", timeout=30.0, idle_timeout=5.0
+            )
+        )
+        raised = None
+    except RuntimeError as e:
+        raised = e
+
+    assert raised is not None
+    assert "Timed out waiting for job" in str(raised)
+
+
+def test_poll_timeout_defaults_to_fastvss_ws_max_wait(monkeypatch, tmp_path):
+    """
+    An unset poll_timeout must resolve from FASTVSS_WS_MAX_WAIT, not a hard-coded 10s.
+
+    compute_embeddings_and_viz never passed poll_timeout, so it fell through to a flat
+    10.0-second default and FASTVSS_WS_MAX_WAIT never reached this path at all -- despite
+    being documented as the knob controlling it.
+    """
+    monkeypatch.setenv("FASTVSS_WS_MAX_WAIT", "777")
+    dataset = _make_fake_dataset(tmp_path, num_samples=2)
+    seen = {}
+
+    async def fake_submit(client, url, files, batch_label):
+        return f"job-{batch_label}"
+
+    async def fake_poll(
+        ds, ws_base, project_name, job_id, batch_ids, embeddings_field, batch_label,
+        poll_timeout, *, save_lock=None
+    ):
+        seen["poll_timeout"] = poll_timeout
+        return len(batch_ids)
+
+    monkeypatch.setattr(embeddings_viz, "_submit_batch_with_retries", fake_submit)
+    monkeypatch.setattr(embeddings_viz, "_poll_and_save_batch_with_retries", fake_poll)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
+
+    asyncio.run(
+        embeddings_viz._compute_embeddings_via_service_async(
+            dataset,
+            project_name="proj",
+            embeddings_field="embeddings",
+            service_url="http://embed.example",
+            batch_size=2,
+            poll_timeout=None,
+            concurrency=1,
+        )
+    )
+
+    assert seen["poll_timeout"] == 777.0
+
+
+def test_describe_error_never_returns_empty_string():
+    from src.app.embedding_service import describe_error
+
+    # The exceptions that made the original log lines end in a bare colon.
+    assert describe_error(asyncio.TimeoutError()) == "TimeoutError"
+    assert describe_error(RuntimeError("")) == "RuntimeError"
+    assert describe_error(RuntimeError("boom")) == "RuntimeError: boom"
