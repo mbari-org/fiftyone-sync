@@ -4858,7 +4858,7 @@ def _remove_near_duplicate_samples(
     enabled: bool = False,
 ) -> dict[str, Any] | None:
     """
-    Drop CleanVision-flagged samples (near duplicates, blurry, dark, low information)
+    Drop CleanVision-flagged samples (near duplicates, dark, low information)
     from the FiftyOne dataset.
 
     Runs when the `remove_near_duplicates` query param is set or `cleanvision.enabled`
@@ -4920,7 +4920,7 @@ def sync_project_to_fiftyone(
     Optional vss_project_key: selects a specific VSS project configuration for embeddings.
     Optional s3_bucket/s3_prefix: sync crop images to S3 (not full images) and build a second dataset from S3 (parent folder = label).
     Optional remove_near_duplicates: after the dataset is built, drop CleanVision-flagged
-    near duplicates / blurry / dark / low-information samples from the FiftyOne dataset
+    near duplicates / dark / low-information samples from the FiftyOne dataset
     (Voxel51 samples only; nothing is deleted in Tator and the crop files are kept).
     Returns {"status": "ok", "dataset_name": str, "database_name": str} or raises.
     """
@@ -5137,7 +5137,7 @@ def sync_project_to_fiftyone(
         sample_count = len(dataset)
         logger.info(f"Dataset '{dataset_name}' has {sample_count} samples")
 
-        # Optionally prune CleanVision-flagged samples (near duplicates, blurry, dark,
+        # Optionally prune CleanVision-flagged samples (near duplicates, dark,
         # low information) *before* embeddings so pruned samples are never embedded --
         # fewer samples means less annotator overhead and less memory/GPU pressure.
         cleanvision_result = _remove_near_duplicate_samples(

@@ -571,7 +571,7 @@ async def sync(
     remove_near_duplicates: bool = Query(
         False,
         description=(
-            "Remove CleanVision-flagged near-duplicate, blurry, dark, and low-information "
+            "Remove CleanVision-flagged near-duplicate, dark, and low-information "
             "samples from the built FiftyOne dataset. Voxel51 samples only: nothing is "
             "deleted in Tator and the crop files are kept"
         ),

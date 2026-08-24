@@ -1,12 +1,12 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: src/app/cleanvision_filter.py
-# Description: Remove CleanVision-flagged bad images (near duplicates, blurry, dark, low information) from a FiftyOne dataset.
+# Description: Remove CleanVision-flagged bad images (near duplicates, dark, low information) from a FiftyOne dataset.
 """
 Prune a FiftyOne dataset with `CleanVision <https://github.com/cleanlab/cleanvision>`_.
 
 Datasets built from Tator crops frequently contain near-duplicate crops (successive
 video frames, overlapping boxes on the same target) plus crops that are unusable for
-annotation (blurry, dark, near-empty). Removing them before annotation reduces the
+annotation (dark, near-empty). Removing them before annotation reduces the
 number of samples a human has to review and cuts the memory/GPU pressure of the
 downstream embedding + UMAP passes.
 
@@ -36,21 +36,23 @@ logger = logging.getLogger(__name__)
 #
 # `near_duplicates` groups images by perceptual-hash collision, so `hash_size` is the
 # sensitivity knob: a smaller hash is coarser and therefore more aggressive.
+#
+# Blur detection is deliberately absent. CleanVision's `blurry` check scores global image
+# sharpness, which misreads the plankton/ROV crops this pipeline builds: a small, genuinely
+# soft-edged organism against a uniform background scores like a blurred photograph, so the
+# check culled usable specimens. It is not merely disabled by default here -- it is not part
+# of the pipeline at all, and no blur score is computed.
 DEFAULT_ISSUE_TYPES: dict[str, dict[str, Any]] = {
     "low_information": {},
     "dark": {},
-    "blurry": {"threshold": 0.52},
     "near_duplicates": {"hash_size": 4, "hash_type": "phash"},
 }
 
 # Issue types whose flagged images are removed outright.
-FLAG_ISSUE_TYPES: tuple[str, ...] = ("low_information", "dark", "blurry", "light")
+FLAG_ISSUE_TYPES: tuple[str, ...] = ("low_information", "dark", "light")
 
 # Handled separately: one image per set is kept.
 NEAR_DUPLICATES = "near_duplicates"
-
-# Used to pick which image of a near-duplicate set to keep (highest = least blurry).
-_BLURRY_SCORE_COL = "blurry_score"
 
 
 def is_cleanvision_available() -> bool:
@@ -105,27 +107,22 @@ def normalize_issue_types(
 
 def select_near_duplicate_removals(
     duplicate_sets: Iterable[Iterable[str]],
-    blurry_scores: dict[str, float] | None = None,
 ) -> list[str]:
     """
     For each near-duplicate set, keep one image and return the others.
 
-    The kept image is the one with the highest `blurry_score` (least blurry). Ties, and
-    the case where no blurry scores were computed, fall back to the lexicographically
-    smallest path so the choice is deterministic across runs.
+    The kept image is the lexicographically smallest path in the set. Members of a
+    near-duplicate set are by definition near-identical, so which one survives matters far
+    less than that the choice is deterministic: the same crops must yield the same kept
+    image on every sync, since nothing is removed upstream and a later reconcile re-adds
+    and re-prunes these samples.
     """
-    scores = blurry_scores or {}
     removals: list[str] = []
     for dup_set in duplicate_sets or []:
         members = sorted(str(p) for p in (dup_set or []))
         if len(members) <= 1:
             continue
-        if scores:
-            # Highest blurry_score wins; ties fall back to the smallest path.
-            keep = min(members, key=lambda p: (-scores.get(p, 0.0), p))
-        else:
-            keep = members[0]
-        removals.extend(p for p in members if p != keep)
+        removals.extend(members[1:])
     return removals
 
 
@@ -136,7 +133,7 @@ def find_bad_images(
     verbose: bool = False,
 ) -> list[str]:
     """
-    Return the filepaths CleanVision flags as low information, dark, blurry, or as the
+    Return the filepaths CleanVision flags as low information or dark, or as the
     redundant members of a near-duplicate set (one image per set is always kept).
 
     `imagelab.report()` is deliberately never called: it segfaults on large datasets.
@@ -168,16 +165,10 @@ def find_bad_images(
 
     duplicate_sets = (imagelab.info.get(NEAR_DUPLICATES) or {}).get("sets") or []
     if duplicate_sets:
-        blurry_scores: dict[str, float] = {}
-        if _BLURRY_SCORE_COL in issues.columns:
-            blurry_scores = {
-                str(path): float(score)
-                for path, score in issues[_BLURRY_SCORE_COL].items()
-            }
-        dup_removals = select_near_duplicate_removals(duplicate_sets, blurry_scores)
+        dup_removals = select_near_duplicate_removals(duplicate_sets)
         logger.info(
             f"CleanVision: removing {len(dup_removals)} images from "
-            f"{len(duplicate_sets)} near-duplicate sets, keeping the least blurry of each"
+            f"{len(duplicate_sets)} near-duplicate sets, keeping one of each"
         )
         bad.extend(dup_removals)
 

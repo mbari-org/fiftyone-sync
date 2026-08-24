@@ -15,8 +15,7 @@ import src.app.cleanvision_filter as cvf
 
 def test_normalize_issue_types_defaults():
     resolved = cvf.normalize_issue_types(None)
-    assert set(resolved) == {"low_information", "dark", "blurry", "near_duplicates"}
-    assert resolved["blurry"]["threshold"] == 0.52
+    assert set(resolved) == {"low_information", "dark", "near_duplicates"}
     assert resolved["near_duplicates"]["hash_size"] == 4
     assert resolved["near_duplicates"]["hash_type"] == "phash"
 
@@ -25,7 +24,8 @@ def test_normalize_issue_types_merges_over_defaults():
     resolved = cvf.normalize_issue_types({"near_duplicates": {"hash_size": 8}})
     assert resolved["near_duplicates"] == {"hash_size": 8, "hash_type": "phash"}
     # untouched defaults survive
-    assert resolved["blurry"]["threshold"] == 0.52
+    assert resolved["dark"] == {}
+    assert resolved["low_information"] == {}
 
 
 def test_normalize_issue_types_none_disables_issue_type():
@@ -52,38 +52,55 @@ def test_normalize_issue_types_explicit_hash_type_wins():
 
 
 def test_normalize_issue_types_does_not_mutate_defaults():
-    cvf.normalize_issue_types({"blurry": {"threshold": 0.9}})
-    assert cvf.DEFAULT_ISSUE_TYPES["blurry"]["threshold"] == 0.52
+    cvf.normalize_issue_types({"near_duplicates": {"hash_size": 16}})
+    assert cvf.DEFAULT_ISSUE_TYPES["near_duplicates"]["hash_size"] == 4
+
+
+def test_blur_detection_is_absent_from_the_pipeline():
+    """
+    Blur is removed outright, not merely defaulted off.
+
+    CleanVision's `blurry` check scores global sharpness, which reads a small soft-edged
+    organism against a uniform background as a blurred photograph and culled usable crops.
+    """
+    assert "blurry" not in cvf.DEFAULT_ISSUE_TYPES
+    assert "blurry" not in cvf.FLAG_ISSUE_TYPES
+
+
+def test_blurry_can_still_be_requested_explicitly_via_config():
+    """normalize_issue_types stays a pass-through: config can add issue types back."""
+    resolved = cvf.normalize_issue_types({"blurry": {"threshold": 0.9}})
+    assert resolved["blurry"] == {"threshold": 0.9}
+    # ...but it is still never a removal criterion.
+    assert "blurry" not in cvf.FLAG_ISSUE_TYPES
 
 
 # --------------------------------------------------- near-duplicate selection
 
 
-def test_select_near_duplicate_removals_keeps_least_blurry():
-    sets = [["/c/a.png", "/c/b.png", "/c/d.png"]]
-    scores = {"/c/a.png": 0.1, "/c/b.png": 0.9, "/c/d.png": 0.5}
-    assert cvf.select_near_duplicate_removals(sets, scores) == ["/c/a.png", "/c/d.png"]
+def test_select_near_duplicate_removals_keeps_smallest_path():
+    sets = [["/c/b.png", "/c/a.png", "/c/d.png"]]
+    assert cvf.select_near_duplicate_removals(sets) == ["/c/b.png", "/c/d.png"]
 
 
-def test_select_near_duplicate_removals_ties_keep_smallest_path():
-    sets = [["/c/b.png", "/c/a.png"]]
-    scores = {"/c/a.png": 0.5, "/c/b.png": 0.5}
-    assert cvf.select_near_duplicate_removals(sets, scores) == ["/c/b.png"]
-
-
-def test_select_near_duplicate_removals_without_scores_is_deterministic():
-    sets = [["/c/b.png", "/c/a.png", "/c/c.png"]]
-    assert cvf.select_near_duplicate_removals(sets, None) == ["/c/b.png", "/c/c.png"]
+def test_select_near_duplicate_removals_is_deterministic_regardless_of_input_order():
+    """
+    Nothing is removed upstream, so a later sync re-adds and re-prunes these samples.
+    The same crops must therefore always yield the same survivor.
+    """
+    a = cvf.select_near_duplicate_removals([["/c/b.png", "/c/a.png", "/c/c.png"]])
+    b = cvf.select_near_duplicate_removals([["/c/c.png", "/c/b.png", "/c/a.png"]])
+    assert a == b == ["/c/b.png", "/c/c.png"]
 
 
 def test_select_near_duplicate_removals_ignores_singleton_and_empty_sets():
-    assert cvf.select_near_duplicate_removals([["/c/a.png"], [], None], {}) == []
-    assert cvf.select_near_duplicate_removals(None, {}) == []
+    assert cvf.select_near_duplicate_removals([["/c/a.png"], [], None]) == []
+    assert cvf.select_near_duplicate_removals(None) == []
 
 
 def test_select_near_duplicate_removals_keeps_one_per_set():
     sets = [["/c/a.png", "/c/b.png"], ["/c/x.png", "/c/y.png", "/c/z.png"]]
-    removals = cvf.select_near_duplicate_removals(sets, {})
+    removals = cvf.select_near_duplicate_removals(sets)
     assert len(removals) == 3  # 2 sets, one survivor each
 
 
@@ -219,14 +236,6 @@ def test_remove_bad_images_skips_when_no_local_files():
 # --------------------------------------------------------- find_bad_images
 
 
-class _FakeSeries:
-    def __init__(self, mapping):
-        self._mapping = dict(mapping)
-
-    def items(self):
-        return self._mapping.items()
-
-
 class _FakeMask:
     """Stand-in for the boolean mask in `issues[issues[col]]`."""
 
@@ -237,23 +246,17 @@ class _FakeMask:
 class _FakeIssues:
     """Stands in for the pandas DataFrame returned by imagelab.issues."""
 
-    def __init__(self, flags, blurry_scores=None):
-        # flags: {"is_blurry_issue": [paths...]}
+    def __init__(self, flags):
+        # flags: {"is_dark_issue": [paths...]}
         self._flags = flags
-        self._blurry_scores = blurry_scores or {}
 
     @property
     def columns(self):
-        cols = list(self._flags)
-        if self._blurry_scores:
-            cols.append("blurry_score")
-        return cols
+        return list(self._flags)
 
     def __getitem__(self, key):
         if isinstance(key, _FakeMask):
             return types.SimpleNamespace(index=self._flags.get(key.column, []))
-        if key == "blurry_score":
-            return _FakeSeries(self._blurry_scores)
         return _FakeMask(key)
 
 
@@ -263,8 +266,10 @@ class _FakeImagelab:
     def __init__(self, filepaths=None, verbose=True):
         self.filepaths = filepaths
         self.issues = _FakeIssues(
-            {"is_blurry_issue": ["/c/blur.png"], "is_dark_issue": ["/c/dark.png"]},
-            blurry_scores={"/c/a.png": 0.2, "/c/b.png": 0.8},
+            {
+                "is_low_information_issue": ["/c/empty.png"],
+                "is_dark_issue": ["/c/dark.png"],
+            }
         )
         self.info = {"near_duplicates": {"sets": [["/c/a.png", "/c/b.png"]]}}
 
@@ -285,11 +290,24 @@ def fake_cleanvision(monkeypatch):
 
 
 def test_find_bad_images_collects_flags_and_duplicates(fake_cleanvision):
-    bad = cvf.find_bad_images(["/c/a.png", "/c/b.png", "/c/blur.png", "/c/dark.png"])
-    # blurry + dark flagged outright; the blurrier of the duplicate pair is dropped
-    assert set(bad) == {"/c/blur.png", "/c/dark.png", "/c/a.png"}
-    # least blurry duplicate is kept
-    assert "/c/b.png" not in bad
+    bad = cvf.find_bad_images(["/c/a.png", "/c/b.png", "/c/empty.png", "/c/dark.png"])
+    # low_information + dark flagged outright; one of the duplicate pair is dropped
+    assert set(bad) == {"/c/empty.png", "/c/dark.png", "/c/b.png"}
+    # the smallest path of the duplicate set survives
+    assert "/c/a.png" not in bad
+
+
+def test_find_bad_images_never_removes_on_blur(fake_cleanvision, monkeypatch):
+    """A `blurry` column in CleanVision's output must not cull anything."""
+
+    class _WithBlur(_FakeImagelab):
+        def __init__(self, filepaths=None, verbose=True):
+            super().__init__(filepaths=filepaths, verbose=verbose)
+            self.issues = _FakeIssues({"is_blurry_issue": ["/c/soft.png"]})
+            self.info = {}
+
+    monkeypatch.setattr(fake_cleanvision, "Imagelab", _WithBlur)
+    assert cvf.find_bad_images(["/c/soft.png"]) == []
 
 
 def test_find_bad_images_deduplicates_paths(fake_cleanvision, monkeypatch):
@@ -297,8 +315,10 @@ def test_find_bad_images_deduplicates_paths(fake_cleanvision, monkeypatch):
         def __init__(self, filepaths=None, verbose=True):
             super().__init__(filepaths=filepaths, verbose=verbose)
             self.issues = _FakeIssues(
-                {"is_blurry_issue": ["/c/a.png"], "is_dark_issue": ["/c/a.png"]},
-                blurry_scores={"/c/a.png": 0.1, "/c/b.png": 0.9},
+                {
+                    "is_low_information_issue": ["/c/a.png"],
+                    "is_dark_issue": ["/c/a.png"],
+                }
             )
 
     monkeypatch.setattr(fake_cleanvision, "Imagelab", _Overlap)
@@ -311,7 +331,7 @@ def test_find_bad_images_passes_resolved_issue_types(fake_cleanvision):
     kwargs = _FakeImagelab.last_kwargs
     assert kwargs["n_jobs"] == 2
     assert kwargs["issue_types"]["near_duplicates"]["hash_size"] == 8
-    assert kwargs["issue_types"]["blurry"]["threshold"] == 0.52
+    assert "blurry" not in kwargs["issue_types"]
 
 
 def test_find_bad_images_empty_input_short_circuits():

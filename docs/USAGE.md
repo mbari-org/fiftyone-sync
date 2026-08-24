@@ -161,7 +161,7 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `query` | no | Tator `encoded_search` filter (base64 Object_Search); ANDed with `section_id` when both set |
 | `localization_type_id` | no | Restrict sync to a single Tator box (localization) type |
 | `verified_only` | no | Only include localizations whose `verified` attribute is truthy (default: false). Exposed as the **Verified only** checkbox in the launcher applet. When set, the Tator media (`related_attribute=verified::true`) and localization (`attribute=verified::true`) queries are filtered server-side, so unverified media/localizations are never fetched, downloaded, or cropped — this minimizes data transfer, not just what's shown in the dataset. On subsequent syncs, samples that later become unverified are removed from the dataset (they are re-added automatically if re-verified). |
-| `remove_near_duplicates` | no | Remove CleanVision-flagged near-duplicate, blurry, dark, and low-information samples from the built dataset (default: false). Exposed as the **Remove near duplicates** checkbox in the launcher applet. See [Near-duplicate and low-quality sample removal](#near-duplicate-and-low-quality-sample-removal-cleanvision). |
+| `remove_near_duplicates` | no | Remove CleanVision-flagged near-duplicate, dark, and low-information samples from the built dataset (default: false). Exposed as the **Remove near duplicates** checkbox in the launcher applet. See [Near-duplicate and low-quality sample removal](#near-duplicate-and-low-quality-sample-removal-cleanvision). |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
@@ -189,15 +189,20 @@ The FiftyOne dataset name is always `project_name_v{version_id}_{port}` and cann
 
 Datasets built from Tator crops often contain near duplicates (successive video frames,
 overlapping boxes on the same target) plus crops that are unusable for annotation
-(blurry, dark, near-empty). Set `remove_near_duplicates=true` on `POST /sync` — or tick
+(dark, near-empty). Set `remove_near_duplicates=true` on `POST /sync` — or tick
 **Remove near duplicates** in the launcher applet — to prune them with
 [CleanVision](https://github.com/cleanlab/cleanvision).
 
 - Runs **after** the dataset is built and **before** embeddings/UMAP, so pruned samples
   are never embedded. Fewer samples means less annotator overhead and less memory/GPU
   pressure for the embedding and dimensionality-reduction passes.
-- Removes every image flagged `low_information`, `dark`, or `blurry`, and all but one
-  image of each near-duplicate set (the **least blurry** member is kept).
+- Removes every image flagged `low_information` or `dark`, and all but one image of each
+  near-duplicate set (the lexicographically smallest path is kept, so the choice is stable
+  across syncs).
+- **Blur is not detected.** CleanVision's `blurry` check scores global image sharpness,
+  which misreads these crops — a small, genuinely soft-edged organism against a uniform
+  background scores like a blurred photograph — so it culled usable specimens. It has been
+  removed from the pipeline rather than merely defaulted off.
 - **Voxel51 samples only.** Nothing is deleted in Tator, and the cropped image files on
   disk / in S3 are left in place, so the crop cache stays valid and a later sync does not
   have to re-crop.
@@ -221,8 +226,6 @@ cleanvision:
   issue_types:            # map an issue type to null to switch it off
     low_information: {}
     dark: {}
-    blurry:
-      threshold: 0.52     # CleanVision default is 0.5; higher is stricter
     near_duplicates:
       hash_size: 4        # perceptual-hash size; smaller is coarser, so more aggressive
       hash_type: phash

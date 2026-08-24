@@ -121,7 +121,7 @@ LAUNCHER_TEMPLATE = r"""
               <label class="force-sync-option" title="Only include localizations whose verified attribute is set to true in the built dataset.">
                 <input type="checkbox" id="verified-only-checkbox" name="verified_only" value="1"> Verified only
               </label>
-              <label class="force-sync-option" title="Remove near-duplicate, blurry, dark, and low-information crops (CleanVision) from the Voxel51 dataset. Nothing is deleted in Tator.">
+              <label class="force-sync-option" title="Remove near-duplicate, dark, and low-information crops (CleanVision) from the Voxel51 dataset. Nothing is deleted in Tator.">
                 <input type="checkbox" id="remove-near-duplicates-checkbox" name="remove_near_duplicates" value="1"> Remove near duplicates
               </label>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>

@@ -74,7 +74,7 @@ def enqueue_sync(
     vss_project_key is used to select a specific VSS project configuration for embeddings.
     localization_type_id restricts the sync to a single Tator box (localization) type.
     verified_only restricts the built dataset to localizations with a truthy `verified` attribute.
-    remove_near_duplicates prunes CleanVision-flagged near duplicates / blurry / dark /
+    remove_near_duplicates prunes CleanVision-flagged near duplicates / dark /
     low-information samples from the built FiftyOne dataset (Voxel51 samples only).
     """
     from rq import Queue
