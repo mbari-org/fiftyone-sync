@@ -10,9 +10,16 @@ annotation (dark, near-empty). Removing them before annotation reduces the
 number of samples a human has to review and cuts the memory/GPU pressure of the
 downstream embedding + UMAP passes.
 
-Only the **Voxel51 (FiftyOne) samples** are removed. Nothing is deleted in Tator, and
-the cropped image files on disk / in S3 are left in place, so the crop cache stays
-valid and a later sync does not have to re-crop.
+Only the **Voxel51 (FiftyOne) samples** are removed -- nothing is deleted in Tator.
+The cropped image files of the removed samples are *moved* out of the crops directory
+into a sibling quarantine directory (``crops_removed/`` by default), preserving the
+``<media_stem>/<elemental_id>.png`` layout, so they can be inspected or restored. No
+image file is ever deleted.
+
+Moving rather than deleting keeps the crop cache usable: sync treats a crop present in
+the quarantine directory as already cropped, so a later sync does not re-download and
+re-crop that media. Running a sync with the option off restores the quarantined crops
+first, so the full dataset comes back.
 
 Because nothing is deleted upstream, a subsequent sync re-adds these samples during
 reconcile and this filter removes them again (CleanVision hashing/scoring is
@@ -26,6 +33,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+from pathlib import Path
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
@@ -56,6 +65,9 @@ FLAG_ISSUE_TYPES: tuple[str, ...] = ("low_information", "dark", "light")
 
 # Handled separately: one image per set is kept.
 NEAR_DUPLICATES = "near_duplicates"
+
+# Sibling of the crops directory that removed crop images are moved into.
+REMOVED_CROPS_DIRNAME = "crops_removed"
 
 
 def is_cleanvision_available() -> bool:
@@ -231,17 +243,109 @@ def collect_local_paths(dataset: Any) -> tuple[dict[str, list[str]], int]:
     return path_to_ids, skipped
 
 
+def removed_crops_dir_for(crops_dir: str) -> str:
+    """
+    Default quarantine directory for removed crops: a `crops_removed` sibling of `crops_dir`.
+
+    Deliberately *outside* the crops directory -- the dataset build globs the crops tree
+    and, in enterprise deployments, the crops tree is synced to S3, so quarantined images
+    inside it would be re-added as samples and re-uploaded.
+    """
+    return os.path.join(
+        os.path.dirname(os.path.abspath(crops_dir)), REMOVED_CROPS_DIRNAME
+    )
+
+
+def _relative_crop_path(path: str, crops_dir: str) -> str:
+    """`<media_stem>/<elemental_id>.png` for a crop under `crops_dir`, else its basename."""
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(crops_dir))
+    except ValueError:  # different drives on Windows
+        return os.path.basename(path)
+    if rel.startswith(os.pardir):
+        return os.path.basename(path)
+    return rel
+
+
+def quarantine_crops(paths: Iterable[str], crops_dir: str, removed_dir: str) -> int:
+    """
+    Move removed crop images from `crops_dir` into `removed_dir`, keeping their
+    `<media_stem>/<elemental_id>.png` layout. Returns the number of files moved.
+
+    Files are moved, never deleted, so a removed crop can be reviewed or restored.
+    Individual failures are logged and skipped rather than failing the sync.
+    """
+    moved = 0
+    failed = 0
+    for path in paths:
+        src = str(path)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(removed_dir, _relative_crop_path(src, crops_dir))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            # move() refuses to overwrite an existing file on some platforms; a crop
+            # quarantined by an earlier run is the same image, so replace it.
+            if os.path.exists(dst):
+                os.remove(dst)
+            shutil.move(src, dst)
+            moved += 1
+        except OSError as e:
+            failed += 1
+            logger.warning(f"CleanVision: could not move {src} to {dst}: {e}")
+    if failed:
+        logger.warning(f"CleanVision: {failed} crop image(s) could not be moved")
+    logger.info(f"CleanVision: moved {moved} removed crop image(s) to {removed_dir}")
+    return moved
+
+
+def restore_quarantined_crops(crops_dir: str, removed_dir: str | None = None) -> int:
+    """
+    Move every quarantined crop back into `crops_dir`. Returns the number restored.
+
+    Called when a sync runs with duplicate removal switched off, so the dataset is
+    rebuilt from the full set of crops again.
+    """
+    source = removed_dir or removed_crops_dir_for(crops_dir)
+    if not os.path.isdir(source):
+        return 0
+    restored = 0
+    for path in sorted(Path(source).rglob("*")):
+        if not path.is_file():
+            continue
+        dst = os.path.join(crops_dir, os.path.relpath(str(path), source))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst):
+                os.remove(str(path))  # already back in place
+            else:
+                shutil.move(str(path), dst)
+            restored += 1
+        except OSError as e:
+            logger.warning(f"CleanVision: could not restore {path} to {dst}: {e}")
+    if restored:
+        logger.info(
+            f"CleanVision: restored {restored} previously removed crop image(s) "
+            f"from {source} to {crops_dir}"
+        )
+    return restored
+
+
 def remove_bad_images(
     dataset: Any,
     issue_types: dict[str, Any] | None = None,
     n_jobs: int | None = None,
     dry_run: bool = False,
+    crops_dir: str | None = None,
+    removed_dir: str | None = None,
 ) -> dict[str, Any]:
     """
     Delete CleanVision-flagged samples from `dataset` (Voxel51 samples only).
 
-    Nothing is deleted in Tator and the crop files themselves are kept. Returns a
-    summary dict; on `dry_run` the samples are reported but not deleted.
+    Nothing is deleted in Tator. When `crops_dir` is given, the flagged crop images are
+    moved out of it into `removed_dir` (default: the `crops_removed` sibling), so the
+    removed images stay on disk for review. Returns a summary dict; on `dry_run` the
+    samples are reported but neither deleted nor moved.
     """
     num_before = len(dataset)
     path_to_ids, skipped = collect_local_paths(dataset)
@@ -273,6 +377,12 @@ def remove_bad_images(
     if remove_ids and not dry_run:
         dataset.delete_samples(remove_ids)
 
+    num_moved = 0
+    resolved_removed_dir = None
+    if bad_paths and crops_dir and not dry_run:
+        resolved_removed_dir = removed_dir or removed_crops_dir_for(crops_dir)
+        num_moved = quarantine_crops(bad_paths, crops_dir, resolved_removed_dir)
+
     num_after = len(dataset)
     logger.info(
         f"CleanVision: removed {len(remove_ids)} of {num_before} samples "
@@ -285,6 +395,8 @@ def remove_bad_images(
         "num_removed": len(remove_ids),
         "num_bad_images": len(bad_paths),
         "num_skipped_no_local_file": skipped,
+        "num_crops_moved": num_moved,
+        "removed_crops_dir": resolved_removed_dir,
         "issue_types": sorted(normalize_issue_types(issue_types)),
         "dry_run": bool(dry_run),
     }

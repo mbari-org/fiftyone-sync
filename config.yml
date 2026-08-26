@@ -49,6 +49,9 @@ cleanvision:
   dry_run: false
   # Worker processes for image hashing/scoring (omit or null = CleanVision decides).
   n_jobs: null
+  # Where removed crop images are moved to. They are moved, never deleted, so they can
+  # be reviewed or restored. Default: a `crops_removed` sibling of the crops directory.
+  removed_dir: null
   # CleanVision issue types and params. Map an issue type to null to switch it off.
   # near_duplicates groups by perceptual-hash collision: a smaller hash_size is coarser
   # and therefore more aggressive. hash_size is the side of the hash grid, so it means

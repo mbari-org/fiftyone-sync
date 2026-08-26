@@ -188,6 +188,161 @@ def test_collect_local_paths_without_local_filepath_field(tmp_path):
     assert skipped == 0
 
 
+# --------------------------------------------------------- crop quarantine
+
+
+def _crop(crops_dir, media_stem, eid):
+    d = crops_dir / media_stem
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{eid}.png"
+    p.write_bytes(b"x")
+    return p
+
+
+def test_removed_crops_dir_is_a_sibling_of_crops(tmp_path):
+    crops = tmp_path / "v1" / "crops"
+    crops.mkdir(parents=True)
+    assert cvf.removed_crops_dir_for(str(crops)) == str(tmp_path / "v1" / "crops_removed")
+
+
+def test_quarantine_crops_preserves_layout(tmp_path):
+    crops = tmp_path / "crops"
+    removed = tmp_path / "crops_removed"
+    src = _crop(crops, "media1", "eid-1")
+
+    moved = cvf.quarantine_crops([str(src)], str(crops), str(removed))
+
+    assert moved == 1
+    assert not src.exists()
+    assert (removed / "media1" / "eid-1.png").is_file()
+
+
+def test_quarantine_crops_moves_not_deletes(tmp_path):
+    crops = tmp_path / "crops"
+    removed = tmp_path / "elsewhere"
+    src = _crop(crops, "media1", "eid-1")
+    src.write_bytes(b"pixels")
+
+    cvf.quarantine_crops([str(src)], str(crops), str(removed))
+
+    assert (removed / "media1" / "eid-1.png").read_bytes() == b"pixels"
+
+
+def test_quarantine_crops_overwrites_prior_quarantine(tmp_path):
+    crops = tmp_path / "crops"
+    removed = tmp_path / "crops_removed"
+    dest = removed / "media1"
+    dest.mkdir(parents=True)
+    (dest / "eid-1.png").write_bytes(b"old")
+    src = _crop(crops, "media1", "eid-1")
+    src.write_bytes(b"new")
+
+    assert cvf.quarantine_crops([str(src)], str(crops), str(removed)) == 1
+    assert (removed / "media1" / "eid-1.png").read_bytes() == b"new"
+
+
+def test_quarantine_crops_skips_missing_and_outside_paths(tmp_path):
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    removed = tmp_path / "crops_removed"
+    outside = tmp_path / "loose.png"
+    outside.write_bytes(b"x")
+
+    moved = cvf.quarantine_crops(
+        [str(crops / "gone.png"), str(outside)], str(crops), str(removed)
+    )
+
+    assert moved == 1  # the missing file is skipped
+    assert (removed / "loose.png").is_file()  # outside paths fall back to basename
+
+
+def test_restore_quarantined_crops_moves_files_back(tmp_path):
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    removed = tmp_path / "crops_removed"
+    (removed / "media1").mkdir(parents=True)
+    (removed / "media1" / "eid-1.png").write_bytes(b"x")
+
+    restored = cvf.restore_quarantined_crops(str(crops))
+
+    assert restored == 1
+    assert (crops / "media1" / "eid-1.png").is_file()
+    assert not (removed / "media1" / "eid-1.png").exists()
+
+
+def test_restore_quarantined_crops_no_quarantine_dir(tmp_path):
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    assert cvf.restore_quarantined_crops(str(crops)) == 0
+
+
+def test_restore_quarantined_crops_drops_duplicate_of_existing_crop(tmp_path):
+    crops = tmp_path / "crops"
+    _crop(crops, "media1", "eid-1")
+    removed = tmp_path / "crops_removed"
+    (removed / "media1").mkdir(parents=True)
+    (removed / "media1" / "eid-1.png").write_bytes(b"stale")
+
+    assert cvf.restore_quarantined_crops(str(crops)) == 1
+    assert (crops / "media1" / "eid-1.png").read_bytes() == b"x"
+    assert not (removed / "media1" / "eid-1.png").exists()
+
+
+def test_remove_bad_images_moves_removed_crops(monkeypatch, tmp_path):
+    crops = tmp_path / "crops"
+    kept = _crop(crops, "media1", "keep")
+    dropped = _crop(crops, "media1", "drop")
+    dataset = _FakeDataset(
+        [("id0", str(kept), "s3://b/keep.png"), ("id1", str(dropped), "s3://b/drop.png")]
+    )
+    monkeypatch.setattr(cvf, "find_bad_images", lambda p, **kw: [str(dropped)])
+
+    result = cvf.remove_bad_images(dataset, crops_dir=str(crops))
+
+    assert result["num_crops_moved"] == 1
+    assert result["removed_crops_dir"] == str(tmp_path / "crops_removed")
+    assert not dropped.exists()
+    assert kept.is_file()
+    assert (tmp_path / "crops_removed" / "media1" / "drop.png").is_file()
+
+
+def test_remove_bad_images_honors_removed_dir_override(monkeypatch, tmp_path):
+    crops = tmp_path / "crops"
+    dropped = _crop(crops, "media1", "drop")
+    dataset = _FakeDataset([("id0", str(dropped), "s3://b/drop.png")])
+    monkeypatch.setattr(cvf, "find_bad_images", lambda p, **kw: [str(dropped)])
+
+    override = tmp_path / "quarantine"
+    result = cvf.remove_bad_images(
+        dataset, crops_dir=str(crops), removed_dir=str(override)
+    )
+
+    assert result["removed_crops_dir"] == str(override)
+    assert (override / "media1" / "drop.png").is_file()
+
+
+def test_remove_bad_images_dry_run_leaves_crops_in_place(monkeypatch, tmp_path):
+    crops = tmp_path / "crops"
+    dropped = _crop(crops, "media1", "drop")
+    dataset = _FakeDataset([("id0", str(dropped), "s3://b/drop.png")])
+    monkeypatch.setattr(cvf, "find_bad_images", lambda p, **kw: [str(dropped)])
+
+    result = cvf.remove_bad_images(dataset, crops_dir=str(crops), dry_run=True)
+
+    assert result["num_crops_moved"] == 0
+    assert dropped.is_file()
+
+
+def test_remove_bad_images_without_crops_dir_does_not_move(monkeypatch, tmp_path):
+    dataset, paths = _dataset_with_crops(tmp_path, 1)
+    monkeypatch.setattr(cvf, "find_bad_images", lambda p, **kw: [paths[0]])
+
+    result = cvf.remove_bad_images(dataset)
+
+    assert result["num_crops_moved"] == 0
+    assert result["removed_crops_dir"] is None
+
+
 def test_remove_bad_images_deletes_flagged_samples(monkeypatch, tmp_path):
     dataset, paths = _dataset_with_crops(tmp_path, 3)
     monkeypatch.setattr(cvf, "find_bad_images", lambda p, **kw: [paths[0], paths[2]])
@@ -392,3 +547,87 @@ def test_cleanvision_config_ignores_non_dict():
 
     assert sync._cleanvision_config({"cleanvision": "yes"}) == {}
     assert sync._cleanvision_config({}) == {}
+
+
+def test_remove_near_duplicate_samples_passes_crops_dir(monkeypatch):
+    import src.app.sync as sync
+
+    monkeypatch.setattr(cvf, "is_cleanvision_available", lambda: True)
+    monkeypatch.setattr(cvf, "remove_bad_images", lambda ds, **kw: {"status": "ok", "kwargs": kw})
+
+    config = {"cleanvision": {"removed_dir": "/data/quarantine"}}
+    result = sync._remove_near_duplicate_samples(
+        object(), config, enabled=True, crops_dir="/data/crops"
+    )
+
+    assert result["kwargs"]["crops_dir"] == "/data/crops"
+    assert result["kwargs"]["removed_dir"] == "/data/quarantine"
+
+
+def test_removed_crops_dir_helper_matches_filter_module():
+    import src.app.sync as sync
+
+    assert sync._removed_crops_dir("/data/v1/crops") == cvf.removed_crops_dir_for(
+        "/data/v1/crops"
+    )
+
+
+def test_restore_removed_crops_delegates_to_filter(tmp_path):
+    import src.app.sync as sync
+
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    removed = tmp_path / "crops_removed"
+    (removed / "media1").mkdir(parents=True)
+    (removed / "media1" / "eid-1.png").write_bytes(b"x")
+
+    assert sync._restore_removed_crops(str(crops), {}) == 1
+    assert (crops / "media1" / "eid-1.png").is_file()
+
+
+def test_restore_removed_crops_swallows_errors(monkeypatch):
+    import src.app.sync as sync
+
+    def _boom(crops_dir, removed_dir=None):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(cvf, "restore_quarantined_crops", _boom)
+    assert sync._restore_removed_crops("/data/crops", {}) == 0
+
+
+def test_find_crop_cache_misses_counts_quarantined_crop_as_hit(tmp_path):
+    import json
+
+    import src.app.sync as sync
+
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    (tmp_path / "crops_removed" / "media1").mkdir(parents=True)
+    (tmp_path / "crops_removed" / "media1" / "eid-1.png").write_bytes(b"x")
+
+    jsonl = tmp_path / "localizations.jsonl"
+    jsonl.write_text(
+        json.dumps(
+            {
+                "elemental_id": "eid-1",
+                "media": 1,
+                "media_stem": "media1",
+                "modified_datetime": "2026-01-01T00:00:00Z",
+            }
+        )
+        + "\n"
+    )
+    manifest = {
+        "eid-1": {
+            "modified_at": "2026-01-01T00:00:00Z",
+            "media_id": 1,
+            "media_stem": "media1",
+        }
+    }
+
+    media_ids, locs_to_crop, _updated = sync._find_crop_cache_misses(
+        str(jsonl), str(crops), manifest
+    )
+
+    assert locs_to_crop == []  # quarantined crop is not re-cropped
+    assert media_ids == set()

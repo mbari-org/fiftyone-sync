@@ -203,15 +203,23 @@ overlapping boxes on the same target) plus crops that are unusable for annotatio
   which misreads these crops — a small, genuinely soft-edged organism against a uniform
   background scores like a blurred photograph — so it culled usable specimens. It has been
   removed from the pipeline rather than merely defaulted off.
-- **Voxel51 samples only.** Nothing is deleted in Tator, and the cropped image files on
-  disk / in S3 are left in place, so the crop cache stays valid and a later sync does not
-  have to re-crop.
+- **Voxel51 samples only.** Nothing is deleted in Tator.
+- The removed samples' crop images are **moved, never deleted**: they go from
+  `.../crops/<media_stem>/<elemental_id>.png` to a sibling
+  `.../crops_removed/<media_stem>/<elemental_id>.png`, keeping the same layout, so you
+  can review what was dropped. Override the location with `cleanvision.removed_dir`.
+  The quarantine folder is deliberately *outside* the crops tree — the dataset build
+  globs that tree and (in enterprise) syncs it to S3, so images left inside would be
+  re-added as samples and re-uploaded.
+- Sync counts a crop sitting in the quarantine folder as already cropped, so a later
+  sync does **not** re-download and re-crop that media.
 - Because nothing is removed upstream, a later sync re-adds these samples during
   reconcile and prunes them again — CleanVision hashing/scoring is deterministic for the
-  same crops, so the result is stable. Run the sync without the flag to get the full
-  dataset back.
+  same crops, so the result is stable. Running a sync **without** the flag moves every
+  quarantined crop back into the crops directory first, so the full dataset comes back.
 - The sync result (`GET /sync/status/{job_id}`) carries a `cleanvision` summary with
-  `num_samples_before`, `num_removed`, and `num_samples_after`.
+  `num_samples_before`, `num_removed`, `num_samples_after`, `num_crops_moved`, and
+  `removed_crops_dir`.
 - `cleanvision` is in `requirements.txt`; if it is not installed the step logs a warning
   and is skipped, leaving the full dataset in place.
 
@@ -223,6 +231,7 @@ cleanvision:
   enabled: false          # true = always prune, even without the query param
   dry_run: false          # true = report what would be removed, delete nothing
   n_jobs: null            # worker processes for hashing/scoring (null = CleanVision decides)
+  removed_dir: null       # where removed crops are moved (null = `crops_removed` beside crops)
   issue_types:            # map an issue type to null to switch it off
     low_information: {}
     dark: {}

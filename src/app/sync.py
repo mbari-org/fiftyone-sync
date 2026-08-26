@@ -266,6 +266,13 @@ def _crops_dir(
     return path
 
 
+def _removed_crops_dir(crops_dir: str) -> str:
+    """Sibling directory holding crops removed by the CleanVision filter (never deleted)."""
+    from src.app.cleanvision_filter import removed_crops_dir_for
+
+    return removed_crops_dir_for(crops_dir)
+
+
 def _localizations_jsonl_path(
     project_id: int,
     version_id: int | None,
@@ -2222,6 +2229,10 @@ def _find_crop_cache_misses(
             manifest_stem_map[int(mid)] = stem
 
     crops_path = Path(crops_dir)
+    # Crops removed by the CleanVision filter are moved here rather than deleted; they
+    # still count as cropped, so a later sync does not re-download and re-crop that
+    # media just because the image is no longer under crops/.
+    removed_crops_path = Path(_removed_crops_dir(crops_dir))
 
     media_ids_needed: set[int] = set()
     locs_to_crop: list[dict] = []
@@ -2267,7 +2278,11 @@ def _find_crop_cache_misses(
             }
 
             old_entry = manifest.get(eid)
-            crop_file = crops_path / media_stem / f"{eid}.png"
+            crop_rel = Path(media_stem) / f"{eid}.png"
+            crop_file = crops_path / crop_rel
+            crop_exists = (
+                crop_file.exists() or (removed_crops_path / crop_rel).exists()
+            )
 
             # A crop file already on disk is direct proof that localization was
             # already cropped, even when the manifest has no record of it (e.g. the
@@ -2277,7 +2292,7 @@ def _find_crop_cache_misses(
             # Without this, a missing/stale manifest alone would mark every
             # localization a "miss" and re-download/re-crop videos that are already
             # fully cropped on disk.
-            is_miss = not crop_file.exists() or (
+            is_miss = not crop_exists or (
                 old_entry is not None and old_entry.get("modified_at") != modified_at
             )
             if is_miss:
@@ -4852,19 +4867,40 @@ def _cleanvision_config(config: dict[str, Any]) -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _restore_removed_crops(crops_dir: str, config: dict[str, Any]) -> int:
+    """
+    Move CleanVision-quarantined crops back into `crops_dir`. Never raises.
+
+    Runs when a sync is not pruning duplicates, so switching the option off rebuilds the
+    dataset from every crop again.
+    """
+    try:
+        from src.app.cleanvision_filter import restore_quarantined_crops
+
+        return restore_quarantined_crops(
+            crops_dir, _cleanvision_config(config).get("removed_dir")
+        )
+    except Exception:
+        logger.exception("Restoring previously removed crops failed")
+        return 0
+
+
 def _remove_near_duplicate_samples(
     dataset: Any,
     config: dict[str, Any],
     enabled: bool = False,
+    crops_dir: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Drop CleanVision-flagged samples (near duplicates, dark, low information)
     from the FiftyOne dataset.
 
     Runs when the `remove_near_duplicates` query param is set or `cleanvision.enabled`
-    is true in config. Only Voxel51 samples are deleted -- Tator localizations and the
-    cropped image files are left untouched, so the crop cache stays valid. Never raises:
-    a failure here leaves the full dataset in place.
+    is true in config. Only Voxel51 samples are deleted -- nothing is removed in Tator.
+    The removed samples' crop images are moved out of `crops_dir` into the `crops_removed`
+    sibling (override with `cleanvision.removed_dir`) rather than deleted, so they can be
+    reviewed or restored and the crop cache stays valid. Never raises: a failure here
+    leaves the full dataset in place.
 
     Returns a summary dict, or None when the step did not run.
     """
@@ -4889,6 +4925,8 @@ def _remove_near_duplicate_samples(
             issue_types=cleanvision_cfg.get("issue_types"),
             n_jobs=cleanvision_cfg.get("n_jobs"),
             dry_run=bool(cleanvision_cfg.get("dry_run", False)),
+            crops_dir=crops_dir,
+            removed_dir=cleanvision_cfg.get("removed_dir"),
         )
     except Exception as e:
         logger.exception("CleanVision duplicate/quality removal failed")
@@ -5008,6 +5046,12 @@ def sync_project_to_fiftyone(
             query=query,
             localization_type_id=localization_type_id,
         )
+        # Crops removed by an earlier CleanVision run are quarantined, not deleted.
+        # When this sync is not pruning, put them back first so the dataset is rebuilt
+        # from the full set of crops.
+        if not (remove_near_duplicates or _cleanvision_config(config).get("enabled")):
+            _restore_removed_crops(crops, config)
+
         try:
             host = api_url.rstrip("/")
             api = tator.get_api(host, token)
@@ -5141,7 +5185,7 @@ def sync_project_to_fiftyone(
         # low information) *before* embeddings so pruned samples are never embedded --
         # fewer samples means less annotator overhead and less memory/GPU pressure.
         cleanvision_result = _remove_near_duplicate_samples(
-            dataset, config, enabled=remove_near_duplicates
+            dataset, config, enabled=remove_near_duplicates, crops_dir=crops
         )
         if cleanvision_result and cleanvision_result.get("num_removed"):
             sample_count = len(dataset)
