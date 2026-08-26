@@ -24,3 +24,13 @@ projects:
 #    databases:
 #      - uri: "mongodb://localhost:27017"
 #        port: 5151
+#
+# Optional: remove near-duplicate / dark / low-information samples from the
+# built Voxel51 dataset with CleanVision (see config.yml and docs/USAGE.md).
+# cleanvision:
+#   enabled: false
+#   removed_dir: null      # default: a `crops_removed` sibling of the crops directory
+#   issue_types:
+#     near_duplicates:
+#       hash_size: 8
+#       hash_type: phash

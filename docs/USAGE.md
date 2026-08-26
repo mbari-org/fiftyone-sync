@@ -161,6 +161,7 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `query` | no | Tator `encoded_search` filter (base64 Object_Search); ANDed with `section_id` when both set |
 | `localization_type_id` | no | Restrict sync to a single Tator box (localization) type |
 | `verified_only` | no | Only include localizations whose `verified` attribute is truthy (default: false). Exposed as the **Verified only** checkbox in the launcher applet. When set, the Tator media (`related_attribute=verified::true`) and localization (`attribute=verified::true`) queries are filtered server-side, so unverified media/localizations are never fetched, downloaded, or cropped — this minimizes data transfer, not just what's shown in the dataset. On subsequent syncs, samples that later become unverified are removed from the dataset (they are re-added automatically if re-verified). |
+| `remove_near_duplicates` | no | Remove CleanVision-flagged near-duplicate, dark, and low-information samples from the built dataset (default: false). Exposed as the **Remove near duplicates** checkbox in the launcher applet. See [Near-duplicate and low-quality sample removal](#near-duplicate-and-low-quality-sample-removal-cleanvision). |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
@@ -184,6 +185,68 @@ max_samples: 500                         # optional: limit for testing
 
 The FiftyOne dataset name is always `project_name_v{version_id}_{port}` and cannot be set in config.
 
+### Near-duplicate and low-quality sample removal (CleanVision)
+
+Datasets built from Tator crops often contain near duplicates (successive video frames,
+overlapping boxes on the same target) plus crops that are unusable for annotation
+(dark, near-empty). Set `remove_near_duplicates=true` on `POST /sync` — or tick
+**Remove near duplicates** in the launcher applet — to prune them with
+[CleanVision](https://github.com/cleanlab/cleanvision).
+
+- Runs **after** the dataset is built and **before** embeddings/UMAP, so pruned samples
+  are never embedded. Fewer samples means less annotator overhead and less memory/GPU
+  pressure for the embedding and dimensionality-reduction passes.
+- Removes every image flagged `low_information` or `dark`, and all but one image of each
+  near-duplicate set (the lexicographically smallest path is kept, so the choice is stable
+  across syncs).
+- **Blur is not detected.** CleanVision's `blurry` check scores global image sharpness,
+  which misreads these crops — a small, genuinely soft-edged organism against a uniform
+  background scores like a blurred photograph — so it culled usable specimens. It has been
+  removed from the pipeline rather than merely defaulted off.
+- **Voxel51 samples only.** Nothing is deleted in Tator.
+- The removed samples' crop images are **moved, never deleted**: they go from
+  `.../crops/<media_stem>/<elemental_id>.png` to a sibling
+  `.../crops_removed/<media_stem>/<elemental_id>.png`, keeping the same layout, so you
+  can review what was dropped. Override the location with `cleanvision.removed_dir`.
+  The quarantine folder is deliberately *outside* the crops tree — the dataset build
+  globs that tree and (in enterprise) syncs it to S3, so images left inside would be
+  re-added as samples and re-uploaded.
+- Sync counts a crop sitting in the quarantine folder as already cropped, so a later
+  sync does **not** re-download and re-crop that media.
+- Because nothing is removed upstream, a later sync re-adds these samples during
+  reconcile and prunes them again — CleanVision hashing/scoring is deterministic for the
+  same crops, so the result is stable. Running a sync **without** the flag moves every
+  quarantined crop back into the crops directory first, so the full dataset comes back.
+- The sync result (`GET /sync/status/{job_id}`) carries a `cleanvision` summary with
+  `num_samples_before`, `num_removed`, `num_samples_after`, `num_crops_moved`, and
+  `removed_crops_dir`.
+- `cleanvision` is in `requirements.txt`; if it is not installed the step logs a warning
+  and is skipped, leaving the full dataset in place.
+
+Defaults come from the module and are overridden by the `cleanvision` block in the config
+file (`config_path` / `FIFTYONE_SYNC_CONFIG_PATH`):
+
+```yaml
+cleanvision:
+  enabled: false          # true = always prune, even without the query param
+  dry_run: false          # true = report what would be removed, delete nothing
+  n_jobs: null            # worker processes for hashing/scoring (null = CleanVision decides)
+  removed_dir: null       # where removed crops are moved (null = `crops_removed` beside crops)
+  issue_types:            # map an issue type to null to switch it off
+    low_information: {}
+    dark: {}
+    near_duplicates:
+      hash_size: 8        # hash grid side, so hash_size**2 bits; smaller is coarser, so more aggressive
+      hash_type: phash
+```
+
+`near_duplicates` groups images by perceptual-hash collision, so `hash_size` is the
+sensitivity knob rather than a distance threshold. `hash_types: [whash, phash]` is also
+accepted and maps onto the singular `hash_type` that CleanVision >= 0.3 reads.
+
+> CleanVision's `imagelab.report()` is deliberately never called — it segfaults on large
+> datasets. Counts are logged instead.
+
 ### Embeddings, UMAP, and similarity search
 
 You can optionally compute **embeddings**, a **UMAP** 2D visualization, and a **similarity** index after the dataset is built. Embeddings are fetched from the **embed service** at `{service_url}/embed/{project}`. By default `{project}` is the **Tator project ID** (many services expect this). Set `embeddings.project_name` in config to use a project name or other key instead. Add an `embeddings` block to your config and pass it via `config_path`:
@@ -201,6 +264,7 @@ embeddings:
   force_similarity: false             # set true to recompute similarity index
   batch_size: 32                     # batch size for embed service requests
   concurrency: 4                     # max batches submitted to the embed service concurrently
+  poll_timeout: null                  # optional; seconds to wait per embed job (default FASTVSS_WS_MAX_WAIT)
   service_url: null                   # optional; default FASTVSS_API_URL or http://localhost:8000
   project_name: null                  # optional; override for embed service URL path (default: project_id)
 ```
@@ -213,11 +277,26 @@ To recompute dimensionality reduction without re-embedding, use `POST /dimreduce
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
+| `FASTVSS_WS_MAX_WAIT` | `1800` | Total budget for one embed job, measured from when its WebSocket opens (ws-test background + sync) |
+| `FASTVSS_WS_IDLE_TIMEOUT` | `120` | Max gap between frames from Fast-VSS before the stream is treated as dead |
+| `FASTVSS_WS_CONNECT_TIMEOUT` | `30` | WebSocket handshake timeout |
+| `FASTVSS_HTTP_TIMEOUT` | `300` | Read/write timeout for the multipart POST that submits a batch |
 | `FASTVSS_WS_TEST_TIMEOUT` | `120` | Max wait for applet `GET /vss-embedding/ws-test` |
 
+`FASTVSS_WS_MAX_WAIT` and `FASTVSS_WS_IDLE_TIMEOUT` are deliberately separate. Fast-VSS runs one
+serial RQ worker per project, so a job queued behind `concurrency` others spends nearly all of its
+budget legitimately in the `pending` state — a job deadline must therefore be generous. What
+actually indicates a broken run is a *gap in the heartbeat*: Fast-VSS sends `{"status": "pending"}`
+every `WS_POLL_INTERVAL` (0.5s), so `FASTVSS_WS_IDLE_TIMEOUT` is what detects a wedged socket or
+service. Collapsing the two — waiting only on the remaining budget with a small floor — turns the
+job deadline into a one-second inter-frame watchdog that any momentary stall trips; that was the
+cause of the `WebSocket batch N/M attempt 1/3 failed:` storms at the start of a run.
+
+A batch that exhausts its retries now fails only that batch. The run continues, whatever succeeded
+is saved, and the next sync computes just the samples still missing embeddings. Only a run in which
+every batch failed raises.
+
 `GET /vss-embedding/ws-test` succeeds only when Fast-VSS returns embeddings (sync) or a `job_id` whose WebSocket completes. A 200 with only `Comment`/`error` and no vectors (e.g. prefix names like `MBARI`) is treated as failure.
-| `FASTVSS_WS_MAX_WAIT` | `300` | Max wait per embed job over WebSocket (ws-test background + sync) |
-| `FASTVSS_WS_CONNECT_TIMEOUT` | `30` | WebSocket handshake timeout |
 
 For UMAP visualization, install `umap-learn` in the sync service venv:
 

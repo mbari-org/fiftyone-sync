@@ -42,8 +42,28 @@ def _env_float(name: str, default: float) -> float:
 
 
 def fastvss_ws_max_wait_seconds() -> float:
-    """Max seconds to wait for one Fast-VSS job over WebSocket (FASTVSS_WS_MAX_WAIT, default 300)."""
-    return _env_float("FASTVSS_WS_MAX_WAIT", 300.0)
+    """
+    Total wall-clock budget for one Fast-VSS job (FASTVSS_WS_MAX_WAIT, default 1800).
+
+    This is a *job* deadline, not an inter-message one: Fast-VSS runs a single serial RQ
+    worker per project, so a job submitted while `concurrency` others are queued ahead of it
+    legitimately spends nearly all of this budget in the "pending" state. 300s was too tight
+    for that once more than a couple of batches were in flight.
+    """
+    return _env_float("FASTVSS_WS_MAX_WAIT", 1800.0)
+
+
+def fastvss_ws_idle_timeout_seconds() -> float:
+    """
+    Max seconds to wait for *any* frame before treating the stream as dead
+    (FASTVSS_WS_IDLE_TIMEOUT, default 120).
+
+    Fast-VSS heartbeats a {"status": "pending"} frame every WS_POLL_INTERVAL (0.5s by
+    default), so a gap this long means the socket or the service is genuinely wedged rather
+    than merely busy. Deliberately far above the heartbeat interval: a momentary event-loop
+    or network stall must never kill an otherwise healthy job.
+    """
+    return _env_float("FASTVSS_WS_IDLE_TIMEOUT", 120.0)
 
 
 def fastvss_ws_connect_timeout_seconds() -> float:
@@ -51,13 +71,33 @@ def fastvss_ws_connect_timeout_seconds() -> float:
     return _env_float("FASTVSS_WS_CONNECT_TIMEOUT", 30.0)
 
 
+def fastvss_http_timeout_seconds() -> float:
+    """
+    Read/write timeout for the multipart POST that submits a batch
+    (FASTVSS_HTTP_TIMEOUT, default 300).
+
+    One request carries a whole batch of crops (512 in the shipped config), so the upload
+    alone can run to hundreds of megabytes against a service that is concurrently handling
+    other batches.
+    """
+    return _env_float("FASTVSS_HTTP_TIMEOUT", 300.0)
+
+
 def fastvss_ws_test_timeout_seconds() -> float:
     """Max seconds for /vss-embedding/ws-test to wait for a fake job (FASTVSS_WS_TEST_TIMEOUT, default 120)."""
     return _env_float("FASTVSS_WS_TEST_TIMEOUT", 120.0)
 
 
-_WS_MAX_WAIT = fastvss_ws_max_wait_seconds()
-_WS_CONNECT_TIMEOUT = fastvss_ws_connect_timeout_seconds()
+def describe_error(exc: BaseException) -> str:
+    """
+    Render an exception for a log line, never as an empty string.
+
+    Several exceptions on this path stringify to "" -- notably asyncio.TimeoutError and the
+    httpx/httpcore timeout wrappers -- which produced log lines ending in a bare colon
+    ("attempt 1/3 failed:") and made these failures effectively undiagnosable.
+    """
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def fastvss_ws_job_url(ws_base: str, job_id: str, project: str) -> str:
@@ -147,7 +187,9 @@ async def queue_embedding_job(
             FASTVSS_BASE_URL,
         )
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(fastvss_http_timeout_seconds(), connect=15.0)
+            ) as client:
                 files = [
                     ("files", (os.path.basename(fp), data))
                     for fp, data in zip(local_filepaths, image_bytes_list)
@@ -214,27 +256,64 @@ async def queue_embedding_job(
                     try:
                         async with websockets.connect(
                             url,
-                            open_timeout=_WS_CONNECT_TIMEOUT,
+                            open_timeout=fastvss_ws_connect_timeout_seconds(),
                             close_timeout=5,
                             max_size=10 * 1024 * 1024,
                             additional_headers={"Origin": origin},
                         ) as ws:
-                            deadline = time.monotonic() + _WS_MAX_WAIT
+                            job_timeout = fastvss_ws_max_wait_seconds()
+                            idle_timeout = fastvss_ws_idle_timeout_seconds()
+                            start = time.monotonic()
+                            deadline = start + job_timeout
+                            frames = 0
+                            def budget_msg(n: int) -> str:
+                                return (
+                                    f"job did not finish within {job_timeout:.0f}s "
+                                    f"(received {n} status frames; raise "
+                                    "FASTVSS_WS_MAX_WAIT if the embed service is "
+                                    "simply backed up)"
+                                )
+
                             while True:
-                                remaining = max(1.0, deadline - time.monotonic())
-                                try:
-                                    raw = await asyncio.wait_for(
-                                        ws.recv(), timeout=remaining
-                                    )
-                                except asyncio.TimeoutError:
+                                now = time.monotonic()
+                                budget_left = deadline - now
+                                if budget_left <= 0:
                                     async with _queue_lock:
                                         _queue_results[job_id] = {
                                             "status": "failed",
                                             "embeddings": None,
-                                            "error": "WebSocket wait timed out",
+                                            "error": budget_msg(frames),
                                         }
                                         _job_map.pop(job_id, None)
                                     return
+                                # Wait at most `idle_timeout` for the next frame, never the
+                                # bare remaining budget clamped to a floor: that turns the job
+                                # deadline into an inter-frame watchdog which any momentary
+                                # stall trips. Attribute the timeout to whichever limit
+                                # actually elapsed.
+                                wait_next = min(idle_timeout, budget_left)
+                                try:
+                                    raw = await asyncio.wait_for(
+                                        ws.recv(), timeout=wait_next
+                                    )
+                                except (TimeoutError, asyncio.TimeoutError):
+                                    if time.monotonic() >= deadline:
+                                        error = budget_msg(frames)
+                                    else:
+                                        error = (
+                                            f"no message from Fast-VSS for {wait_next:.1f}s "
+                                            f"after {now - start:.0f}s (received {frames} "
+                                            "status frames); connection or service stalled"
+                                        )
+                                    async with _queue_lock:
+                                        _queue_results[job_id] = {
+                                            "status": "failed",
+                                            "embeddings": None,
+                                            "error": error,
+                                        }
+                                        _job_map.pop(job_id, None)
+                                    return
+                                frames += 1
                                 msg = json.loads(raw)
                                 status = msg.get("status")
                                 logger.debug(

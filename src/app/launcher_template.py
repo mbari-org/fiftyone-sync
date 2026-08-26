@@ -121,6 +121,9 @@ LAUNCHER_TEMPLATE = r"""
               <label class="force-sync-option" title="Only include localizations whose verified attribute is set to true in the built dataset.">
                 <input type="checkbox" id="verified-only-checkbox" name="verified_only" value="1"> Verified only
               </label>
+              <label class="force-sync-option" title="Remove near-duplicate, dark, and low-information crops (CleanVision) from the Voxel51 dataset. Nothing is deleted in Tator.">
+                <input type="checkbox" id="remove-near-duplicates-checkbox" name="remove_near_duplicates" value="1"> Remove near duplicates
+              </label>
               <span id="sync-status" class="sync-status" aria-live="polite"></span>
               <a id="fiftyone-app-link" href="#" target="_blank" rel="noopener" class="fiftyone-app-link" style="display: none;">Open Voxel51</a>
             </div>
@@ -713,6 +716,10 @@ LAUNCHER_TEMPLATE = r"""
           var verifiedOnlyEl = document.getElementById('verified-only-checkbox');
           if (verifiedOnlyEl && verifiedOnlyEl.checked) {
             params.set('verified_only', 'true');
+          }
+          var removeNearDupEl = document.getElementById('remove-near-duplicates-checkbox');
+          if (removeNearDupEl && removeNearDupEl.checked) {
+            params.set('remove_near_duplicates', 'true');
           }
           if (isEnterprise) {
             var s3BucketEl = document.getElementById('s3-bucket-input');
