@@ -42,6 +42,7 @@ from src.app.sync_filters import (
     filter_slug as _filter_slug,
     localization_fetch_kwargs as _localization_fetch_kwargs,
     media_fetch_kwargs as _media_fetch_kwargs,
+    parse_include_classes,
     scoped_data_dir,
     version_slug as _version_slug_from_filters,
 )
@@ -231,6 +232,7 @@ def _data_dir(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    include_classes: list[str] | None = None,
 ) -> str:
     """Per-project+version directory for JSONL, crops, and manifest."""
     return scoped_data_dir(
@@ -240,6 +242,7 @@ def _data_dir(
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
+        include_classes=include_classes,
     )
 
 
@@ -250,6 +253,7 @@ def _crops_dir(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    include_classes: list[str] | None = None,
 ) -> str:
     """Per-project+version crops directory."""
     path = os.path.join(
@@ -259,6 +263,7 @@ def _crops_dir(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            include_classes=include_classes,
         ),
         "crops",
     )
@@ -280,8 +285,9 @@ def _localizations_jsonl_path(
     section_id: int | None = None,
     query: str | None = None,
     localization_type_id: int | None = None,
+    include_classes: list[str] | None = None,
 ) -> str:
-    """Per-project+version JSONL path (optional section/query/box-type filter scope)."""
+    """Per-project+version JSONL path (optional section/query/box-type/label filter scope)."""
     return os.path.join(
         _data_dir(
             project_id,
@@ -289,6 +295,7 @@ def _localizations_jsonl_path(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            include_classes=include_classes,
         ),
         "localizations.jsonl",
     )
@@ -1353,6 +1360,7 @@ def fetch_and_save_localizations(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> str:
     """
     Fetch all current localizations from Tator and write to a JSONL file.
@@ -1364,16 +1372,21 @@ def fetch_and_save_localizations(
     If localization_type_id is provided, only localizations of that box type are fetched.
     If verified_only is set, only localizations whose own `verified` attribute is true are
     fetched (attribute=verified::true), so unverified localizations are never downloaded.
+    If include_classes is set, localizations are restricted to those labels.
+    A single label is applied as Tator `attribute=Label::{name}`; multiple labels
+    are filtered after fetch. Combined with verified_only when both are set.
 
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
     414 Request-URI Too Large errors from nginx when the project has many media.
     """
+    include_class_list = parse_include_classes(include_classes)
     out_path = _localizations_jsonl_path(
         project_id,
         version_id,
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
+        include_classes=include_class_list or None,
     )
     logger.info(f"Localizations JSONL will be saved to: {out_path}")
     loc_batch = (
@@ -1404,12 +1417,15 @@ def fetch_and_save_localizations(
         f"Media ID batches: {len(media_id_batches)} batch(es) of up to {effective_mid_batch}"
     )
 
+    # Tator attribute filters AND, so only a single Label can be pushed server-side.
+    include_class = include_class_list[0] if len(include_class_list) == 1 else None
     filter_kw = _localization_fetch_kwargs(
         version_id=version_id,
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
         verified_only=verified_only,
+        include_class=include_class,
     )
 
     try:
@@ -1423,7 +1439,7 @@ def fetch_and_save_localizations(
             f"get_localization_count(project_id={project_id}, media_ids={bool(media_ids)}, "
             f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}) = {loc_count}"
         )
-        if loc_count == 0 and version_id is not None:
+        if loc_count == 0 and version_id is not None and not include_class_list:
             count_no_ver = 0
             for mid_batch in media_id_batches:
                 kw: dict = {}
@@ -1482,6 +1498,9 @@ def fetch_and_save_localizations(
             return fetched
 
         total = _fetch_all_locs()
+
+    if len(include_class_list) > 1:
+        total = _filter_jsonl_include_classes(out_path, include_class_list)
 
     logger.info(f"Fetched {total} localizations -> {out_path}")
     return out_path
@@ -1985,10 +2004,19 @@ def _crop_manifest_path(
     *,
     section_id: int | None = None,
     query: str | None = None,
+    localization_type_id: int | None = None,
+    include_classes: list[str] | None = None,
 ) -> str:
     """Path to the crop manifest JSON for a project+version."""
     return os.path.join(
-        _data_dir(project_id, version_id, section_id=section_id, query=query),
+        _data_dir(
+            project_id,
+            version_id,
+            section_id=section_id,
+            query=query,
+            localization_type_id=localization_type_id,
+            include_classes=include_classes,
+        ),
         "crop_manifest.json",
     )
 
@@ -1999,13 +2027,20 @@ def _load_crop_manifest(
     *,
     section_id: int | None = None,
     query: str | None = None,
+    localization_type_id: int | None = None,
+    include_classes: list[str] | None = None,
 ) -> dict[str, dict]:
     """
     Load the crop manifest from disk.
     Returns {elemental_id: {"media_id": int, "media_stem": str}} or empty dict.
     """
     path = _crop_manifest_path(
-        project_id, version_id, section_id=section_id, query=query
+        project_id,
+        version_id,
+        section_id=section_id,
+        query=query,
+        localization_type_id=localization_type_id,
+        include_classes=include_classes,
     )
     if not os.path.exists(path):
         return {}
@@ -2024,10 +2059,17 @@ def _save_crop_manifest(
     *,
     section_id: int | None = None,
     query: str | None = None,
+    localization_type_id: int | None = None,
+    include_classes: list[str] | None = None,
 ) -> None:
     """Atomically write the crop manifest to disk."""
     path = _crop_manifest_path(
-        project_id, version_id, section_id=section_id, query=query
+        project_id,
+        version_id,
+        section_id=section_id,
+        query=query,
+        localization_type_id=localization_type_id,
+        include_classes=include_classes,
     )
     tmp_path = path + ".tmp"
     try:
@@ -2384,54 +2426,70 @@ def _resolve_localizations_jsonl(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> tuple[str, list[int], bool]:
     """
     Resolve localizations JSONL and media ids for crop work.
 
     When verified_only is True, media and localization fetches are scoped
     server-side to verified::true so unverified data is never downloaded.
+    When include_classes is set, localization fetches are scoped to those labels
+    and media pre-fetch is skipped so only media that have matching labels are downloaded.
 
     Returns (localizations_path, media_ids_list, use_cached_jsonl).
     """
+    include_class_list = parse_include_classes(include_classes)
     jsonl_path = _localizations_jsonl_path(
         project_id,
         version_id,
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
+        include_classes=include_class_list or None,
     )
     localizations_path = ""
     media_ids_list: list[int] = []
     use_cached_jsonl = False
     has_query = bool((query or "").strip())
+    has_label_filter = bool(include_class_list)
     if not force_sync and _file_newer_than_days(jsonl_path, days=1.0):
         line_count, media_ids_from_jsonl = _localizations_jsonl_line_count_and_media_ids(
             jsonl_path
         )
-        api_count = _get_localization_count_from_api(
-            api,
-            project_id,
-            version_id,
-            None if has_query else (media_ids_from_jsonl or None),
-            media_id_batch_size,
-            section_id=section_id,
-            query=query,
-            localization_type_id=localization_type_id,
-            verified_only=verified_only,
-        )
-        if api_count is not None and line_count == api_count:
+        if has_label_filter:
             use_cached_jsonl = True
             localizations_path = jsonl_path
             media_ids_list = media_ids_from_jsonl
             logger.info(
-                "Bypassing media and localization fetch: JSONL is newer than 1 day and "
-                "line count (%s) matches get_localization_count",
+                "Bypassing media and localization fetch: label-scoped JSONL is newer than 1 day "
+                "(%s lines)",
                 line_count,
             )
+        else:
+            api_count = _get_localization_count_from_api(
+                api,
+                project_id,
+                version_id,
+                None if has_query else (media_ids_from_jsonl or None),
+                media_id_batch_size,
+                section_id=section_id,
+                query=query,
+                localization_type_id=localization_type_id,
+                verified_only=verified_only,
+            )
+            if api_count is not None and line_count == api_count:
+                use_cached_jsonl = True
+                localizations_path = jsonl_path
+                media_ids_list = media_ids_from_jsonl
+                logger.info(
+                    "Bypassing media and localization fetch: JSONL is newer than 1 day and "
+                    "line count (%s) matches get_localization_count",
+                    line_count,
+                )
 
     if not use_cached_jsonl:
         loc_media_ids: list[int] | None = None
-        if not has_query:
+        if not has_query and not has_label_filter:
             logger.info(
                 "Fetching media IDs... host=%s project_id=%s api_url=%s verified_only=%s",
                 api_url.rstrip("/"),
@@ -2449,9 +2507,12 @@ def _resolve_localizations_jsonl(
             )
             loc_media_ids = media_ids_list or None
         else:
-            logger.info(
-                "Skipping media pre-fetch: encoded_search query filters localizations directly"
+            skip_reason = (
+                "include_classes filters localizations by Label"
+                if has_label_filter
+                else "encoded_search query filters localizations directly"
             )
+            logger.info("Skipping media pre-fetch: %s", skip_reason)
         logger.info("Fetching localizations...")
         localizations_path = fetch_and_save_localizations(
             api,
@@ -2464,8 +2525,9 @@ def _resolve_localizations_jsonl(
             query=query,
             localization_type_id=localization_type_id,
             verified_only=verified_only,
+            include_classes=include_class_list or None,
         )
-        if has_query and localizations_path:
+        if (has_query or has_label_filter) and localizations_path:
             _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
                 localizations_path
             )
@@ -2534,6 +2596,29 @@ def _delete_existing_crop_files(
     return removed
 
 
+def _filter_jsonl_include_classes(path: str, include_classes: list[str]) -> int:
+    """Rewrite JSONL keeping rows whose Label is in include_classes. Returns kept count."""
+    allowed = set(parse_include_classes(include_classes))
+    if not allowed or not path or not os.path.isfile(path):
+        return 0
+    kept: list[str] = []
+    with open(path) as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                loc = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if _get_label_from_loc(loc) in allowed:
+                kept.append(json.dumps(loc, default=_json_serial))
+    with open(path, "w") as f:
+        for row in kept:
+            f.write(row + "\n")
+    return len(kept)
+
+
 def _run_crop_pipeline(
     api: Any,
     *,
@@ -2551,6 +2636,7 @@ def _run_crop_pipeline(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Run crop refresh pipeline and return counts/paths/context.
@@ -2558,8 +2644,9 @@ def _run_crop_pipeline(
     This function is shared by full sync and crop-recompute jobs. When
     verified_only is True, media/localization fetches are scoped server-side
     to verified::true, so unverified media/localizations are never downloaded
-    or cropped.
+    or cropped. When include_classes is set, only those labels are fetched and cropped.
     """
+    include_class_list = parse_include_classes(include_classes)
     dl_dir = _download_dir(project_id)
     crops = _crops_dir(
         project_id,
@@ -2567,6 +2654,7 @@ def _run_crop_pipeline(
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
+        include_classes=include_class_list or None,
     )
     localizations_path = ""
     localizations_count = 0
@@ -2594,6 +2682,7 @@ def _run_crop_pipeline(
             query=query,
             localization_type_id=localization_type_id,
             verified_only=verified_only,
+            include_classes=include_class_list or None,
         )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
@@ -2625,8 +2714,25 @@ def _run_crop_pipeline(
                     added,
                     len(media_ids_list),
                 )
+        if localizations_path and include_class_list:
+            kept = _filter_jsonl_include_classes(
+                localizations_path, include_class_list
+            )
+            _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                localizations_path
+            )
+            logger.info(
+                "include_classes filter: kept %s localization(s) matching %s",
+                kept,
+                include_class_list,
+            )
         old_manifest = _load_crop_manifest(
-            project_id, version_id, section_id=section_id, query=query
+            project_id,
+            version_id,
+            section_id=section_id,
+            query=query,
+            localization_type_id=localization_type_id,
+            include_classes=include_class_list or None,
         )
         if force:
             (
@@ -2722,6 +2828,8 @@ def _run_crop_pipeline(
             updated_manifest,
             section_id=section_id,
             query=query,
+            localization_type_id=localization_type_id,
+            include_classes=include_class_list or None,
         )
 
         if s3_bucket and os.path.isdir(crops):
@@ -3280,6 +3388,7 @@ def reconcile_dataset_with_tator(
     Reconcile existing dataset with current Tator localizations:
     - Remove samples whose elemental_id was deleted in Tator
     - Remove samples that are no longer verified, when config["verified_only"] is set
+    - Remove samples whose label is not in config["include_classes"], when that is set
     - Update samples whose modified_datetime changed (crop file already overwritten)
     - Add samples for new elemental_ids in Tator
     """
@@ -3310,18 +3419,21 @@ def reconcile_dataset_with_tator(
     all_sample_ids = dataset.values("id", _enforce_natural_order=False)
     all_eids = dataset.values("elemental_id", _enforce_natural_order=False)
     to_remove: list[str] = []
-    to_remove_unverified: list[str] = []
+    to_remove_excluded: list[str] = []
     dataset_eids: set[str] = set()
     for sample_id, eid in zip(all_sample_ids, all_eids):
         if eid is not None:
             eid_str = str(eid)
             if eid_str in tator_eids:
-                if verified_only and not _loc_is_verified(loc_index.get(eid_str)):
+                loc = loc_index.get(eid_str)
+                if verified_only and not _loc_is_verified(loc):
                     # Still exists in Tator but no longer verified; drop from the
                     # verified_only dataset. Not added to dataset_eids, so step 3
                     # ("add new") will consider re-adding it, but _create_sample_from_loc
                     # will skip it again since it remains unverified.
-                    to_remove_unverified.append(sample_id)
+                    to_remove_excluded.append(sample_id)
+                elif include_classes and _get_label_from_loc(loc) not in include_classes:
+                    to_remove_excluded.append(sample_id)
                 else:
                     dataset_eids.add(eid_str)
             elif tator_eids:
@@ -3339,11 +3451,11 @@ def reconcile_dataset_with_tator(
             "Reconcile: 0 localizations from Tator; skipping delete step (keeping existing samples)"
         )
 
-    if to_remove_unverified:
-        dataset.delete_samples(to_remove_unverified)
+    if to_remove_excluded:
+        dataset.delete_samples(to_remove_excluded)
         logger.info(
-            f"Reconcile: removed {len(to_remove_unverified)} samples "
-            "(no longer verified; verified_only enabled)"
+            f"Reconcile: removed {len(to_remove_excluded)} samples "
+            "(excluded by verified_only or include_classes)"
         )
 
     # 2. Update samples with changed modified_datetime (crop already overwritten by crop_localizations_parallel)
@@ -3498,8 +3610,10 @@ def reconcile_dataset_with_tator(
     return dataset
 
 
-def _get_label_from_loc(loc: dict) -> str:
+def _get_label_from_loc(loc: dict | None) -> str:
     """Extract label from localization attributes (Label, label) or fallback to Unknown."""
+    if not loc:
+        return "Unknown"
     attrs = loc.get("attributes") or {}
     label = attrs.get("Label") or attrs.get("label")
     if label is not None and str(label).strip():
@@ -4502,6 +4616,7 @@ def run_sync_job(
     localization_type_id: int | None = None,
     verified_only: bool = False,
     remove_near_duplicates: bool = False,
+    include_classes: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Entrypoint for RQ worker: all args are serializable. Calls sync_project_to_fiftyone.
@@ -4513,7 +4628,8 @@ def run_sync_job(
         f"run_sync_job received project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
         f"localization_type_id={localization_type_id} verified_only={verified_only} "
-        f"remove_near_duplicates={remove_near_duplicates}"
+        f"remove_near_duplicates={remove_near_duplicates} "
+        f"include_classes={include_classes or 'all'}"
     )
 
     job_meta_handler: logging.Handler | None = None
@@ -4548,6 +4664,7 @@ def run_sync_job(
             localization_type_id=localization_type_id,
             verified_only=verified_only,
             remove_near_duplicates=remove_near_duplicates,
+            include_classes=include_classes,
         )
     finally:
         if job_meta_handler is not None:
@@ -4951,6 +5068,7 @@ def sync_project_to_fiftyone(
     localization_type_id: int | None = None,
     verified_only: bool = False,
     remove_near_duplicates: bool = False,
+    include_classes: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Fetch Tator media and localizations, build FiftyOne dataset, launch App on given port.
@@ -4960,6 +5078,7 @@ def sync_project_to_fiftyone(
     Optional remove_near_duplicates: after the dataset is built, drop CleanVision-flagged
     near duplicates / dark / low-information samples from the FiftyOne dataset
     (Voxel51 samples only; nothing is deleted in Tator and the crop files are kept).
+    Optional include_classes: restrict the dataset (and Tator loc fetch) to those labels.
     Returns {"status": "ok", "dataset_name": str, "database_name": str} or raises.
     """
     if not (s3_bucket and s3_bucket.strip()):
@@ -4980,7 +5099,8 @@ def sync_project_to_fiftyone(
         f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
         f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only} "
-        f"remove_near_duplicates={remove_near_duplicates}"
+        f"remove_near_duplicates={remove_near_duplicates} "
+        f"include_classes={include_classes or 'all'}"
     )
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
@@ -5035,6 +5155,11 @@ def sync_project_to_fiftyone(
     localization_batch_size = (
         config.get("localization_batch_size") or _DEFAULT_LOCALIZATION_BATCH_SIZE
     )
+    if include_classes is not None:
+        include_class_list = parse_include_classes(include_classes)
+        config["include_classes"] = include_class_list
+    else:
+        include_class_list = parse_include_classes(config.get("include_classes"))
 
     try:
         dl_dir = ""
@@ -5045,6 +5170,7 @@ def sync_project_to_fiftyone(
             section_id=section_id,
             query=query,
             localization_type_id=localization_type_id,
+            include_classes=include_class_list or None,
         )
         # Crops removed by an earlier CleanVision run are quarantined, not deleted.
         # When this sync is not pruning, put them back first so the dataset is rebuilt
@@ -5071,6 +5197,7 @@ def sync_project_to_fiftyone(
                 query=query,
                 localization_type_id=localization_type_id,
                 verified_only=verified_only,
+                include_classes=include_class_list or None,
             )
             if crop_result.get("status") != "ok":
                 return {

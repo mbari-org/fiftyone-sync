@@ -576,6 +576,10 @@ async def sync(
             "deleted in Tator and the crop files are kept"
         ),
     ),
+    include_classes: str | None = Query(
+        None,
+        description="Optional comma-separated label names to include in the Voxel51 dataset (e.g. Larvacean,Copepod). Combined with verified_only when both are set.",
+    ),
 ) -> dict:
     """
     Trigger sync: enqueues a job to fetch Tator media + localizations, build FiftyOne dataset, launch App.
@@ -583,6 +587,7 @@ async def sync(
     """
     from src.app.sync_queue import enqueue_sync
     from src.app.database_manager import get_vss_project_config
+    from src.app.sync_filters import parse_include_classes
 
     project_name: str | None = None
     try:
@@ -642,6 +647,7 @@ async def sync(
             localization_type_id=localization_type_id,
             verified_only=verified_only,
             remove_near_duplicates=remove_near_duplicates,
+            include_classes=parse_include_classes(include_classes) or None,
         )
         return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:

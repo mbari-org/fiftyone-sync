@@ -26,7 +26,8 @@ LAUNCHER_TEMPLATE = r"""
     .applet-header .btn-icon { margin-right: 0.25rem; }
     .applet-header .btn-icon.end { margin-right: 0; margin-left: 0.25rem; }
     .applet-header select { padding: 0.35rem 0.5rem; font-size: 0.8rem; background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; min-width: 10rem; }
-    .applet-header input[type="password"] { padding: 0.35rem 0.5rem; font-size: 0.8rem; background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; min-width: 12rem; }
+    .applet-header input[type="password"],
+    .applet-header input[type="text"] { padding: 0.35rem 0.5rem; font-size: 0.8rem; background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; min-width: 12rem; }
     .applet-header a.token-link { font-size: 0.8rem; color: #6ab; }
     .applet-header a.token-link:hover { color: #8cd; text-decoration: underline; }
     .applet-header a.fiftyone-app-link { font-size: 0.8rem; color: #6ab; margin-left: 0.5rem; }
@@ -107,6 +108,14 @@ LAUNCHER_TEMPLATE = r"""
               <select id="box-type-select" aria-label="box-type" disabled title="Optional Tator box (localization) type filter. Only localizations of the selected box type are loaded into the dataset.">
                 <option value="">All box types</option>
               </select>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <th>Labels</th>
+          <td>
+            <div class="cell-controls">
+              <input type="text" id="include-classes-input" placeholder="All labels" aria-label="labels" title="Optional. Comma-separated label names to export to Voxel51 (e.g. Larvacean, Copepod). Combined with Verified only when that is checked." />
             </div>
           </td>
         </tr>
@@ -721,6 +730,9 @@ LAUNCHER_TEMPLATE = r"""
           if (removeNearDupEl && removeNearDupEl.checked) {
             params.set('remove_near_duplicates', 'true');
           }
+          var includeClassesEl = document.getElementById('include-classes-input');
+          var includeClasses = includeClassesEl ? includeClassesEl.value.trim() : '';
+          if (includeClasses) params.set('include_classes', includeClasses);
           if (isEnterprise) {
             var s3BucketEl = document.getElementById('s3-bucket-input');
             var s3PrefixEl = document.getElementById('s3-prefix-input');

@@ -1,6 +1,6 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: tests/test_verified_only_filter.py
-# Description: Tests for the verified_only sync/UI filter (excludes non-verified localizations).
+# Description: Tests for verified_only and include_classes sync/UI sample filters.
 
 import src.app.sync as sync
 
@@ -72,6 +72,18 @@ def test_create_sample_from_loc_verified_only_includes_verified():
     )
     assert sample is not None
     assert sample["elemental_id"] == "eid-1"
+
+
+def test_create_sample_from_loc_include_classes_excludes_other_labels():
+    loc = _make_loc({"Label": "Krill", "verified": True})
+    sample = sync._create_sample_from_loc(
+        loc,
+        crops_dir="/tmp/crops",
+        media_stem="media1",
+        include_classes={"Larvacean"},
+        s3_bucket="test-bucket",
+    )
+    assert sample is None
 
 
 def test_create_sample_from_loc_default_includes_unverified():
@@ -244,3 +256,38 @@ def test_reconcile_keeps_unverified_samples_when_verified_only_disabled(monkeypa
     )
 
     assert dataset.deleted_ids == []
+
+
+def test_reconcile_removes_samples_not_in_include_classes(monkeypatch):
+    monkeypatch.setattr(sync, "repair_undeclared_sample_fields", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sync, "_media_id_to_stem_from_crops", lambda *_a, **_k: {1: "media1", 2: "media2"}
+    )
+    monkeypatch.setattr(sync, "_apply_loc_to_sample", lambda *a, **k: None)
+
+    keep_sample = _FakeSample("sample-keep", "keep-larvacean")
+    drop_sample = _FakeSample("sample-drop", "drop-krill")
+    dataset = _FakeReconcileDataset([keep_sample, drop_sample])
+
+    loc_index = {
+        "keep-larvacean": _make_loc(
+            {"Label": "Larvacean", "verified": True},
+            elemental_id="keep-larvacean",
+            media=1,
+        ),
+        "drop-krill": _make_loc(
+            {"Label": "Krill", "verified": True}, elemental_id="drop-krill", media=2
+        ),
+    }
+
+    sync.reconcile_dataset_with_tator(
+        dataset=dataset,
+        loc_index=loc_index,
+        crops_dir="/tmp/crops",
+        download_dir=None,
+        config={"include_classes": ["Larvacean"], "s3_bucket": "test-bucket"},
+        max_samples=None,
+    )
+
+    assert dataset.deleted_ids == ["sample-drop"]
+    assert dataset.added == []
