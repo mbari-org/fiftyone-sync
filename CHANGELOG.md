@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.13.0 (2026-09-11)
+
+### Features
+
+- **app**: CleanVision near-duplicate removal and embed WebSocket timeout fixes (#39)
+  ([#39](https://github.com/mbari-org/fiftyone-sync/pull/39),
+  [`42aecb0`](https://github.com/mbari-org/fiftyone-sync/commit/42aecb0559c07813ab1f8ad67818dbbbd42fd0a5))
+
+
 ## v0.12.3 (2026-08-20)
 
 ### Bug Fixes
