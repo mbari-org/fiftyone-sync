@@ -266,6 +266,13 @@ def _crops_dir(
     return path
 
 
+def _removed_crops_dir(crops_dir: str) -> str:
+    """Sibling directory holding crops removed by the CleanVision filter (never deleted)."""
+    from src.app.cleanvision_filter import removed_crops_dir_for
+
+    return removed_crops_dir_for(crops_dir)
+
+
 def _localizations_jsonl_path(
     project_id: int,
     version_id: int | None,
@@ -2222,6 +2229,10 @@ def _find_crop_cache_misses(
             manifest_stem_map[int(mid)] = stem
 
     crops_path = Path(crops_dir)
+    # Crops removed by the CleanVision filter are moved here rather than deleted; they
+    # still count as cropped, so a later sync does not re-download and re-crop that
+    # media just because the image is no longer under crops/.
+    removed_crops_path = Path(_removed_crops_dir(crops_dir))
 
     media_ids_needed: set[int] = set()
     locs_to_crop: list[dict] = []
@@ -2267,7 +2278,11 @@ def _find_crop_cache_misses(
             }
 
             old_entry = manifest.get(eid)
-            crop_file = crops_path / media_stem / f"{eid}.png"
+            crop_rel = Path(media_stem) / f"{eid}.png"
+            crop_file = crops_path / crop_rel
+            crop_exists = (
+                crop_file.exists() or (removed_crops_path / crop_rel).exists()
+            )
 
             # A crop file already on disk is direct proof that localization was
             # already cropped, even when the manifest has no record of it (e.g. the
@@ -2277,7 +2292,7 @@ def _find_crop_cache_misses(
             # Without this, a missing/stale manifest alone would mark every
             # localization a "miss" and re-download/re-crop videos that are already
             # fully cropped on disk.
-            is_miss = not crop_file.exists() or (
+            is_miss = not crop_exists or (
                 old_entry is not None and old_entry.get("modified_at") != modified_at
             )
             if is_miss:
@@ -4486,6 +4501,7 @@ def run_sync_job(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    remove_near_duplicates: bool = False,
 ) -> dict[str, Any]:
     """
     Entrypoint for RQ worker: all args are serializable. Calls sync_project_to_fiftyone.
@@ -4496,7 +4512,8 @@ def run_sync_job(
     logger.info(
         f"run_sync_job received project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
-        f"localization_type_id={localization_type_id} verified_only={verified_only}"
+        f"localization_type_id={localization_type_id} verified_only={verified_only} "
+        f"remove_near_duplicates={remove_near_duplicates}"
     )
 
     job_meta_handler: logging.Handler | None = None
@@ -4530,6 +4547,7 @@ def run_sync_job(
             query=query,
             localization_type_id=localization_type_id,
             verified_only=verified_only,
+            remove_near_duplicates=remove_near_duplicates,
         )
     finally:
         if job_meta_handler is not None:
@@ -4843,6 +4861,78 @@ def _embeddings_coverage(
     return existing_embeddings_count, embeddings_up_to_date
 
 
+def _cleanvision_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the `cleanvision` config block (empty dict when absent or invalid)."""
+    cfg = config.get("cleanvision") if isinstance(config, dict) else None
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _restore_removed_crops(crops_dir: str, config: dict[str, Any]) -> int:
+    """
+    Move CleanVision-quarantined crops back into `crops_dir`. Never raises.
+
+    Runs when a sync is not pruning duplicates, so switching the option off rebuilds the
+    dataset from every crop again.
+    """
+    try:
+        from src.app.cleanvision_filter import restore_quarantined_crops
+
+        return restore_quarantined_crops(
+            crops_dir, _cleanvision_config(config).get("removed_dir")
+        )
+    except Exception:
+        logger.exception("Restoring previously removed crops failed")
+        return 0
+
+
+def _remove_near_duplicate_samples(
+    dataset: Any,
+    config: dict[str, Any],
+    enabled: bool = False,
+    crops_dir: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Drop CleanVision-flagged samples (near duplicates, dark, low information)
+    from the FiftyOne dataset.
+
+    Runs when the `remove_near_duplicates` query param is set or `cleanvision.enabled`
+    is true in config. Only Voxel51 samples are deleted -- nothing is removed in Tator.
+    The removed samples' crop images are moved out of `crops_dir` into the `crops_removed`
+    sibling (override with `cleanvision.removed_dir`) rather than deleted, so they can be
+    reviewed or restored and the crop cache stays valid. Never raises: a failure here
+    leaves the full dataset in place.
+
+    Returns a summary dict, or None when the step did not run.
+    """
+    cleanvision_cfg = _cleanvision_config(config)
+    if not (enabled or bool(cleanvision_cfg.get("enabled"))):
+        return None
+    try:
+        from src.app.cleanvision_filter import (
+            is_cleanvision_available,
+            remove_bad_images,
+        )
+
+        if not is_cleanvision_available():
+            logger.warning(
+                "Near-duplicate removal requested but cleanvision is not installed; "
+                "skipping (pip install cleanvision)"
+            )
+            return {"status": "skipped", "reason": "cleanvision not installed"}
+
+        return remove_bad_images(
+            dataset,
+            issue_types=cleanvision_cfg.get("issue_types"),
+            n_jobs=cleanvision_cfg.get("n_jobs"),
+            dry_run=bool(cleanvision_cfg.get("dry_run", False)),
+            crops_dir=crops_dir,
+            removed_dir=cleanvision_cfg.get("removed_dir"),
+        )
+    except Exception as e:
+        logger.exception("CleanVision duplicate/quality removal failed")
+        return {"status": "error", "message": str(e)}
+
+
 def sync_project_to_fiftyone(
     project_id: int,
     version_id: int | None,
@@ -4860,12 +4950,16 @@ def sync_project_to_fiftyone(
     query: str | None = None,
     localization_type_id: int | None = None,
     verified_only: bool = False,
+    remove_near_duplicates: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch Tator media and localizations, build FiftyOne dataset, launch App on given port.
     Uses per-project MongoDB database (database_uri when provided, else resolved via config; database_name override or get_database_name).
     Optional vss_project_key: selects a specific VSS project configuration for embeddings.
     Optional s3_bucket/s3_prefix: sync crop images to S3 (not full images) and build a second dataset from S3 (parent folder = label).
+    Optional remove_near_duplicates: after the dataset is built, drop CleanVision-flagged
+    near duplicates / dark / low-information samples from the FiftyOne dataset
+    (Voxel51 samples only; nothing is deleted in Tator and the crop files are kept).
     Returns {"status": "ok", "dataset_name": str, "database_name": str} or raises.
     """
     if not (s3_bucket and s3_bucket.strip()):
@@ -4885,7 +4979,8 @@ def sync_project_to_fiftyone(
     logger.info(
         f"sync_project_to_fiftyone CALLED: project_id={project_id} version_id={version_id} "
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
-        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only}"
+        f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only} "
+        f"remove_near_duplicates={remove_near_duplicates}"
     )
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
@@ -4951,6 +5046,12 @@ def sync_project_to_fiftyone(
             query=query,
             localization_type_id=localization_type_id,
         )
+        # Crops removed by an earlier CleanVision run are quarantined, not deleted.
+        # When this sync is not pruning, put them back first so the dataset is rebuilt
+        # from the full set of crops.
+        if not (remove_near_duplicates or _cleanvision_config(config).get("enabled")):
+            _restore_removed_crops(crops, config)
+
         try:
             host = api_url.rstrip("/")
             api = tator.get_api(host, token)
@@ -5022,6 +5123,7 @@ def sync_project_to_fiftyone(
         config["version_id"] = version_id
         config["force_sync"] = force_sync
         config["verified_only"] = verified_only
+        config["remove_near_duplicates"] = remove_near_duplicates
         # In enterprise/production, use S3 URIs for sample filepaths so FiftyOne loads from S3
         if s3_bucket:
             config["s3_bucket"] = s3_bucket
@@ -5078,6 +5180,19 @@ def sync_project_to_fiftyone(
 
         sample_count = len(dataset)
         logger.info(f"Dataset '{dataset_name}' has {sample_count} samples")
+
+        # Optionally prune CleanVision-flagged samples (near duplicates, dark,
+        # low information) *before* embeddings so pruned samples are never embedded --
+        # fewer samples means less annotator overhead and less memory/GPU pressure.
+        cleanvision_result = _remove_near_duplicate_samples(
+            dataset, config, enabled=remove_near_duplicates, crops_dir=crops
+        )
+        if cleanvision_result and cleanvision_result.get("num_removed"):
+            sample_count = len(dataset)
+            logger.info(
+                f"Dataset '{dataset_name}' has {sample_count} samples after "
+                "CleanVision duplicate/quality removal"
+            )
 
         # Always compute embeddings (from service) and UMAP; config.embeddings overrides defaults
         embeddings_config = config.get("embeddings") or {}
@@ -5156,6 +5271,11 @@ def sync_project_to_fiftyone(
                     concurrency = int(
                         embeddings_config.get("concurrency", DEFAULT_EMBEDDING_CONCURRENCY)
                     )
+                    # None -> resolved from FASTVSS_WS_MAX_WAIT inside embeddings_viz.
+                    raw_poll_timeout = embeddings_config.get("poll_timeout")
+                    poll_timeout = (
+                        float(raw_poll_timeout) if raw_poll_timeout else None
+                    )
                     logger.info(
                         f"Computing embeddings with batch size {batch_size}, concurrency {concurrency}, "
                         f"UMAP, and similarity for dataset '{dataset_name}'..."
@@ -5178,6 +5298,7 @@ def sync_project_to_fiftyone(
                         service_url=embeddings_config.get("service_url")
                         or os.environ.get("FASTVSS_API_URL"),
                         concurrency=concurrency,
+                        poll_timeout=poll_timeout,
                     )
                     logger.info(
                         f"Embeddings, UMAP, and similarity completed for dataset '{dataset_name}'"
@@ -5206,6 +5327,8 @@ def sync_project_to_fiftyone(
             "saved_localizations_path": localizations_path or None,
             "saved_crops_dir": crops or None,
         }
+        if cleanvision_result is not None:
+            result["cleanvision"] = cleanvision_result
         if app_url is not None:
             result["app_url"] = app_url
         result["port"] = port
