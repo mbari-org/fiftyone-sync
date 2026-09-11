@@ -3906,6 +3906,23 @@ def _dataset_name_with_port(dataset_name: str, port: int) -> str:
     return name if name.endswith(suffix) else f"{name}{suffix}"
 
 
+def _resolve_created_dataset_name(
+    override: str | None,
+    *,
+    default_base: str,
+    port: int,
+) -> str:
+    """Dataset name for Load from Tator.
+
+    Empty override → default `project_v{version}[_s{section}]_{port}`.
+    Non-empty override is sanitized (max 60 chars) and used as-is (port not forced).
+    """
+    cleaned = (override or "").strip()
+    if not cleaned:
+        return _dataset_name_with_port(default_base, port)
+    return _prepare_new_dataset_name(cleaned)
+
+
 def _normalize_elemental_id_str(elemental_id: Any) -> str:
     return str(elemental_id)
 
@@ -4617,6 +4634,7 @@ def run_sync_job(
     verified_only: bool = False,
     remove_near_duplicates: bool = False,
     include_classes: list[str] | None = None,
+    dataset_name: str | None = None,
 ) -> dict[str, Any]:
     """
     Entrypoint for RQ worker: all args are serializable. Calls sync_project_to_fiftyone.
@@ -4629,7 +4647,7 @@ def run_sync_job(
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
         f"localization_type_id={localization_type_id} verified_only={verified_only} "
         f"remove_near_duplicates={remove_near_duplicates} "
-        f"include_classes={include_classes or 'all'}"
+        f"include_classes={include_classes or 'all'} dataset_name={dataset_name!r}"
     )
 
     job_meta_handler: logging.Handler | None = None
@@ -4665,6 +4683,7 @@ def run_sync_job(
             verified_only=verified_only,
             remove_near_duplicates=remove_near_duplicates,
             include_classes=include_classes,
+            dataset_name=dataset_name,
         )
     finally:
         if job_meta_handler is not None:
@@ -5069,6 +5088,7 @@ def sync_project_to_fiftyone(
     verified_only: bool = False,
     remove_near_duplicates: bool = False,
     include_classes: list[str] | None = None,
+    dataset_name: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch Tator media and localizations, build FiftyOne dataset, launch App on given port.
@@ -5079,6 +5099,7 @@ def sync_project_to_fiftyone(
     near duplicates / dark / low-information samples from the FiftyOne dataset
     (Voxel51 samples only; nothing is deleted in Tator and the crop files are kept).
     Optional include_classes: restrict the dataset (and Tator loc fetch) to those labels.
+    Optional dataset_name: override the FiftyOne dataset name created by this sync.
     Returns {"status": "ok", "dataset_name": str, "database_name": str} or raises.
     """
     if not (s3_bucket and s3_bucket.strip()):
@@ -5100,7 +5121,7 @@ def sync_project_to_fiftyone(
         f"section_id={section_id} query={'set' if (query or '').strip() else 'none'} "
         f"api_url={api_url} port={port} s3_bucket={s3_bucket or 'none'} verified_only={verified_only} "
         f"remove_near_duplicates={remove_near_duplicates} "
-        f"include_classes={include_classes or 'all'}"
+        f"include_classes={include_classes or 'all'} dataset_name={dataset_name!r}"
     )
     resolved_db = (
         database_name.strip() if database_name and database_name.strip() else None
@@ -5256,10 +5277,13 @@ def sync_project_to_fiftyone(
             config["s3_bucket"] = s3_bucket
             config["s3_prefix"] = s3_crops_prefix or ""
 
-        dataset_name = _default_dataset_name(
-            api, project_id, version_id, section_id=section_id
+        dataset_name = _resolve_created_dataset_name(
+            dataset_name,
+            default_base=_default_dataset_name(
+                api, project_id, version_id, section_id=section_id
+            ),
+            port=port,
         )
-        dataset_name = _dataset_name_with_port(dataset_name, port)
 
         # Set env so FiftyOne app subprocess uses the same database (only when not production)
         if not get_is_enterprise():
@@ -5915,8 +5939,12 @@ def rename_dataset_for_version(
     database_uri: str | None = None,
     database_name: str | None = None,
     section_id: int | None = None,
+    dataset_name: str | None = None,
 ) -> dict[str, Any]:
-    """Rename the FiftyOne dataset (MongoDB) for a specific version/port/section.
+    """Rename a FiftyOne dataset (MongoDB).
+
+    When `dataset_name` is set, that dataset is renamed (must already exist).
+    Otherwise the dataset for this version/port/section is found as before.
 
     `new_name` is sanitized to safe FiftyOne/MongoDB characters and truncated to
     MAX_DATASET_NAME_LENGTH (60) characters. This lets teams replace the default
@@ -5949,33 +5977,50 @@ def rename_dataset_for_version(
     except ConnectionError as exc:
         raise RuntimeError(f"Connection check failed: {exc}") from exc
 
-    host = api_url.rstrip("/")
-    api = tator.get_api(host, token)
-    ds_name = _default_dataset_name(
-        api, project_id, version_id, section_id=section_id
-    )
-    ds_name_with_port = _dataset_name_with_port(ds_name, port)
-
-    project_prefix = _sanitize_dataset_name(project_name) if project_name else f"project_{project_id}"
-
     available = fo.list_datasets()
-    target = _find_dataset_match(
-        available,
-        ds_name=ds_name,
-        ds_name_with_port=ds_name_with_port,
-        project_prefix=project_prefix,
-        version_id=version_id,
-        port=port,
-        section_id=section_id,
-    )
-    if target is None:
-        return {
-            "status": "ok",
-            "old_name": None,
-            "new_name": None,
-            "database_name": resolved_db,
-            "message": f"No dataset found for version {version_id} (looked for '{ds_name_with_port}')",
-        }
+    requested = (dataset_name or "").strip()
+    if requested:
+        if requested not in available:
+            return {
+                "status": "ok",
+                "old_name": None,
+                "new_name": None,
+                "database_name": resolved_db,
+                "message": f"No dataset named '{requested}' found",
+            }
+        target = requested
+    else:
+        host = api_url.rstrip("/")
+        api = tator.get_api(host, token)
+        ds_name = _default_dataset_name(
+            api, project_id, version_id, section_id=section_id
+        )
+        ds_name_with_port = _dataset_name_with_port(ds_name, port)
+        project_prefix = (
+            _sanitize_dataset_name(project_name)
+            if project_name
+            else f"project_{project_id}"
+        )
+        target = _find_dataset_match(
+            available,
+            ds_name=ds_name,
+            ds_name_with_port=ds_name_with_port,
+            project_prefix=project_prefix,
+            version_id=version_id,
+            port=port,
+            section_id=section_id,
+        )
+        if target is None:
+            return {
+                "status": "ok",
+                "old_name": None,
+                "new_name": None,
+                "database_name": resolved_db,
+                "message": (
+                    f"No dataset found for version {version_id} "
+                    f"(looked for '{ds_name_with_port}')"
+                ),
+            }
 
     if cleaned_name == target:
         return {

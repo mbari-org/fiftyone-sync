@@ -30,6 +30,26 @@ def test_prepare_new_dataset_name_truncation_strips_trailing_separator():
     assert not result.endswith("-")
 
 
+def test_resolve_created_dataset_name_default_when_empty():
+    assert (
+        sync._resolve_created_dataset_name(None, default_base="Proj_v1", port=5151)
+        == "Proj_v1_5151"
+    )
+    assert (
+        sync._resolve_created_dataset_name("  ", default_base="Proj_v1", port=5151)
+        == "Proj_v1_5151"
+    )
+
+
+def test_resolve_created_dataset_name_override_sanitizes_without_port():
+    assert (
+        sync._resolve_created_dataset_name(
+            "Larvacean export", default_base="Proj_v1", port=5151
+        )
+        == "Larvacean_export"
+    )
+
+
 class _FakeProject:
     name = "MidwaterTimeSeries"
 
@@ -150,3 +170,43 @@ def test_rename_dataset_for_version_rejects_name_collision(monkeypatch):
             new_name="Zooplankton QC pass",
             section_id=477,
         )
+
+
+def test_rename_dataset_for_version_explicit_current_name(monkeypatch):
+    existing = ["Larvacean_export", "MidwaterTimeSeries_v82_s477_5151"]
+    loaded = _patch_common(monkeypatch, existing_datasets=existing)
+
+    result = sync.rename_dataset_for_version(
+        project_id=1,
+        version_id=82,
+        port=5151,
+        api_url="http://example.com",
+        token="tok",
+        new_name="Larvacean QC",
+        section_id=477,
+        dataset_name="Larvacean_export",
+    )
+
+    assert result["status"] == "ok"
+    assert result["old_name"] == "Larvacean_export"
+    assert result["new_name"] == "Larvacean_QC"
+    assert loaded["dataset"].name == "Larvacean_QC"
+
+
+def test_rename_dataset_for_version_explicit_name_not_found(monkeypatch):
+    _patch_common(monkeypatch, existing_datasets=["other_dataset"])
+
+    result = sync.rename_dataset_for_version(
+        project_id=1,
+        version_id=82,
+        port=5151,
+        api_url="http://example.com",
+        token="tok",
+        new_name="new name",
+        dataset_name="missing_ds",
+    )
+
+    assert result["status"] == "ok"
+    assert result["old_name"] is None
+    assert result["new_name"] is None
+    assert "missing_ds" in result["message"]
