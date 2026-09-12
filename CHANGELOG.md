@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.14.0 (2026-09-12)
+
+### Features
+
+- Add export of selected labels and dataset name override (#41)
+  ([#41](https://github.com/mbari-org/fiftyone-sync/pull/41),
+  [`441d975`](https://github.com/mbari-org/fiftyone-sync/commit/441d9757410ecf6dade430a2521597be25b03a40))
+
+
 ## v0.13.0 (2026-09-11)
 
 ### Features
