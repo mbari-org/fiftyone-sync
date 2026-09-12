@@ -26,7 +26,9 @@ LAUNCHER_TEMPLATE = r"""
     .applet-header .btn-icon { margin-right: 0.25rem; }
     .applet-header .btn-icon.end { margin-right: 0; margin-left: 0.25rem; }
     .applet-header select { padding: 0.35rem 0.5rem; font-size: 0.8rem; background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; min-width: 10rem; }
-    .applet-header input[type="password"] { padding: 0.35rem 0.5rem; font-size: 0.8rem; background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; min-width: 12rem; }
+    .applet-header input[type="password"],
+    .applet-header input[type="text"] { padding: 0.35rem 0.5rem; font-size: 0.8rem; background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; min-width: 12rem; }
+    .applet-header input.dataset-name-input { min-width: 22rem; max-width: 36rem; flex: 1; }
     .applet-header a.token-link { font-size: 0.8rem; color: #6ab; }
     .applet-header a.token-link:hover { color: #8cd; text-decoration: underline; }
     .applet-header a.fiftyone-app-link { font-size: 0.8rem; color: #6ab; margin-left: 0.5rem; }
@@ -111,6 +113,22 @@ LAUNCHER_TEMPLATE = r"""
           </td>
         </tr>
         <tr>
+          <th>Labels</th>
+          <td>
+            <div class="cell-controls">
+              <input type="text" id="include-classes-input" placeholder="All labels" aria-label="labels" title="Optional. Comma-separated label names to export to Voxel51 (e.g. Larvacean, Copepod). Combined with Verified only when that is checked." />
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <th>Dataset name</th>
+          <td>
+            <div class="cell-controls">
+              <input type="text" id="dataset-name-input" class="dataset-name-input" maxlength="60" placeholder="Default dataset name" aria-label="dataset-name" title="FiftyOne dataset name for Load from Tator. Prefills with the default (project_version_port). Override to create a separate dataset. Rename uses this as the new name for the selected Voxel51 dataset." />
+            </div>
+          </td>
+        </tr>
+        <tr>
           <th>Sync</th>
           <td>
             <div class="cell-controls">
@@ -157,10 +175,11 @@ LAUNCHER_TEMPLATE = r"""
           <th>Voxel51 dataset</th>
           <td>
             <div class="cell-controls">
-              <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator.">
+              <select id="voxel-dataset-select" aria-label="voxel-dataset" disabled title="Select the FiftyOne dataset to sync back to Tator or rename.">
                 <option value="">Enter token and click Test</option>
               </select>
               <button type="button" id="sync-to-tator-btn" disabled title="Pushes any revised data from FiftyOne back to the selected version.">Sync to Tator<span class="btn-icon end" aria-hidden="true">→</span></button>
+              <button type="button" id="rename-dataset-btn" disabled title="Rename the selected Voxel51 dataset to the name in Dataset name.">Rename</button>
               <button type="button" id="delete-dataset-btn" class="btn-danger" disabled title="Delete the FiftyOne dataset for the selected version. This cannot be undone. Not this only deletes the dataset from Voxel51, not Tator."><span class="btn-icon" aria-hidden="true">🗑</span>Delete Voxel51 Dataset</button>
             </div>
           </td>
@@ -200,7 +219,9 @@ LAUNCHER_TEMPLATE = r"""
       var vssProjectSelect = document.getElementById('vss-project-select');
       var vssProjectRow = document.getElementById('vss-project-row');
       var syncToTatorBtn = document.getElementById('sync-to-tator-btn');
+      var renameDatasetBtn = document.getElementById('rename-dataset-btn');
       var deleteDatasetBtn = document.getElementById('delete-dataset-btn');
+      var datasetNameInput = document.getElementById('dataset-name-input');
       var tokenInput = document.getElementById('user-token');
       var testTokenBtn = document.getElementById('test-token-btn');
       var tokenVerified = false;
@@ -209,6 +230,7 @@ LAUNCHER_TEMPLATE = r"""
       var versionId = '';
       var datasetExists = false;
       var selectedSyncDatasetName = '';
+      var datasetNameDirty = false;
       var vssProjectKey = '';
       var vssProjectsData = [];  // full list from /vss-projects: [{key, name}]; embedding service URL is global
       var embeddingServiceReady = false;  // true when WS test passed or service not configured
@@ -227,6 +249,28 @@ LAUNCHER_TEMPLATE = r"""
         // Returns the project for the embedding API. Always uses vss_project_key (no fallback).
         return vssProjectKey || '';
       }
+      function sanitizeDatasetName(name) {
+        if (!name) return 'default';
+        var s = String(name).trim().replace(/[^a-zA-Z0-9_-]+/g, '_');
+        s = s.replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+        return s || 'default';
+      }
+      function defaultDatasetName() {
+        var pn = sanitizeDatasetName(projectName) || ('project_' + project);
+        var v = versionSelect && versionSelect.value ? versionSelect.value : '';
+        var versionPart = v ? ('v' + v) : 'default';
+        var base = pn + '_' + versionPart;
+        var s = sectionSelect && sectionSelect.value ? sectionSelect.value : '';
+        if (s) base += '_s' + s;
+        return base + '_' + port;
+      }
+      function fillDefaultDatasetName() {
+        if (!datasetNameInput) return;
+        if (!datasetNameDirty) datasetNameInput.value = defaultDatasetName();
+      }
+      function getRequestedDatasetName() {
+        return datasetNameInput ? datasetNameInput.value.trim() : '';
+      }
       function setVssProjectFromDropdown() {
         vssProjectKey = vssProjectSelect && vssProjectSelect.value ? vssProjectSelect.value : '';
         // Update S3 config when VSS project changes
@@ -242,9 +286,10 @@ LAUNCHER_TEMPLATE = r"""
           var selOpt = versionSelect.options[versionSelect.selectedIndex];
           versionSelect.title = selOpt ? (selOpt.getAttribute('data-description') || '') : '';
         }
-        updateSyncButtonsState();
         datasetExists = false;
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = true;
+        fillDefaultDatasetName();
+        updateSyncButtonsState();
         if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
       }
       function setSyncDatasetFromDropdown() {
@@ -313,6 +358,10 @@ LAUNCHER_TEMPLATE = r"""
       function updateSyncButtonsState() {
         if (syncBtn) syncBtn.disabled = !tokenVerified || !hasDatabaseEntry || !embeddingServiceReady;
         if (syncToTatorBtn) syncToTatorBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !selectedSyncDatasetName;
+        var requestedName = getRequestedDatasetName();
+        if (renameDatasetBtn) {
+          renameDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !selectedSyncDatasetName || !requestedName || requestedName === selectedSyncDatasetName;
+        }
         if (deleteDatasetBtn) deleteDatasetBtn.disabled = !tokenVerified || !hasDatabaseEntry || !versionId || !datasetExists;
       }
       function setSyncControlsEnabled(enabled) {
@@ -403,6 +452,7 @@ LAUNCHER_TEMPLATE = r"""
             if (initialSectionId && sectionSelect.querySelector('option[value="' + initialSectionId + '"]')) {
               sectionSelect.value = initialSectionId;
             }
+            fillDefaultDatasetName();
           })
           .catch(function() {
             sectionSelect.innerHTML = '';
@@ -411,6 +461,7 @@ LAUNCHER_TEMPLATE = r"""
             opt.textContent = 'All sections';
             sectionSelect.appendChild(opt);
             if (initialSectionId) sectionSelect.value = initialSectionId;
+            fillDefaultDatasetName();
           });
       }
       function loadBoxTypes(token) {
@@ -517,8 +568,16 @@ LAUNCHER_TEMPLATE = r"""
       if (vssProjectSelect) vssProjectSelect.addEventListener('change', setVssProjectFromDropdown);
       if (versionSelect) versionSelect.addEventListener('change', setVersionFromDropdown);
       if (sectionSelect) sectionSelect.addEventListener('change', function() {
+        fillDefaultDatasetName();
+        updateSyncButtonsState();
         if (tokenVerified && hasDatabaseEntry && versionId) checkDatasetExists();
       });
+      if (datasetNameInput) {
+        datasetNameInput.addEventListener('input', function() {
+          datasetNameDirty = getRequestedDatasetName() !== defaultDatasetName();
+          updateSyncButtonsState();
+        });
+      }
       function updateDatabaseInfo(token) {
         if (!syncServiceUrl || !token) return;
         var databaseInfoUrl = syncServiceUrl + '/database-info?project_id=' + project + '&api_url=' + encodeURIComponent(apiUrl) + '&port=' + port;
@@ -541,6 +600,7 @@ LAUNCHER_TEMPLATE = r"""
             }
             if (d && d.database_name) databaseName = d.database_name;
             if (d && d.database_uri) databaseUri = d.database_uri;
+            fillDefaultDatasetName();
             var s3Row = document.getElementById('s3-bucket-row');
             if (s3Row) s3Row.style.display = isEnterprise ? '' : 'none';
             var s3BucketInput = document.getElementById('s3-bucket-input');
@@ -721,6 +781,13 @@ LAUNCHER_TEMPLATE = r"""
           if (removeNearDupEl && removeNearDupEl.checked) {
             params.set('remove_near_duplicates', 'true');
           }
+          var includeClassesEl = document.getElementById('include-classes-input');
+          var includeClasses = includeClassesEl ? includeClassesEl.value.trim() : '';
+          if (includeClasses) params.set('include_classes', includeClasses);
+          if (datasetNameDirty) {
+            var dsOverride = getRequestedDatasetName();
+            if (dsOverride) params.set('dataset_name', dsOverride);
+          }
           if (isEnterprise) {
             var s3BucketEl = document.getElementById('s3-bucket-input');
             var s3PrefixEl = document.getElementById('s3-prefix-input');
@@ -805,6 +872,10 @@ LAUNCHER_TEMPLATE = r"""
                         syncBtn.disabled = false;
                         if (syncLogPanel) syncLogPanel.classList.add('visible');
                         updateLogPanel(hideLogPanelAfterDelay);
+                        if (datasetNameDirty) {
+                          var createdName = getRequestedDatasetName();
+                          if (createdName) selectedSyncDatasetName = createdName;
+                        }
                         checkDatasetExists();
                         refreshSyncDatasetChoices();
                         return;
@@ -842,6 +913,10 @@ LAUNCHER_TEMPLATE = r"""
               }
               setTimeout(function() { syncStatus.textContent = ''; }, 5000);
               syncBtn.disabled = false;
+              if (datasetNameDirty) {
+                var createdNameSync = getRequestedDatasetName();
+                if (createdNameSync) selectedSyncDatasetName = createdNameSync;
+              }
               checkDatasetExists();
               refreshSyncDatasetChoices();
             })
@@ -902,6 +977,76 @@ LAUNCHER_TEMPLATE = r"""
             .finally(function() { setVersionFromDropdown(); });
         });
       }
+      if (renameDatasetBtn && syncStatus && syncServiceUrl && apiUrl) {
+        renameDatasetBtn.addEventListener('click', function() {
+          var token = getToken();
+          if (!token || !tokenVerified) return;
+          var v = versionSelect && versionSelect.value ? versionSelect.value : '';
+          if (!v) {
+            syncStatus.textContent = 'Select a version first.';
+            syncStatus.classList.add('error');
+            return;
+          }
+          var currentName = selectedSyncDatasetName;
+          var newName = getRequestedDatasetName();
+          if (!currentName) {
+            syncStatus.textContent = 'Select a Voxel51 dataset to rename.';
+            syncStatus.classList.add('error');
+            return;
+          }
+          if (!newName || newName === currentName) {
+            syncStatus.textContent = 'Enter a different name in Dataset name.';
+            syncStatus.classList.add('error');
+            return;
+          }
+          if (!confirm('Rename dataset "' + currentName + '" to "' + newName + '"?')) return;
+          renameDatasetBtn.disabled = true;
+          syncStatus.textContent = 'Renaming dataset…';
+          syncStatus.classList.remove('error');
+          var params = new URLSearchParams({
+            project_id: String(project),
+            version_id: v,
+            api_url: apiUrl,
+            port: String(port),
+            new_name: newName,
+            dataset_name: currentName
+          });
+          var sec = sectionSelect ? sectionSelect.value : '';
+          if (sec) params.set('section_id', sec);
+          fetch(syncServiceUrl + '/rename-dataset?' + params.toString(), {
+            method: 'POST',
+            headers: { 'Authorization': 'Token ' + token }
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(result) {
+              if (!result.ok) {
+                syncStatus.textContent = 'Rename failed: ' + (result.data.detail || result.data.message || 'Unknown error');
+                syncStatus.classList.add('error');
+                return;
+              }
+              var renamed = result.data.new_name;
+              if (!renamed) {
+                syncStatus.textContent = result.data.message || 'No dataset found to rename.';
+                syncStatus.classList.remove('error');
+                return;
+              }
+              if (datasetNameInput) datasetNameInput.value = renamed;
+              datasetNameDirty = getRequestedDatasetName() !== defaultDatasetName();
+              selectedSyncDatasetName = renamed;
+              syncStatus.textContent = 'Renamed ' + (result.data.old_name || currentName) + ' → ' + renamed;
+              syncStatus.classList.remove('error');
+              setTimeout(function() { syncStatus.textContent = ''; }, 5000);
+            })
+            .catch(function(err) {
+              syncStatus.textContent = 'Rename error: ' + (err.message || 'Network error');
+              syncStatus.classList.add('error');
+            })
+            .finally(function() {
+              refreshSyncDatasetChoices();
+              updateSyncButtonsState();
+            });
+        });
+      }
       if (deleteDatasetBtn && syncStatus && syncServiceUrl && apiUrl) {
         deleteDatasetBtn.addEventListener('click', function() {
           var token = getToken();
@@ -958,6 +1103,7 @@ LAUNCHER_TEMPLATE = r"""
             });
         });
       }
+      fillDefaultDatasetName();
     })();
   </script>
 </body>

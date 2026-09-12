@@ -67,6 +67,8 @@ def enqueue_sync(
     localization_type_id: int | None = None,
     verified_only: bool = False,
     remove_near_duplicates: bool = False,
+    include_classes: list[str] | None = None,
+    dataset_name: str | None = None,
 ) -> str:
     """
     Enqueue a sync job. Returns RQ job id. Requires Redis.
@@ -76,6 +78,8 @@ def enqueue_sync(
     verified_only restricts the built dataset to localizations with a truthy `verified` attribute.
     remove_near_duplicates prunes CleanVision-flagged near duplicates / dark /
     low-information samples from the built FiftyOne dataset (Voxel51 samples only).
+    include_classes restricts the built dataset to localizations whose Label is in the list.
+    dataset_name overrides the FiftyOne dataset name created by this sync.
     """
     from rq import Queue
 
@@ -100,6 +104,8 @@ def enqueue_sync(
         localization_type_id=localization_type_id,
         verified_only=verified_only,
         remove_near_duplicates=remove_near_duplicates,
+        include_classes=include_classes,
+        dataset_name=dataset_name,
         job_timeout=3600 * 24,  # 24h for large projects
         result_ttl=3600 * 24,
         failure_ttl=3600,

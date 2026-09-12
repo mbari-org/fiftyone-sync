@@ -162,11 +162,13 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `localization_type_id` | no | Restrict sync to a single Tator box (localization) type |
 | `verified_only` | no | Only include localizations whose `verified` attribute is truthy (default: false). Exposed as the **Verified only** checkbox in the launcher applet. When set, the Tator media (`related_attribute=verified::true`) and localization (`attribute=verified::true`) queries are filtered server-side, so unverified media/localizations are never fetched, downloaded, or cropped — this minimizes data transfer, not just what's shown in the dataset. On subsequent syncs, samples that later become unverified are removed from the dataset (they are re-added automatically if re-verified). |
 | `remove_near_duplicates` | no | Remove CleanVision-flagged near-duplicate, dark, and low-information samples from the built dataset (default: false). Exposed as the **Remove near duplicates** checkbox in the launcher applet. See [Near-duplicate and low-quality sample removal](#near-duplicate-and-low-quality-sample-removal-cleanvision). |
+| `include_classes` | no | Optional comma-separated label names (e.g. `Larvacean,Copepod`). Only those labels are exported to Voxel51. Exposed as the **Labels** field in the launcher applet. Combined with `verified_only` when both are set. |
+| `dataset_name` | no | Optional FiftyOne dataset name. Default is `project_name_v{version_id}[_s{section_id}]_{port}` (e.g. `MyProject_v66_5151`). Sanitized to safe characters; max 60 characters. Exposed as the **Dataset name** field in the launcher applet. Use a distinct name to create a separate dataset (for example one export per label). |
 | `database_name` | no | Override MongoDB database name |
 | `config_path` | no | Path to YAML/JSON config file for dataset build |
 | `launch_app` | no | Launch FiftyOne app after sync (default: true) |
 
-**Sync-from-Tator flow (dashboard):** The launcher template calls `POST /sync`, then opens the FiftyOne app in a new tab. The "Open Voxel51" link always points to the base URL from `FIFTYONE_APP_PUBLIC_BASE_URL` (e.g. `https://cortex.shore.mbari.org/fiftyone/`) — no port or dataset path is appended. The dataset name is always `project_name + "_v" + version_id + "_" + port` (e.g. `MyProject_v66_5151`). It cannot be overridden via config.
+**Sync-from-Tator flow (dashboard):** The launcher template calls `POST /sync`, then opens the FiftyOne app in a new tab. The "Open Voxel51" link always points to the base URL from `FIFTYONE_APP_PUBLIC_BASE_URL` (e.g. `https://cortex.shore.mbari.org/fiftyone/`) — no port or dataset path is appended. The default dataset name is `project_name + "_v" + version_id + "_" + port` (e.g. `MyProject_v66_5151`). Override it with the applet **Dataset name** field or the `dataset_name` query param.
 
 ### Config file (YAML/JSON)
 
@@ -183,7 +185,9 @@ max_samples: 500                         # optional: limit for testing
 
 `verified_only` is set from the `verified_only` query param (or the applet's **Verified only** checkbox), not from this config file.
 
-The FiftyOne dataset name is always `project_name_v{version_id}_{port}` and cannot be set in config.
+`include_classes` can also be set from the `include_classes` query param (or the applet's **Labels** field). When the query param is present, it overrides this config key. Use it to break a large project into smaller Voxel51 datasets by exporting one or more labels at a time.
+
+The FiftyOne dataset name defaults to `project_name_v{version_id}_{port}` and cannot be set in the config file. Override it with the `dataset_name` query param or the applet **Dataset name** field.
 
 ### Near-duplicate and low-quality sample removal (CleanVision)
 

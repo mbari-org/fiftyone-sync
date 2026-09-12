@@ -142,11 +142,13 @@ def test_rename_dataset_endpoint_accepts_query_param_token(monkeypatch, tmp_path
             "port": 5151,
             "new_name": "Zooplankton QC pass",
             "token": "abc123",
+            "dataset_name": "Larvacean_export",
         },
     )
     assert response.status_code == 200
     assert response.json()["new_name"] == "Zooplankton_QC_pass"
     assert captured["token"] == "abc123"
+    assert captured["dataset_name"] == "Larvacean_export"
 
 
 def test_rename_dataset_endpoint_401_without_any_token(monkeypatch, tmp_path):

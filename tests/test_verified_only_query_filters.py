@@ -1,7 +1,6 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: tests/test_verified_only_query_filters.py
-# Description: Tests that verified_only is pushed into the Tator media/localization
-# queries (related_attribute / attribute) so unverified data is never downloaded.
+# Description: Tests that verified_only and include_classes are pushed into Tator queries.
 
 import json
 
@@ -179,3 +178,23 @@ def test_resolve_localizations_jsonl_forwards_verified_only(monkeypatch, tmp_pat
 
     assert captured["media_kwargs"].get("verified_only") is True
     assert captured["loc_kwargs"].get("verified_only") is True
+
+
+def test_fetch_and_save_localizations_include_classes_sets_label_filter(
+    monkeypatch, tmp_path
+):
+    fake_api = _FakeApi(localizations=[_FakeLoc(1, "eid-larv", True)])
+    monkeypatch.setattr(
+        sync,
+        "_localizations_jsonl_path",
+        lambda *_a, **_k: str(tmp_path / "localizations.jsonl"),
+    )
+
+    sync.fetch_and_save_localizations(
+        fake_api, project_id=7, include_classes=["Larvacean"]
+    )
+
+    assert all(
+        "Label::Larvacean" in (kw.get("attribute") or [])
+        for kw in fake_api.get_localization_list_calls
+    )

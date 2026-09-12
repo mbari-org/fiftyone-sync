@@ -576,6 +576,19 @@ async def sync(
             "deleted in Tator and the crop files are kept"
         ),
     ),
+    include_classes: str | None = Query(
+        None,
+        description="Optional comma-separated label names to include in the Voxel51 dataset (e.g. Larvacean,Copepod). Combined with verified_only when both are set.",
+    ),
+    dataset_name: str | None = Query(
+        None,
+        max_length=60,
+        description=(
+            "Optional FiftyOne dataset name. Default is "
+            "project_v{version}[_s{section}]_{port}. Sanitized to safe characters; "
+            "max 60 characters."
+        ),
+    ),
 ) -> dict:
     """
     Trigger sync: enqueues a job to fetch Tator media + localizations, build FiftyOne dataset, launch App.
@@ -583,6 +596,7 @@ async def sync(
     """
     from src.app.sync_queue import enqueue_sync
     from src.app.database_manager import get_vss_project_config
+    from src.app.sync_filters import parse_include_classes
 
     project_name: str | None = None
     try:
@@ -642,6 +656,8 @@ async def sync(
             localization_type_id=localization_type_id,
             verified_only=verified_only,
             remove_near_duplicates=remove_near_duplicates,
+            include_classes=parse_include_classes(include_classes) or None,
+            dataset_name=(dataset_name or "").strip() or None,
         )
         return {"job_id": job_id, "status": "queued", "port": port}
     except Exception as e:
@@ -1144,6 +1160,13 @@ async def rename_dataset(
         max_length=60,
         description="New dataset name (sanitized to safe characters; max 60 characters)",
     ),
+    dataset_name: str | None = Query(
+        None,
+        description=(
+            "Current FiftyOne dataset name to rename. If omitted, the default "
+            "dataset for this version/section/port is renamed."
+        ),
+    ),
     section_id: int | None = Query(
         None, description="Optional Tator media section ID (matches section-scoped datasets)"
     ),
@@ -1153,9 +1176,11 @@ async def rename_dataset(
     authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     """
-    Rename the FiftyOne dataset for a specific version/port/section, e.g. to replace
-    the default traceability-oriented name (project_v{version}[_s{section}]_{port})
-    with a more descriptive one. `new_name` is sanitized and truncated to 60 characters.
+    Rename a FiftyOne dataset, e.g. to replace the default traceability-oriented
+    name (project_v{version}[_s{section}]_{port}) with a more descriptive one.
+    Pass `dataset_name` to rename a specific existing dataset; otherwise the
+    default dataset for this version/port/section is renamed. `new_name` is
+    sanitized and truncated to 60 characters.
     Requires authentication (Authorization header or `token` query parameter).
     Returns {"status": "ok", "old_name": str | None, "new_name": str | None,
     "database_name": str}.
@@ -1200,6 +1225,7 @@ async def rename_dataset(
             project_name=project_name,
             database_name=database_name_from_uri(database_entry.uri),
             section_id=section_id,
+            dataset_name=(dataset_name or "").strip() or None,
         )
         return result
     except ValueError as e:

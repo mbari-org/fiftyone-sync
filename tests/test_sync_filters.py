@@ -1,6 +1,6 @@
 # fiftyone-sync, Apache-2.0 license
 # Filename: tests/test_sync_filters.py
-# Description: Unit tests for Tator section/query sync filter helpers.
+# Description: Unit tests for Tator section/query/label sync filter helpers.
 
 from src.app.sync_filters import (
     filter_slug,
@@ -36,6 +36,40 @@ def test_filter_slug_localization_type_only():
 
 def test_filter_slug_section_and_localization_type():
     assert filter_slug(section_id=7, localization_type_id=15) == "s7_t15"
+
+
+def test_parse_include_classes_from_string():
+    from src.app.sync_filters import parse_include_classes
+
+    assert parse_include_classes("Larvacean, Copepod") == ["Larvacean", "Copepod"]
+    assert parse_include_classes("  a, a, b  ") == ["a", "b"]
+    assert parse_include_classes(None) == []
+
+
+def test_include_classes_slug_is_order_independent():
+    from src.app.sync_filters import include_classes_slug
+
+    assert include_classes_slug(["B", "A"]) == include_classes_slug(["A", "B"])
+    assert include_classes_slug(["A"]).startswith("l")
+    assert len(include_classes_slug(["A"])) == 13
+
+
+def test_filter_slug_include_classes():
+    from src.app.sync_filters import include_classes_slug
+
+    assert filter_slug(include_classes=["Larvacean", "Copepod"]) == include_classes_slug(
+        ["Copepod", "Larvacean"]
+    )
+
+
+def test_localization_fetch_kwargs_include_class():
+    kw = localization_fetch_kwargs(
+        version_id=3, verified_only=True, include_class="Larvacean"
+    )
+    assert kw == {
+        "version": [3],
+        "attribute": ["verified::true", "Label::Larvacean"],
+    }
 
 
 def test_localization_fetch_kwargs_version_section_query():
