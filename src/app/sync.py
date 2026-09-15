@@ -14,6 +14,7 @@ import glob
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -97,6 +98,88 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     except ValueError:
         return default
     return max(minimum, val)
+
+
+def _max_samples_from_config(config: dict[str, Any] | None) -> int | None:
+    """Positive max_samples from config, or None if unset/invalid."""
+    if not config:
+        return None
+    raw = config.get("max_samples")
+    if raw is None or raw == "":
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
+def _max_images_limit(config: dict[str, Any] | None = None) -> int | None:
+    """Cap on localizations/samples per sync, or None if unlimited.
+
+    FIFTYONE_SYNC_MAX_IMAGES overrides config max_samples. Missing, 0, or
+    invalid values mean no cap (the full dataset is synced).
+    """
+    raw = os.environ.get("FIFTYONE_SYNC_MAX_IMAGES", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid FIFTYONE_SYNC_MAX_IMAGES=%r; ignoring (no cap from env)",
+                raw,
+            )
+            return _max_samples_from_config(config)
+        if val <= 0:
+            return None
+        return val
+    return _max_samples_from_config(config)
+
+
+def _jsonl_cache_matches(
+    line_count: int,
+    api_count: int | None,
+    *,
+    max_images: int | None = None,
+) -> bool:
+    """True when a cached JSONL can stand in for a fresh Tator fetch."""
+    if api_count is None:
+        return False
+    if line_count == api_count:
+        return True
+    return bool(
+        max_images
+        and line_count == max_images
+        and api_count > max_images
+    )
+
+
+def _sample_jsonl_random(
+    path: str, max_n: int, *, rng: random.Random | None = None
+) -> int:
+    """Rewrite JSONL to a random subset when over max_n. Returns kept count."""
+    if max_n <= 0 or not path or not os.path.isfile(path):
+        return 0
+    lines: list[str] = []
+    with open(path) as f:
+        for line in f:
+            raw = line.strip()
+            if raw:
+                lines.append(raw)
+    if len(lines) <= max_n:
+        return len(lines)
+    picker = rng if rng is not None else random
+    kept = picker.sample(lines, max_n)
+    with open(path, "w") as f:
+        for row in kept:
+            f.write(row + "\n")
+    logger.info(
+        "FIFTYONE_SYNC_MAX_IMAGES: randomly sampled %s of %s localizations "
+        "to limit dataset size",
+        max_n,
+        len(lines),
+    )
+    return max_n
 
 
 def _sync_to_tator_fetch_chunk() -> int:
@@ -2427,6 +2510,7 @@ def _resolve_localizations_jsonl(
     localization_type_id: int | None = None,
     verified_only: bool = False,
     include_classes: list[str] | None = None,
+    max_images: int | None = None,
 ) -> tuple[str, list[int], bool]:
     """
     Resolve localizations JSONL and media ids for crop work.
@@ -2435,6 +2519,9 @@ def _resolve_localizations_jsonl(
     server-side to verified::true so unverified data is never downloaded.
     When include_classes is set, localization fetches are scoped to those labels
     and media pre-fetch is skipped so only media that have matching labels are downloaded.
+    When max_images is set, a previously sampled JSONL whose line count equals
+    that cap is treated as a valid cache even if the Tator localization count
+    is larger.
 
     Returns (localizations_path, media_ids_list, use_cached_jsonl).
     """
@@ -2477,15 +2564,25 @@ def _resolve_localizations_jsonl(
                 localization_type_id=localization_type_id,
                 verified_only=verified_only,
             )
-            if api_count is not None and line_count == api_count:
+            if _jsonl_cache_matches(
+                line_count, api_count, max_images=max_images
+            ):
                 use_cached_jsonl = True
                 localizations_path = jsonl_path
                 media_ids_list = media_ids_from_jsonl
-                logger.info(
-                    "Bypassing media and localization fetch: JSONL is newer than 1 day and "
-                    "line count (%s) matches get_localization_count",
-                    line_count,
-                )
+                if api_count is not None and line_count != api_count:
+                    logger.info(
+                        "Bypassing media and localization fetch: JSONL is newer "
+                        "than 1 day and is a random sample of %s (API count %s)",
+                        line_count,
+                        api_count,
+                    )
+                else:
+                    logger.info(
+                        "Bypassing media and localization fetch: JSONL is newer than 1 day and "
+                        "line count (%s) matches get_localization_count",
+                        line_count,
+                    )
 
     if not use_cached_jsonl:
         loc_media_ids: list[int] | None = None
@@ -2637,6 +2734,7 @@ def _run_crop_pipeline(
     localization_type_id: int | None = None,
     verified_only: bool = False,
     include_classes: list[str] | None = None,
+    max_images: int | None = None,
 ) -> dict[str, Any]:
     """
     Run crop refresh pipeline and return counts/paths/context.
@@ -2645,7 +2743,11 @@ def _run_crop_pipeline(
     verified_only is True, media/localization fetches are scoped server-side
     to verified::true, so unverified media/localizations are never downloaded
     or cropped. When include_classes is set, only those labels are fetched and cropped.
+    When max_images is set and the localization JSONL exceeds that count, a
+    random subset is kept so crop/dataset work cannot balloon past the cap.
     """
+    if max_images is None:
+        max_images = _max_images_limit()
     include_class_list = parse_include_classes(include_classes)
     dl_dir = _download_dir(project_id)
     crops = _crops_dir(
@@ -2683,6 +2785,7 @@ def _run_crop_pipeline(
             localization_type_id=localization_type_id,
             verified_only=verified_only,
             include_classes=include_class_list or None,
+            max_images=max_images,
         )
         if localizations_path:
             logger.info("saved_localizations_path (JSONL): %s", localizations_path)
@@ -2725,6 +2828,11 @@ def _run_crop_pipeline(
                 "include_classes filter: kept %s localization(s) matching %s",
                 kept,
                 include_class_list,
+            )
+        if localizations_path and max_images:
+            _sample_jsonl_random(localizations_path, max_images)
+            _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                localizations_path
             )
         old_manifest = _load_crop_manifest(
             project_id,
@@ -3544,7 +3652,9 @@ def reconcile_dataset_with_tator(
             new_eids = set()
         else:
             # Convert to list for slicing, but only take what we need
-            new_eids_list = list(new_eids)[:cap]
+            new_eids_list = list(new_eids)
+            if len(new_eids_list) > cap:
+                new_eids_list = random.sample(new_eids_list, cap)
             new_eids = set(new_eids_list)
 
     if new_eids:
@@ -3651,7 +3761,8 @@ def build_fiftyone_dataset_from_crops(
         verified_only: bool; when True, only include localizations whose
             `verified` attribute is truthy (missing/False/no-loc = excluded)
         image_extensions: glob patterns (default: ["*.png", "*.jpg", ...])
-        max_samples: max samples to load (None = no limit)
+        max_samples: max samples to load; when set and exceeded, a random
+            subset is kept (None = no limit). Also set via FIFTYONE_SYNC_MAX_IMAGES.
 
     Returns the FiftyOne dataset.
     """
@@ -3665,7 +3776,7 @@ def build_fiftyone_dataset_from_crops(
         "*.bmp",
         "*.tiff",
     ]
-    max_samples = config.get("max_samples")
+    max_samples = _max_images_limit(config)
     force_sync = bool(config.get("force_sync"))
     dataset_already_exists = dataset_name in fo.list_datasets()
 
@@ -3673,8 +3784,9 @@ def build_fiftyone_dataset_from_crops(
     loc_index = _load_localizations_index(localizations_jsonl_path)
     logger.info(f"Loaded {len(loc_index)} localizations from JSONL")
 
-    # Collect crop filepaths
-    samples: list = []
+    # Collect matching crop paths first (cheap), then cap with a random sample
+    # so a large crops directory cannot materialize every fo.Sample in memory.
+    candidates: list[tuple[str, str, str, dict | None, str]] = []
     seen = 0
     s3_bucket = config.get("s3_bucket")
     s3_prefix = config.get("s3_prefix")
@@ -3682,8 +3794,6 @@ def build_fiftyone_dataset_from_crops(
         pat = os.path.join(crops_dir, "**", ext)
         for filepath in glob.glob(pat):
             seen += 1
-            if max_samples and len(samples) >= max_samples:
-                break
             rel = os.path.relpath(filepath, crops_dir)
             parts = Path(rel).parts
             if len(parts) < 2:
@@ -3692,42 +3802,54 @@ def build_fiftyone_dataset_from_crops(
             elemental_id = Path(filepath).stem
 
             loc = loc_index.get(elemental_id)
+            if max_samples and loc_index and loc is None:
+                continue
             label = _get_label_from_loc(loc) if loc else (media_stem or "Unknown")
 
             if include_classes and label not in include_classes:
                 continue
             if verified_only and not _loc_is_verified(loc):
                 continue
+            candidates.append((filepath, elemental_id, media_stem, loc, label))
 
-            sample_filepath = _crop_filepath_for_sample(
-                media_stem,
-                elemental_id,
-                crops_dir,
-                s3_bucket=s3_bucket,
-                s3_prefix=s3_prefix,
-            )
-            sample = fo.Sample(filepath=sample_filepath)
-            sample["local_filepath"] = filepath
-            sample["elemental_id"] = elemental_id
-            sample["media_stem"] = media_stem
-            media_attrs_map = config.get("media_attributes_map") or {}
-            if loc:
-                if not dataset_already_exists or force_sync:
-                    _apply_loc_to_sample(
-                        sample,
-                        loc,
-                        api_url=config.get("api_url"),
-                        project_id=config.get("project_id"),
-                        version_id=config.get("version_id"),
-                        media_attributes_map=media_attrs_map,
-                    )
-                else:
-                    _apply_media_attrs_to_sample(sample, loc, media_attrs_map)
+    candidate_count = len(candidates)
+    if max_samples and candidate_count > max_samples:
+        candidates = random.sample(candidates, max_samples)
+        logger.info(
+            "max_samples: randomly selected %s of %s matching crop images",
+            max_samples,
+            candidate_count,
+        )
+
+    samples: list = []
+    media_attrs_map = config.get("media_attributes_map") or {}
+    for filepath, elemental_id, media_stem, loc, label in candidates:
+        sample_filepath = _crop_filepath_for_sample(
+            media_stem,
+            elemental_id,
+            crops_dir,
+            s3_bucket=s3_bucket,
+            s3_prefix=s3_prefix,
+        )
+        sample = fo.Sample(filepath=sample_filepath)
+        sample["local_filepath"] = filepath
+        sample["elemental_id"] = elemental_id
+        sample["media_stem"] = media_stem
+        if loc:
+            if not dataset_already_exists or force_sync:
+                _apply_loc_to_sample(
+                    sample,
+                    loc,
+                    api_url=config.get("api_url"),
+                    project_id=config.get("project_id"),
+                    version_id=config.get("version_id"),
+                    media_attributes_map=media_attrs_map,
+                )
             else:
-                sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
-            samples.append(sample)
-        if max_samples and len(samples) >= max_samples:
-            break
+                _apply_media_attrs_to_sample(sample, loc, media_attrs_map)
+        else:
+            sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
+        samples.append(sample)
 
     if not samples:
         raise ValueError(f"No crops found in {crops_dir} (checked {seen} files)")
@@ -4759,6 +4881,7 @@ def recompute_crops_for_version(
     localization_batch_size = (
         config.get("localization_batch_size") or _DEFAULT_LOCALIZATION_BATCH_SIZE
     )
+    max_images = _max_images_limit(config)
 
     try:
         api = tator.get_api(api_url.rstrip("/"), token)
@@ -4774,6 +4897,7 @@ def recompute_crops_for_version(
             localization_batch_size=localization_batch_size,
             s3_bucket=s3_bucket,
             s3_crops_prefix=s3_crops_prefix,
+            max_images=max_images,
         )
         crop_result["database_name"] = resolved_db
         crop_result["force"] = force
@@ -5182,6 +5306,11 @@ def sync_project_to_fiftyone(
     else:
         include_class_list = parse_include_classes(config.get("include_classes"))
 
+    max_images = _max_images_limit(config)
+    if max_images:
+        config["max_samples"] = max_images
+        logger.info("Sync sample cap: max_images=%s", max_images)
+
     try:
         dl_dir = ""
         localizations_path = ""
@@ -5219,6 +5348,7 @@ def sync_project_to_fiftyone(
                 localization_type_id=localization_type_id,
                 verified_only=verified_only,
                 include_classes=include_class_list or None,
+                max_images=max_images,
             )
             if crop_result.get("status") != "ok":
                 return {

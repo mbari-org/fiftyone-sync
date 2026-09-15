@@ -25,6 +25,10 @@ projects:
 #      - uri: "mongodb://localhost:27017"
 #        port: 5151
 #
+# Optional: cap how many localizations are cropped and loaded into FiftyOne.
+# Prefer FIFTYONE_SYNC_MAX_IMAGES in production (overrides this key).
+# max_samples: 20000
+#
 # Optional: remove near-duplicate / dark / low-information samples from the
 # built Voxel51 dataset with CleanVision (see config.yml and docs/USAGE.md).
 # cleanvision:
