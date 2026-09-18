@@ -98,6 +98,8 @@ flowchart TD
 
 - **Near-duplicate removal (CleanVision)**: `remove_near_duplicates=true` on `POST /sync` (or the **Remove near duplicates** checkbox in the applet) prunes near-duplicate, dark, and low-information crops from the dataset before embeddings are computed, keeping one image per near-duplicate set. Blur is deliberately not detected — the check misread soft-edged specimens as blurred photographs. Fewer samples means less annotator overhead and less memory/GPU pressure. **Voxel51 samples only** — nothing is deleted in Tator, and the removed crop images are *moved* into a `crops_removed/` folder beside the crops rather than deleted, so they can be reviewed or restored. Tunable via the `cleanvision` block in `config.yml`; see [docs/USAGE.md](docs/USAGE.md#near-duplicate-and-low-quality-sample-removal-cleanvision).
 
+- **Sync size cap**: Set `FIFTYONE_SYNC_MAX_IMAGES` (or config `max_samples`) to randomly subsample oversized Tator exports before cropping and dataset build, avoiding OOM on huge versions. See [docs/USAGE.md](docs/USAGE.md#sync-and-fiftyone-dataset).
+
 - **Sync queue (Redis)**: Background worker: `python -m src.app.sync_worker`. Env: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_USE_SSL`, or `REDIS_URL`.
 
 ## Run (Docker)

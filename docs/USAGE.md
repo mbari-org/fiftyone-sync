@@ -180,12 +180,14 @@ localization_batch_size: 5000         # page size for localization list API
 
 include_classes: [Larvacean, Copepod]   # optional: filter labels
 image_extensions: ["*.png", "*.jpg"]
-max_samples: 500                         # optional: limit for testing
+max_samples: 500                         # optional: random subsample if the export is larger
 ```
 
 `verified_only` is set from the `verified_only` query param (or the applet's **Verified only** checkbox), not from this config file.
 
 `include_classes` can also be set from the `include_classes` query param (or the applet's **Labels** field). When the query param is present, it overrides this config key. Use it to break a large project into smaller Voxel51 datasets by exporting one or more labels at a time.
+
+`max_samples` caps how many localizations are cropped and loaded into FiftyOne. If the Tator export is larger, a **random** subset of that size is kept (not the first N files). Prefer the `FIFTYONE_SYNC_MAX_IMAGES` environment variable in production — it overrides this config key and is meant to prevent OOM on huge versions. Unset, `0`, or an invalid value means no cap. A sampled JSONL is reused for up to a day (same cache window as a full fetch) so the subset stays stable until the cache expires.
 
 The FiftyOne dataset name defaults to `project_name_v{version_id}_{port}` and cannot be set in the config file. Override it with the `dataset_name` query param or the applet **Dataset name** field.
 
@@ -357,6 +359,7 @@ Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 | `CROP_FRAME_BATCH_SIZE` | `20` | Number of image crop tasks batched per `ThreadPoolExecutor` cycle inside `crop_localizations_parallel`, and number of video frames extracted per ffmpeg invocation. |
 | `CROP_VIDEO_WORKERS` | `8` | Max concurrent workers used to crop frames extracted from a single video. |
 | `CROP_TIMEOUT` | `300` | Timeout (seconds) for ffmpeg frame-extraction batches. |
+| `FIFTYONE_SYNC_MAX_IMAGES` | unset (no cap) | Maximum localizations/crop images per sync. When the Tator export is larger, a random subset of this size is kept before cropping and dataset build. Overrides config `max_samples`. |
 
 If downloads from Tator are slow (network-bound), raising `MEDIA_DOWNLOAD_WORKERS` has the biggest effect on wall-clock time for image-heavy projects; `CROP_FRAME_BATCH_SIZE` only matters for bulk/recompute crop paths that hand many media to `crop_localizations_parallel` at once.
 
