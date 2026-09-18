@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.15.0 (2026-09-18)
+
+### Features
+
+- **app**: Cap oversized syncs with a random sample to avoid OOM (#43)
+  ([#43](https://github.com/mbari-org/fiftyone-sync/pull/43),
+  [`b3e1389`](https://github.com/mbari-org/fiftyone-sync/commit/b3e13892d3ef955d5e44fb3e1761e564130b5373))
+
+
 ## v0.14.0 (2026-09-12)
 
 ### Features
