@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.16.0 (2026-10-06)
+
+### Features
+
+- **app**: Resume interrupted media loads and batch for millions of media (#44)
+  ([#44](https://github.com/mbari-org/fiftyone-sync/pull/44),
+  [`59fef89`](https://github.com/mbari-org/fiftyone-sync/commit/59fef8932591f4c5005b40f535124be0c85e586e))
+
+
 ## v0.15.0 (2026-09-18)
 
 ### Features
