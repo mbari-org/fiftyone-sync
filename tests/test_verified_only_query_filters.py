@@ -46,7 +46,9 @@ def test_fetch_project_media_ids_verified_only_sets_related_attribute(monkeypatc
     )
 
     assert media_ids == [1, 2]
-    assert fake_api.get_media_list_calls == [{"related_attribute": ["verified::true"]}]
+    assert fake_api.get_media_list_calls == [
+        {"related_attribute": ["verified::true"], "stop": sync._MEDIA_LIST_PAGE_SIZE}
+    ]
 
 
 def test_fetch_project_media_ids_default_omits_related_attribute(monkeypatch):
@@ -55,7 +57,7 @@ def test_fetch_project_media_ids_default_omits_related_attribute(monkeypatch):
 
     sync.fetch_project_media_ids("http://tator.example", "tok", project_id=7)
 
-    assert fake_api.get_media_list_calls == [{}]
+    assert fake_api.get_media_list_calls == [{"stop": sync._MEDIA_LIST_PAGE_SIZE}]
 
 
 def test_fetch_project_media_ids_combines_version_and_verified_only(monkeypatch):
@@ -71,7 +73,10 @@ def test_fetch_project_media_ids_combines_version_and_verified_only(monkeypatch)
     )
 
     assert fake_api.get_media_list_calls == [
-        {"related_attribute": ["$version::21", "verified::true"]}
+        {
+            "related_attribute": ["$version::21", "verified::true"],
+            "stop": sync._MEDIA_LIST_PAGE_SIZE,
+        }
     ]
 
 

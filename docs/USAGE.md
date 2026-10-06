@@ -344,6 +344,24 @@ the raw downloaded file. Existing non-empty crop files are reused even when the
 crop manifest is missing or stale; localizations are recropped when their
 recorded modification time changes.
 
+**Resuming an interrupted sync.** Re-running a sync that was interrupted
+(worker restart, OOM, network failure) picks up where it left off instead of
+starting over:
+
+- Media whose localizations all have a crop on disk are skipped; only the
+  remaining media are resolved, downloaded and cropped. Crops are written via a
+  temp file + rename, so an interrupted write never leaves a truncated crop
+  that would be mistaken for a finished one.
+- A new FiftyOne dataset is persisted first and filled in batches, so samples
+  already inserted survive an interruption. The next sync finds the partial
+  dataset and adds only the localizations that are missing from it.
+
+**Very large syncs (millions of media).** Every stage is batched so memory and
+request sizes stay bounded: the media id list is paged from Tator
+(`after` + `stop`), media are resolved and presigned per download batch (so
+presigned URLs cannot expire on runs that take longer than a day), and dataset
+samples are built and inserted one batch at a time.
+
 Media fetched for download are requested with presigned URLs (`presigned=86400`,
 `no_cache=true`), so media stored in an object store can be downloaded directly.
 Tator deployments that do not support presigning fall back to unsigned object
@@ -359,6 +377,8 @@ Labels come from `attributes.Label` (or `attributes.label`) in localizations.
 | `CROP_FRAME_BATCH_SIZE` | `20` | Number of image crop tasks batched per `ThreadPoolExecutor` cycle inside `crop_localizations_parallel`, and number of video frames extracted per ffmpeg invocation. |
 | `CROP_VIDEO_WORKERS` | `8` | Max concurrent workers used to crop frames extracted from a single video. |
 | `CROP_TIMEOUT` | `300` | Timeout (seconds) for ffmpeg frame-extraction batches. |
+| `FIFTYONE_SYNC_MEDIA_DOWNLOAD_BATCH` | `1000` | Media resolved from Tator (with fresh presigned URLs), downloaded and cropped per batch. Lower it to reduce memory per batch; it does not change download concurrency (`MEDIA_DOWNLOAD_WORKERS`). |
+| `FIFTYONE_SYNC_DATASET_ADD_BATCH` | `1000` | Samples built and inserted into the FiftyOne dataset per batch, both for a new dataset and when reconciling an existing (or partially loaded) one. |
 | `FIFTYONE_SYNC_MAX_IMAGES` | unset (no cap) | Maximum localizations/crop images per sync. When the Tator export is larger, a random subset of this size is kept before cropping and dataset build. Overrides config `max_samples`. |
 
 If downloads from Tator are slow (network-bound), raising `MEDIA_DOWNLOAD_WORKERS` has the biggest effect on wall-clock time for image-heavy projects; `CROP_FRAME_BATCH_SIZE` only matters for bulk/recompute crop paths that hand many media to `crop_localizations_parallel` at once.

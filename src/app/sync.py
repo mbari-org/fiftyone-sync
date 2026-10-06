@@ -75,6 +75,9 @@ _DEFAULT_LOCALIZATION_BATCH_SIZE = 5000
 # Max media IDs per request so URL stays under nginx request line limit (e.g. 4094 bytes).
 # Each media_id in query string is ~17 bytes; base URL + version ~500; 150 * 17 + 500 < 4094.
 _MAX_SAFE_MEDIA_ID_BATCH_SIZE = 150
+# Page size for unfiltered media listing (paginated with `after` so millions of
+# media are never requested in one response).
+_MEDIA_LIST_PAGE_SIZE = 5000
 
 # Lifetime (seconds) of presigned media URLs requested from Tator. 86400 is the
 # maximum Tator allows; downloads can start hours after the media list is fetched.
@@ -180,6 +183,16 @@ def _sample_jsonl_random(
         len(lines),
     )
     return max_n
+
+
+def _media_download_batch_size() -> int:
+    """Media resolved (presigned), downloaded and cropped per batch."""
+    return _env_int("FIFTYONE_SYNC_MEDIA_DOWNLOAD_BATCH", 1000, minimum=1)
+
+
+def _dataset_add_batch_size() -> int:
+    """Samples built and inserted into FiftyOne per batch."""
+    return _env_int("FIFTYONE_SYNC_DATASET_ADD_BATCH", 1000, minimum=1)
 
 
 def _sync_to_tator_fetch_chunk() -> int:
@@ -506,8 +519,22 @@ def fetch_project_media_ids(
             media_list.extend(api.get_media_list(project_id, **kw))
         media_ids = [m.id for m in media_list]
     else:
-        media_list = api.get_media_list(project_id, **kwargs)
-        media_ids = [m.id for m in media_list]
+        # Page by id so projects with millions of media are never listed in one
+        # response; only ids are kept, not the Media objects.
+        media_ids = []
+        after_id = None
+        while True:
+            kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
+            if after_id is not None:
+                kw["after"] = after_id
+            page = api.get_media_list(project_id, **kw)
+            if not page:
+                break
+            media_ids.extend(m.id for m in page)
+            after_id = page[-1].id
+            if len(page) < _MEDIA_LIST_PAGE_SIZE:
+                break
+            logger.info(f"fetch_project_media_ids: {len(media_ids)} ids so far")
     logger.info(f"Project {project_id} media count: {len(media_ids)}")
     return media_ids
 
@@ -668,20 +695,25 @@ def _build_media_attributes_map(
     _, media_ids = _localizations_jsonl_line_count_and_media_ids(localizations_path)
     if not media_ids:
         return {}
-    all_media = get_media_chunked(
-        api, project_id, media_ids, media_id_batch_size=media_id_batch_size
-    )
     result: dict[int, dict[str, Any]] = {}
-    for m in all_media:
-        mid = getattr(m, "id", None)
-        if mid is None:
-            continue
-        attrs = getattr(m, "attributes", None) or {}
-        picked = {
-            k: attrs[k] for k in attr_names if k in attrs and attrs[k] is not None
-        }
-        if picked:
-            result[mid] = picked
+    # Chunked so only the picked attributes, not every Media object, are retained.
+    chunk = _media_download_batch_size()
+    for start in range(0, len(media_ids), chunk):
+        for m in get_media_chunked(
+            api,
+            project_id,
+            media_ids[start : start + chunk],
+            media_id_batch_size=media_id_batch_size,
+        ):
+            mid = getattr(m, "id", None)
+            if mid is None:
+                continue
+            attrs = getattr(m, "attributes", None) or {}
+            picked = {
+                k: attrs[k] for k in attr_names if k in attrs and attrs[k] is not None
+            }
+            if picked:
+                result[mid] = picked
     logger.info(f"Media attributes map: {len(result)} media with attributes (all types)")
     return result
 
@@ -1026,6 +1058,18 @@ def _crop_output_exists(out_path: Path) -> bool:
         return False
 
 
+def _save_png_atomic(img: Image.Image, out_path: Path) -> None:
+    """Write a PNG via temp file + rename so an interrupted sync never leaves a
+    truncated crop that _crop_output_exists would treat as done on resume."""
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    try:
+        img.save(tmp_path, format="PNG")
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        _safe_unlink(tmp_path)
+        raise
+
+
 def _video_frame_group_fully_cached(
     group: list[tuple[dict, Path]],
 ) -> bool:
@@ -1148,7 +1192,7 @@ def _crop_image_group(
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 crop = img.crop((x1, y1, x2, y2))
                 crop = crop.resize((size, size), _PIL_RESAMPLE)
-                crop.save(out_path, format="PNG")
+                _save_png_atomic(crop, out_path)
                 total_ok += 1
             except Exception as e:
                 logger.debug(f"PIL crop failed for {out_path}: {e}")
@@ -1209,7 +1253,7 @@ def _resize_whole_image(
     for _loc, out_path in locs_with_out_paths:
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            squared.resize((size, size), _PIL_RESAMPLE).save(out_path, format="PNG")
+            _save_png_atomic(squared.resize((size, size), _PIL_RESAMPLE), out_path)
             total_ok += 1
         except Exception as e:
             logger.debug(f"PIL resize failed for {out_path}: {e}")
@@ -1282,7 +1326,7 @@ def _crop_media_group(
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 crop = img.crop((x1, y1, x2, y2))
                 crop = crop.resize((size, size), _PIL_RESAMPLE)
-                crop.save(out_path, format="PNG")
+                _save_png_atomic(crop, out_path)
                 total_ok += 1
             except Exception as e:
                 logger.debug(f"PIL crop failed for {out_path}: {e}")
@@ -2437,14 +2481,15 @@ def _patch_manifest_stems(
     manifest: dict[str, dict],
     download_dir: str,
     media_objects: list[Any] | None = None,
+    media_stems: dict[int, str] | None = None,
 ) -> None:
     """
     After downloading new media, update manifest entries whose media_stem is
     still a bare media_id (fallback) with the real stem from the download directory
-    or from media_objects (for video; no file in download dir).
+    or from media_objects / media_stems (for video; no file in download dir).
     """
     real_stems = _media_id_to_stem(download_dir)
-    media_stem_map: dict[int, str] = {}
+    media_stem_map: dict[int, str] = dict(media_stems or {})
     for m in (media_objects or []):
         if not isinstance(m, tator.models.Media):
             continue
@@ -2870,66 +2915,94 @@ def _run_crop_pipeline(
         cache_misses = len(locs_to_crop)
         cache_hits = max(0, localizations_count - cache_misses)
 
-        all_media: list[Any] = []
+        processed_stems: dict[int, str] = {}
         if not media_ids_list:
             logger.info("No media IDs for project %s; skipping download", project_id)
         elif not media_ids_needed:
             logger.info(
                 "All %s crops are cached; skipping media download", localizations_count
             )
+        elif not (locs_to_crop and localizations_path):
+            logger.info("No crop cache misses; skipping crop step")
         else:
+            # Media already fully cropped by an earlier (possibly interrupted) run
+            # are cache hits and never reach needed_ids, so this resumes with
+            # the remainder only.
             needed_ids = [mid for mid in media_ids_list if mid in media_ids_needed]
+            locs_by_media: dict[int, list[dict]] = defaultdict(list)
+            for loc in locs_to_crop:
+                loc_media_id = loc.get("media")
+                if loc_media_id is not None:
+                    locs_by_media[int(loc_media_id)].append(loc)
+            # Resolve, download and crop in batches: bounds the Media objects in
+            # memory and presigns each batch just before its downloads start, so
+            # URLs cannot expire on runs with millions of media.
+            batch_size = _media_download_batch_size()
+            num_batches = (len(needed_ids) + batch_size - 1) // batch_size
             logger.info(
-                "Getting %s/%s media objects for cropping...",
+                "Downloading and cropping %s/%s media (%s already cropped) in "
+                "%s batch(es) of up to %s...",
                 len(needed_ids),
                 len(media_ids_list),
+                len(media_ids_list) - len(needed_ids),
+                num_batches,
+                batch_size,
             )
-            media_for_crop = get_media_chunked(
-                api,
-                project_id,
-                needed_ids,
-                media_id_batch_size=media_id_batch_size,
-                presigned=True,
-            )
-            if not media_for_crop:
-                logger.info(
-                    "No Media objects returned for %s ids; skipping download",
-                    len(needed_ids),
+            for bidx, start in enumerate(range(0, len(needed_ids), batch_size), 1):
+                batch_ids = needed_ids[start : start + batch_size]
+                media_for_crop = get_media_chunked(
+                    api,
+                    project_id,
+                    batch_ids,
+                    media_id_batch_size=media_id_batch_size,
+                    presigned=True,
                 )
-            if locs_to_crop and localizations_path:
+                if not media_for_crop:
+                    logger.info(
+                        "No Media objects returned for %s ids in batch %s/%s",
+                        len(batch_ids),
+                        bidx,
+                        num_batches,
+                    )
                 media_by_id = {
                     m.id: m
                     for m in media_for_crop
                     if isinstance(m, tator.models.Media)
                 }
-                locs_by_media: dict[int, list[dict]] = defaultdict(list)
-                for loc in locs_to_crop:
-                    loc_media_id = loc.get("media")
-                    if loc_media_id is not None:
-                        locs_by_media[int(loc_media_id)].append(loc)
-                logger.info(
-                    "Downloading and cropping %s media one at a time "
-                    "(images + videos)...",
-                    len(needed_ids),
-                )
                 (
                     dl_dir,
-                    all_media,
-                    num_cropped,
-                    num_failed,
+                    batch_media,
+                    batch_ok,
+                    batch_fail,
                 ) = _download_and_crop_media_sequentially(
                     api,
                     project_id,
-                    needed_ids,
+                    batch_ids,
                     media_by_id,
-                    locs_by_media,
+                    {mid: locs_by_media.get(mid) or [] for mid in batch_ids},
                     localizations_path,
                     crops,
                 )
-            else:
-                logger.info("No crop cache misses; skipping crop step")
+                num_cropped += batch_ok
+                num_failed += batch_fail
+                for m in batch_media:
+                    mid = getattr(m, "id", None)
+                    if mid is not None:
+                        processed_stems[int(mid)] = (
+                            f"{mid}_{getattr(m, 'name', '') or ''}"
+                        )
+                logger.info(
+                    "Media batch %s/%s done: %s/%s media processed, "
+                    "%s cropped, %s failed so far",
+                    bidx,
+                    num_batches,
+                    min(start + batch_size, len(needed_ids)),
+                    len(needed_ids),
+                    num_cropped,
+                    num_failed,
+                )
 
-        _patch_manifest_stems(updated_manifest, dl_dir, media_objects=all_media)
+        _patch_manifest_stems(updated_manifest, dl_dir, media_stems=processed_stems)
         _save_crop_manifest(
             project_id,
             version_id,
@@ -3570,16 +3643,6 @@ def reconcile_dataset_with_tator(
     logger.info("Reconcile: Update samples with changed modified_datetime")
     updated = 0
 
-    # Pre-collect all samples that need checking to avoid multiple passes
-    # Create a dict mapping elemental_id to sample for faster lookups
-    eid_to_sample = {}
-    samples_to_update = []
-
-    for sample in dataset.iter_samples(autosave=False):
-        elemental_id = getattr(sample, "elemental_id", None)
-        if elemental_id and str(elemental_id) in loc_index:
-            eid_to_sample[str(elemental_id)] = sample
-
     api_url = config.get("api_url")
     project_id = config.get("project_id")
     version_id = config.get("version_id")
@@ -3588,12 +3651,25 @@ def reconcile_dataset_with_tator(
     if force_sync:
         logger.info("Reconcile: force_sync enabled — rewriting all samples")
 
-    samples_to_fix_storage: list[fo.Sample] = []
-    for eid, sample in eid_to_sample.items():
+    # Stream samples and save changes inline so a dataset with millions of
+    # samples is never materialized in memory at once.
+    for sample in dataset.iter_samples(autosave=False):
+        elemental_id = getattr(sample, "elemental_id", None)
+        eid = str(elemental_id) if elemental_id else None
+        if eid is None or eid not in loc_index:
+            continue
         loc = loc_index[eid]
 
         if force_sync:
-            samples_to_update.append((sample, loc))
+            _apply_loc_to_sample(
+                sample,
+                loc,
+                api_url=api_url,
+                project_id=project_id,
+                version_id=version_id,
+                media_attributes_map=media_attributes_map,
+            )
+            sample.save()
             updated += 1
             continue
 
@@ -3601,8 +3677,6 @@ def reconcile_dataset_with_tator(
             loc.get("modified_datetime") or loc.get("created_datetime")
         )
         tator_modified_at, was_fixed = _get_tator_modified_at_datetime(sample)
-        if was_fixed:
-            samples_to_fix_storage.append(sample)
         mod_ts = _normalize_modified_at(modified_at)
         last_ts = _normalize_modified_at(tator_modified_at)
 
@@ -3616,29 +3690,21 @@ def reconcile_dataset_with_tator(
             logger.debug(
                 f"Sample {sample.id} needs update ({reason}): {eid}"
             )
-            samples_to_update.append((sample, loc))
+            _apply_loc_to_sample(
+                sample,
+                loc,
+                api_url=api_url,
+                project_id=project_id,
+                version_id=version_id,
+                media_attributes_map=media_attributes_map,
+            )
+            sample.save()
             updated += 1
+        elif was_fixed:
+            # Persist tator_modified_at normalized from a non-datetime value
+            sample.save()
 
-    # Persist samples whose tator_modified_at was normalized from non-datetime
-    for sample in samples_to_fix_storage:
-        sample.save()
-
-    # Apply current localization data to changed samples and save
-    if samples_to_update:
-        batch_size = 1000
-        for i in range(0, len(samples_to_update), batch_size):
-            batch = samples_to_update[i : i + batch_size]
-            for sample, loc in batch:
-                _apply_loc_to_sample(
-                    sample,
-                    loc,
-                    api_url=api_url,
-                    project_id=project_id,
-                    version_id=version_id,
-                    media_attributes_map=media_attributes_map,
-                )
-                sample.save()
-
+    if updated:
         logger.info(f"Reconcile: updated {updated} samples (box changed)")
 
     # 3. Add new samples (elemental_id in Tator but not in dataset)
@@ -3658,18 +3724,15 @@ def reconcile_dataset_with_tator(
             new_eids = set(new_eids_list)
 
     if new_eids:
-        # Batch create samples for better performance
+        # Only the elemental_ids missing from the dataset are built, so a sync
+        # that was interrupted mid-load resumes with the remainder.
+        logger.info(
+            f"Reconcile: adding {len(new_eids)} new samples "
+            f"({len(dataset_eids)} already in dataset)"
+        )
         added = 0
-        batch_size = 100  # Adjust based on your needs
+        batch_size = _dataset_add_batch_size()
         samples_to_add = []
-
-        # Pre-filter valid media_ids to avoid repeated checks
-        valid_media_ids = set()
-        for eid in new_eids:
-            loc = loc_index[eid]
-            media_id = loc.get("media")
-            if media_id and int(media_id) in media_id_to_stem:
-                valid_media_ids.add(int(media_id))
 
         for eid in new_eids:
             loc = loc_index[eid]
@@ -3709,6 +3772,9 @@ def reconcile_dataset_with_tator(
                 if len(samples_to_add) >= batch_size:
                     dataset.add_samples(samples_to_add)
                     samples_to_add = []
+                    logger.info(
+                        f"Reconcile: added {added}/{len(new_eids)} new samples"
+                    )
 
         # Add any remaining samples
         if samples_to_add:
@@ -3777,7 +3843,6 @@ def build_fiftyone_dataset_from_crops(
         "*.tiff",
     ]
     max_samples = _max_images_limit(config)
-    force_sync = bool(config.get("force_sync"))
     dataset_already_exists = dataset_name in fo.list_datasets()
 
     # Load localizations index by elemental_id
@@ -3821,42 +3886,13 @@ def build_fiftyone_dataset_from_crops(
             candidate_count,
         )
 
-    samples: list = []
-    media_attrs_map = config.get("media_attributes_map") or {}
-    for filepath, elemental_id, media_stem, loc, label in candidates:
-        sample_filepath = _crop_filepath_for_sample(
-            media_stem,
-            elemental_id,
-            crops_dir,
-            s3_bucket=s3_bucket,
-            s3_prefix=s3_prefix,
-        )
-        sample = fo.Sample(filepath=sample_filepath)
-        sample["local_filepath"] = filepath
-        sample["elemental_id"] = elemental_id
-        sample["media_stem"] = media_stem
-        if loc:
-            if not dataset_already_exists or force_sync:
-                _apply_loc_to_sample(
-                    sample,
-                    loc,
-                    api_url=config.get("api_url"),
-                    project_id=config.get("project_id"),
-                    version_id=config.get("version_id"),
-                    media_attributes_map=media_attrs_map,
-                )
-            else:
-                _apply_media_attrs_to_sample(sample, loc, media_attrs_map)
-        else:
-            sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
-        samples.append(sample)
-
-    if not samples:
+    if not candidates:
         raise ValueError(f"No crops found in {crops_dir} (checked {seen} files)")
 
-    logger.info(f"Collected {len(samples)} samples for dataset")
+    logger.info(f"Collected {len(candidates)} crop candidates for dataset")
 
-    # Handle existing dataset: always reconcile, never delete
+    # Existing dataset (including one left partial by an interrupted sync):
+    # reconcile adds only the samples that are missing, never deletes the dataset.
     if dataset_already_exists:
         logger.info(f"Reconcile: loading dataset {dataset_name}...")
         dataset = fo.load_dataset(dataset_name)
@@ -3880,9 +3916,46 @@ def build_fiftyone_dataset_from_crops(
     )
     dataset = fo.Dataset(dataset_name)
     dataset.persistent = True  # Persist dataset in MongoDB after session ends
-    dataset.add_samples(samples)
+    # Build and insert samples a batch at a time so millions of fo.Sample objects
+    # are never held in memory; committed batches survive an interruption and the
+    # next sync resumes through the reconcile path above.
+    media_attrs_map = config.get("media_attributes_map") or {}
+    batch_size = _dataset_add_batch_size()
+    added = 0
+    for start in range(0, len(candidates), batch_size):
+        batch: list = []
+        for filepath, elemental_id, media_stem, loc, label in candidates[
+            start : start + batch_size
+        ]:
+            sample = fo.Sample(
+                filepath=_crop_filepath_for_sample(
+                    media_stem,
+                    elemental_id,
+                    crops_dir,
+                    s3_bucket=s3_bucket,
+                    s3_prefix=s3_prefix,
+                )
+            )
+            sample["local_filepath"] = filepath
+            sample["elemental_id"] = elemental_id
+            sample["media_stem"] = media_stem
+            if loc:
+                _apply_loc_to_sample(
+                    sample,
+                    loc,
+                    api_url=config.get("api_url"),
+                    project_id=config.get("project_id"),
+                    version_id=config.get("version_id"),
+                    media_attributes_map=media_attrs_map,
+                )
+            else:
+                sample["ground_truth"] = fo.Classification(label=label, confidence=1.0)
+            batch.append(sample)
+        dataset.add_samples(batch)
+        added += len(batch)
+        logger.info(f"Dataset '{dataset_name}': added {added}/{len(candidates)} samples")
     _ensure_field_indexes(dataset)
-    logger.info(f"Created dataset '{dataset_name}' with {len(samples)} samples")
+    logger.info(f"Created dataset '{dataset_name}' with {added} samples")
     return dataset
 
 
