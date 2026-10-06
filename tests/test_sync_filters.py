@@ -115,6 +115,19 @@ def test_media_fetch_kwargs_version_and_verified_only_combine():
     }
 
 
+def test_media_fetch_kwargs_include_class():
+    kw = media_fetch_kwargs(
+        version_id=5, verified_only=True, include_class="Larvacean"
+    )
+    assert kw == {
+        "related_attribute": ["$version::5", "verified::true", "Label::Larvacean"],
+    }
+
+
+def test_media_fetch_kwargs_blank_include_class_is_omitted():
+    assert media_fetch_kwargs(include_class="  ") == {}
+
+
 def test_scoped_data_dir_includes_filter_slug(tmp_path):
     path = scoped_data_dir(
         str(tmp_path), 1, 10, section_id=3, query="q"

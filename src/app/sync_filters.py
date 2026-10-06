@@ -109,12 +109,18 @@ def media_fetch_kwargs(
     version_id: int | None = None,
     section_id: int | None = None,
     verified_only: bool = False,
+    include_class: str | None = None,
 ) -> dict:
     """Tator kwargs for media list (version via related_attribute, section).
 
     When verified_only is True, adds `verified::true` to the `related_attribute`
     filter so Tator only returns media with at least one verified localization,
     instead of downloading all media and filtering client-side.
+
+    When include_class is set, adds `Label::{name}` so Tator only returns media
+    that have a localization with that label. Tator ANDs related_attribute
+    values, so a list of labels is queried one name at a time by the caller
+    and the media ids are unioned.
     """
     kw: dict = {}
     related_attribute: list[str] = []
@@ -122,6 +128,9 @@ def media_fetch_kwargs(
         related_attribute.append(f"$version::{version_id}")
     if verified_only:
         related_attribute.append("verified::true")
+    class_name = (include_class or "").strip()
+    if class_name:
+        related_attribute.append(f"{LABEL_ATTR}::{class_name}")
     if related_attribute:
         kw["related_attribute"] = related_attribute
     if section_id is not None:

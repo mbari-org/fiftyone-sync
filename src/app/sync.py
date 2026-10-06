@@ -483,6 +483,43 @@ def _get_localization_count_from_api(
         return None
 
 
+def _list_media_ids(
+    api: Any,
+    project_id: int,
+    kwargs: dict,
+    media_ids_filter: list[int] | None = None,
+) -> list[int]:
+    """Return media ids for one Tator media-list query.
+
+    An explicit id filter is chunked to stay under the nginx request-line limit.
+    Otherwise the list is paged by id so large projects are never returned in
+    one response. Only ids are kept.
+    """
+    if media_ids_filter:
+        chunk = _MAX_SAFE_MEDIA_ID_BATCH_SIZE
+        media_ids: list[int] = []
+        for i in range(0, len(media_ids_filter), chunk):
+            kw = {**kwargs, "media_id": media_ids_filter[i : i + chunk]}
+            media_ids.extend(m.id for m in api.get_media_list(project_id, **kw))
+        return media_ids
+
+    media_ids = []
+    after_id = None
+    while True:
+        kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
+        if after_id is not None:
+            kw["after"] = after_id
+        page = api.get_media_list(project_id, **kw)
+        if not page:
+            break
+        media_ids.extend(m.id for m in page)
+        after_id = page[-1].id
+        if len(page) < _MEDIA_LIST_PAGE_SIZE:
+            break
+        logger.info(f"fetch_project_media_ids: {len(media_ids)} ids so far")
+    return media_ids
+
+
 def fetch_project_media_ids(
     api_url: str,
     token: str,
@@ -491,6 +528,7 @@ def fetch_project_media_ids(
     version_id: int | None = None,
     section_id: int | None = None,
     verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> list[int]:
     """
     Fetch all media in the project. Returns list of media ids.
@@ -500,41 +538,39 @@ def fetch_project_media_ids(
     If verified_only is set, filters media to those with at least one verified
     localization (related_attribute=verified::true) so unverified-only media are
     never fetched or downloaded.
+    If include_classes is set, each label is queried as
+    related_attribute=Label::{name}. Tator ANDs related_attribute values, so
+    labels are requested separately and the ids are unioned (a media matches if
+    it has any of the labels).
     """
+    include_class_list = parse_include_classes(include_classes)
     logger.info(
         f"fetch_project_media_ids: project_id={project_id} filter={media_ids_filter} "
-        f"version_id={version_id} section_id={section_id} verified_only={verified_only}"
+        f"version_id={version_id} section_id={section_id} verified_only={verified_only} "
+        f"include_classes={include_class_list or 'all'}"
     )
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
-    kwargs = _media_fetch_kwargs(
-        version_id=version_id, section_id=section_id, verified_only=verified_only
-    )
-    if media_ids_filter:
-        # Chunk filter to avoid "Request Line is too large" from nginx (e.g. 4094 bytes).
-        chunk = _MAX_SAFE_MEDIA_ID_BATCH_SIZE
-        media_list = []
-        for i in range(0, len(media_ids_filter), chunk):
-            kw = {**kwargs, "media_id": media_ids_filter[i : i + chunk]}
-            media_list.extend(api.get_media_list(project_id, **kw))
-        media_ids = [m.id for m in media_list]
-    else:
-        # Page by id so projects with millions of media are never listed in one
-        # response; only ids are kept, not the Media objects.
-        media_ids = []
-        after_id = None
-        while True:
-            kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
-            if after_id is not None:
-                kw["after"] = after_id
-            page = api.get_media_list(project_id, **kw)
-            if not page:
-                break
-            media_ids.extend(m.id for m in page)
-            after_id = page[-1].id
-            if len(page) < _MEDIA_LIST_PAGE_SIZE:
-                break
-            logger.info(f"fetch_project_media_ids: {len(media_ids)} ids so far")
+    # None means one unfiltered (aside from version/section/verified) query.
+    labels: list[str | None] = include_class_list or [None]
+    seen: set[int] = set()
+    media_ids: list[int] = []
+    for label in labels:
+        kwargs = _media_fetch_kwargs(
+            version_id=version_id,
+            section_id=section_id,
+            verified_only=verified_only,
+            include_class=label,
+        )
+        for mid in _list_media_ids(api, project_id, kwargs, media_ids_filter):
+            if mid not in seen:
+                seen.add(mid)
+                media_ids.append(mid)
+        if len(labels) > 1:
+            logger.info(
+                f"fetch_project_media_ids: label={label} "
+                f"union_count={len(media_ids)}"
+            )
     logger.info(f"Project {project_id} media count: {len(media_ids)}")
     return media_ids
 
@@ -2562,8 +2598,11 @@ def _resolve_localizations_jsonl(
 
     When verified_only is True, media and localization fetches are scoped
     server-side to verified::true so unverified data is never downloaded.
-    When include_classes is set, localization fetches are scoped to those labels
-    and media pre-fetch is skipped so only media that have matching labels are downloaded.
+    When include_classes is set, media ids are queried with
+    related_attribute=Label::{name} (one request per label, unioned) and
+    localization fetches are scoped to those media and labels. An encoded_search
+    query still skips the media pre-fetch, because that filter applies to
+    localizations directly.
     When max_images is set, a previously sampled JSONL whose line count equals
     that cap is treated as a valid cache even if the Tator localization count
     is larger.
@@ -2631,13 +2670,16 @@ def _resolve_localizations_jsonl(
 
     if not use_cached_jsonl:
         loc_media_ids: list[int] | None = None
-        if not has_query and not has_label_filter:
+        skip_loc_fetch = False
+        if not has_query:
             logger.info(
-                "Fetching media IDs... host=%s project_id=%s api_url=%s verified_only=%s",
+                "Fetching media IDs... host=%s project_id=%s api_url=%s "
+                "verified_only=%s include_classes=%s",
                 api_url.rstrip("/"),
                 project_id,
                 api_url,
                 verified_only,
+                include_class_list or "all",
             )
             media_ids_list = fetch_project_media_ids(
                 api_url,
@@ -2646,33 +2688,45 @@ def _resolve_localizations_jsonl(
                 version_id=version_id,
                 section_id=section_id,
                 verified_only=verified_only,
+                include_classes=include_class_list or None,
             )
-            loc_media_ids = media_ids_list or None
+            if has_label_filter and not media_ids_list:
+                # An empty id list means "no media filter" to the localization
+                # fetch. Write an empty JSONL instead of scanning the project.
+                logger.info(
+                    "No media match include_classes=%s; writing empty localization JSONL",
+                    include_class_list,
+                )
+                with open(jsonl_path, "w"):
+                    pass
+                localizations_path = jsonl_path
+                skip_loc_fetch = True
+            else:
+                loc_media_ids = media_ids_list or None
         else:
-            skip_reason = (
-                "include_classes filters localizations by Label"
-                if has_label_filter
-                else "encoded_search query filters localizations directly"
+            logger.info(
+                "Skipping media pre-fetch: encoded_search query filters "
+                "localizations directly"
             )
-            logger.info("Skipping media pre-fetch: %s", skip_reason)
-        logger.info("Fetching localizations...")
-        localizations_path = fetch_and_save_localizations(
-            api,
-            project_id,
-            version_id=version_id,
-            media_ids=loc_media_ids,
-            localization_batch_size=localization_batch_size,
-            media_id_batch_size=media_id_batch_size,
-            section_id=section_id,
-            query=query,
-            localization_type_id=localization_type_id,
-            verified_only=verified_only,
-            include_classes=include_class_list or None,
-        )
-        if (has_query or has_label_filter) and localizations_path:
-            _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
-                localizations_path
+        if not skip_loc_fetch:
+            logger.info("Fetching localizations...")
+            localizations_path = fetch_and_save_localizations(
+                api,
+                project_id,
+                version_id=version_id,
+                media_ids=loc_media_ids,
+                localization_batch_size=localization_batch_size,
+                media_id_batch_size=media_id_batch_size,
+                section_id=section_id,
+                query=query,
+                localization_type_id=localization_type_id,
+                verified_only=verified_only,
+                include_classes=include_class_list or None,
             )
+            if (has_query or has_label_filter) and localizations_path:
+                _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                    localizations_path
+                )
     return (localizations_path, media_ids_list, use_cached_jsonl)
 
 
@@ -2787,7 +2841,8 @@ def _run_crop_pipeline(
     This function is shared by full sync and crop-recompute jobs. When
     verified_only is True, media/localization fetches are scoped server-side
     to verified::true, so unverified media/localizations are never downloaded
-    or cropped. When include_classes is set, only those labels are fetched and cropped.
+    or cropped. When include_classes is set, media ids are limited with
+    related_attribute=Label::{name} and only those labels are fetched and cropped.
     When max_images is set and the localization JSONL exceeds that count, a
     random subset is kept so crop/dataset work cannot balloon past the cap.
     """
