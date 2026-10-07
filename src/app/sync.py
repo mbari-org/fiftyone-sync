@@ -538,10 +538,9 @@ def fetch_project_media_ids(
     If verified_only is set, filters media to those with at least one verified
     localization (related_attribute=verified::true) so unverified-only media are
     never fetched or downloaded.
-    If include_classes is set, each label is queried as
-    related_attribute=Label::{name}. Tator ANDs related_attribute values, so
-    labels are requested separately and the ids are unioned (a media matches if
-    it has any of the labels).
+    If include_classes is set, media are limited with encoded_related_search
+    against related localization Label attributes. Several labels are an `or`
+    inside that one search.
     """
     include_class_list = parse_include_classes(include_classes)
     logger.info(
@@ -551,26 +550,13 @@ def fetch_project_media_ids(
     )
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
-    # None means one unfiltered (aside from version/section/verified) query.
-    labels: list[str | None] = include_class_list or [None]
-    seen: set[int] = set()
-    media_ids: list[int] = []
-    for label in labels:
-        kwargs = _media_fetch_kwargs(
-            version_id=version_id,
-            section_id=section_id,
-            verified_only=verified_only,
-            include_class=label,
-        )
-        for mid in _list_media_ids(api, project_id, kwargs, media_ids_filter):
-            if mid not in seen:
-                seen.add(mid)
-                media_ids.append(mid)
-        if len(labels) > 1:
-            logger.info(
-                f"fetch_project_media_ids: label={label} "
-                f"union_count={len(media_ids)}"
-            )
+    kwargs = _media_fetch_kwargs(
+        version_id=version_id,
+        section_id=section_id,
+        verified_only=verified_only,
+        include_classes=include_class_list or None,
+    )
+    media_ids = _list_media_ids(api, project_id, kwargs, media_ids_filter)
     logger.info(f"Project {project_id} media count: {len(media_ids)}")
     return media_ids
 
@@ -1535,9 +1521,8 @@ def fetch_and_save_localizations(
     If localization_type_id is provided, only localizations of that box type are fetched.
     If verified_only is set, only localizations whose own `verified` attribute is true are
     fetched (attribute=verified::true), so unverified localizations are never downloaded.
-    If include_classes is set, each label is queried as Tator
-    `attribute=Label::{name}`. Tator ANDs attribute filters, so labels are
-    requested separately and the rows are unioned by localization id. Combined
+    If include_classes is set, labels are an encoded_search AttributeOperationSpec
+    on the localization's own Label attribute (`eq`, or `or` of `eq`). Combined
     with verified_only when both are set.
 
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
@@ -1581,29 +1566,22 @@ def fetch_and_save_localizations(
         f"Media ID batches: {len(media_id_batches)} batch(es) of up to {effective_mid_batch}"
     )
 
-    # Tator attribute filters AND, so each label is its own query. None means
-    # one unfiltered (aside from version/section/verified/query) request.
-    labels: list[str | None] = include_class_list or [None]
-
-    def _kw_for(label: str | None) -> dict:
-        return _localization_fetch_kwargs(
-            version_id=version_id,
-            section_id=section_id,
-            query=query,
-            localization_type_id=localization_type_id,
-            verified_only=verified_only,
-            include_class=label,
-        )
+    filter_kw = _localization_fetch_kwargs(
+        version_id=version_id,
+        section_id=section_id,
+        query=query,
+        localization_type_id=localization_type_id,
+        verified_only=verified_only,
+        include_classes=include_class_list or None,
+    )
 
     try:
         loc_count = 0
-        for label in labels:
-            filter_kw = _kw_for(label)
-            for mid_batch in media_id_batches:
-                kw = dict(filter_kw)
-                if mid_batch:
-                    kw["media_id"] = mid_batch
-                loc_count += api.get_localization_count(project_id, **kw)
+        for mid_batch in media_id_batches:
+            kw = dict(filter_kw)
+            if mid_batch:
+                kw["media_id"] = mid_batch
+            loc_count += api.get_localization_count(project_id, **kw)
         logger.info(
             f"get_localization_count(project_id={project_id}, media_ids={bool(media_ids)}, "
             f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}, "
@@ -1628,12 +1606,11 @@ def fetch_and_save_localizations(
         logger.exception(f"get_localization_count failed (will still try list): {e}")
 
     total = 0
-    seen_ids: set[int] = set()
     with open(out_path, "w") as f:
 
-        def _fetch_label(filter_kw: dict) -> int:
-            """Fetch one label (or the unfiltered set) across media batches. Returns rows written."""
-            written = 0
+        def _fetch_all_locs() -> int:
+            """Fetch localizations across all media_id batches, paginating each. Returns count."""
+            fetched = 0
             for bidx, mid_batch in enumerate(media_id_batches):
                 after_id = None
                 while True:
@@ -1647,7 +1624,7 @@ def fetch_and_save_localizations(
                         locs = api.get_localization_list(project_id, **kw)
                     except Exception as e:
                         logger.info(f"get_localization_list failed: {e}")
-                        return written
+                        return fetched
                     if not locs:
                         logger.info(
                             f"Localizations batch empty (media_batch={bidx + 1}, after={after_id}), moving on"
@@ -1656,34 +1633,19 @@ def fetch_and_save_localizations(
                     for loc in locs:
                         try:
                             obj = loc.to_dict() if hasattr(loc, "to_dict") else loc
-                            loc_id = obj.get("id") if isinstance(obj, dict) else None
-                            if loc_id is not None:
-                                loc_id = int(loc_id)
-                                if loc_id in seen_ids:
-                                    continue
                             f.write(json.dumps(obj, default=_json_serial) + "\n")
-                            if loc_id is not None:
-                                seen_ids.add(loc_id)
-                            written += 1
                         except Exception as e:
                             logger.info(f"Skip localization serialization: {e}")
+                    fetched += len(locs)
                     after_id = locs[-1].id if locs else None
                     logger.info(
-                        f"Localizations batch: count={len(locs)} total_so_far={total + written} last_id={after_id}"
+                        f"Localizations batch: count={len(locs)} total_so_far={fetched} last_id={after_id}"
                     )
                     if len(locs) < loc_batch:
                         break
-            return written
+            return fetched
 
-        for label in labels:
-            written = _fetch_label(_kw_for(label))
-            total += written
-            if len(labels) > 1:
-                logger.info(
-                    "fetch_and_save_localizations: label=%s union_count=%s",
-                    label,
-                    total,
-                )
+        total = _fetch_all_locs()
 
     logger.info(f"Fetched {total} localizations -> {out_path}")
     return out_path
@@ -2618,9 +2580,9 @@ def _resolve_localizations_jsonl(
 
     When verified_only is True, media and localization fetches are scoped
     server-side to verified::true so unverified data is never downloaded.
-    When include_classes is set, media ids are queried with
-    related_attribute=Label::{name} (one request per label, unioned) and
-    localization fetches are scoped to those media and labels. An encoded_search
+    When include_classes is set, media ids are queried with encoded_related_search
+    against related localization Label attributes, and localization fetches use
+    the same label set as encoded_search. An encoded_search
     query still skips the media pre-fetch, because that filter applies to
     localizations directly.
     When max_images is set, a previously sampled JSONL whose line count equals
@@ -2862,7 +2824,8 @@ def _run_crop_pipeline(
     verified_only is True, media/localization fetches are scoped server-side
     to verified::true, so unverified media/localizations are never downloaded
     or cropped. When include_classes is set, media ids are limited with
-    related_attribute=Label::{name} and only those labels are fetched and cropped.
+    encoded_related_search on related localization labels, and only those labels
+    are fetched and cropped.
     When max_images is set and the localization JSONL exceeds that count, a
     random subset is kept so crop/dataset work cannot balloon past the cap.
     """

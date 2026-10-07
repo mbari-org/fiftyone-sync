@@ -63,13 +63,16 @@ def test_filter_slug_include_classes():
 
 
 def test_localization_fetch_kwargs_include_class():
+    import base64
+    import json
+
     kw = localization_fetch_kwargs(
-        version_id=3, verified_only=True, include_class="Larvacean"
+        version_id=3, verified_only=True, include_classes=["Larvacean"]
     )
-    assert kw == {
-        "version": [3],
-        "attribute": ["verified::true", "Label::Larvacean"],
-    }
+    assert kw["version"] == [3]
+    assert kw["attribute"] == ["verified::true"]
+    spec = json.loads(base64.b64decode(kw["encoded_search"]))
+    assert spec == {"attribute": "Label", "operation": "eq", "value": "Larvacean"}
 
 
 def test_localization_fetch_kwargs_version_section_query():
@@ -115,17 +118,26 @@ def test_media_fetch_kwargs_version_and_verified_only_combine():
     }
 
 
-def test_media_fetch_kwargs_include_class():
+def test_media_fetch_kwargs_include_classes_uses_related_search():
+    import base64
+    import json
+
     kw = media_fetch_kwargs(
-        version_id=5, verified_only=True, include_class="Larvacean"
+        version_id=5, verified_only=True, include_classes=["Larvacean", "Copepod"]
     )
-    assert kw == {
-        "related_attribute": ["$version::5", "verified::true", "Label::Larvacean"],
+    assert kw["related_attribute"] == ["$version::5", "verified::true"]
+    spec = json.loads(base64.b64decode(kw["encoded_related_search"]))
+    assert spec == {
+        "method": "or",
+        "operations": [
+            {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
+            {"attribute": "Label", "operation": "eq", "value": "Copepod"},
+        ],
     }
 
 
-def test_media_fetch_kwargs_blank_include_class_is_omitted():
-    assert media_fetch_kwargs(include_class="  ") == {}
+def test_media_fetch_kwargs_blank_include_classes_is_omitted():
+    assert media_fetch_kwargs(include_classes=["  "]) == {}
 
 
 def test_scoped_data_dir_includes_filter_slug(tmp_path):

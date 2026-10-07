@@ -2,9 +2,14 @@
 # Filename: tests/test_verified_only_query_filters.py
 # Description: Tests that verified_only and include_classes are pushed into Tator queries.
 
+import base64
 import json
 
 from src.app import sync
+
+
+def _decode_search(value: str) -> dict:
+    return json.loads(base64.b64decode(value))
 
 
 class _FakeMedia:
@@ -185,9 +190,7 @@ def test_resolve_localizations_jsonl_forwards_verified_only(monkeypatch, tmp_pat
     assert captured["loc_kwargs"].get("verified_only") is True
 
 
-def test_fetch_project_media_ids_include_classes_sets_label_related_attribute(
-    monkeypatch,
-):
+def test_fetch_project_media_ids_include_classes_sets_related_search(monkeypatch):
     fake_api = _FakeApi(media_ids=[4, 5])
     monkeypatch.setattr(sync.tator, "get_api", lambda *_a, **_k: fake_api)
 
@@ -199,31 +202,19 @@ def test_fetch_project_media_ids_include_classes_sets_label_related_attribute(
     )
 
     assert media_ids == [4, 5]
-    assert fake_api.get_media_list_calls == [
-        {
-            "related_attribute": ["Label::Larvacean"],
-            "stop": sync._MEDIA_LIST_PAGE_SIZE,
-        }
-    ]
+    assert len(fake_api.get_media_list_calls) == 1
+    call = fake_api.get_media_list_calls[0]
+    assert "related_attribute" not in call
+    assert call["stop"] == sync._MEDIA_LIST_PAGE_SIZE
+    assert _decode_search(call["encoded_related_search"]) == {
+        "attribute": "Label",
+        "operation": "eq",
+        "value": "Larvacean",
+    }
 
 
-def test_fetch_project_media_ids_multiple_labels_are_unioned(monkeypatch):
-    class _LabelApi:
-        def __init__(self):
-            self.calls: list[dict] = []
-
-        def get_media_list(self, project_id, **kwargs):
-            self.calls.append(kwargs)
-            related = kwargs.get("related_attribute") or []
-            if "Label::Larvacean" in related:
-                ids = [1, 2]
-            elif "Label::Copepod" in related:
-                ids = [2, 3]
-            else:
-                ids = []
-            return [_FakeMedia(mid) for mid in ids]
-
-    fake_api = _LabelApi()
+def test_fetch_project_media_ids_multiple_labels_are_one_related_search(monkeypatch):
+    fake_api = _FakeApi(media_ids=[1, 2, 3])
     monkeypatch.setattr(sync.tator, "get_api", lambda *_a, **_k: fake_api)
 
     media_ids = sync.fetch_project_media_ids(
@@ -235,10 +226,16 @@ def test_fetch_project_media_ids_multiple_labels_are_unioned(monkeypatch):
     )
 
     assert media_ids == [1, 2, 3]
-    assert [call["related_attribute"] for call in fake_api.calls] == [
-        ["verified::true", "Label::Larvacean"],
-        ["verified::true", "Label::Copepod"],
-    ]
+    assert len(fake_api.get_media_list_calls) == 1
+    call = fake_api.get_media_list_calls[0]
+    assert call["related_attribute"] == ["verified::true"]
+    assert _decode_search(call["encoded_related_search"]) == {
+        "method": "or",
+        "operations": [
+            {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
+            {"attribute": "Label", "operation": "eq", "value": "Copepod"},
+        ],
+    }
 
 
 def test_fetch_project_media_ids_label_respects_media_id_filter(monkeypatch):
@@ -253,9 +250,11 @@ def test_fetch_project_media_ids_label_respects_media_id_filter(monkeypatch):
         include_classes=["Larvacean"],
     )
 
-    assert fake_api.get_media_list_calls == [
-        {"related_attribute": ["Label::Larvacean"], "media_id": [9, 10]}
-    ]
+    assert len(fake_api.get_media_list_calls) == 1
+    call = fake_api.get_media_list_calls[0]
+    assert call["media_id"] == [9, 10]
+    assert "related_attribute" not in call
+    assert _decode_search(call["encoded_related_search"])["value"] == "Larvacean"
 
 
 def test_resolve_localizations_jsonl_scopes_media_to_include_classes(
@@ -396,9 +395,17 @@ def test_fetch_and_save_localizations_include_classes_sets_label_filter(
         fake_api, project_id=7, include_classes=["Larvacean"]
     )
 
-    assert all(
-        "Label::Larvacean" in (kw.get("attribute") or [])
+    listed = [
+        kw
         for kw in fake_api.get_localization_list_calls
+        if kw.get("after") is None
+    ]
+    assert listed
+    assert all("Label::" not in " ".join(kw.get("attribute") or []) for kw in listed)
+    assert all(
+        _decode_search(kw["encoded_search"])
+        == {"attribute": "Label", "operation": "eq", "value": "Larvacean"}
+        for kw in listed
     )
 
 
@@ -430,18 +437,11 @@ def test_fetch_and_save_localizations_multiple_labels_are_unioned(
             self.get_localization_list_calls.append(kwargs)
             if kwargs.get("after") is not None:
                 return []
-            attrs = kwargs.get("attribute") or []
-            if "Label::Larvacean" in attrs:
-                return [
-                    _LabeledLoc(1, "e1", "Larvacean"),
-                    _LabeledLoc(2, "e-shared", "Larvacean"),
-                ]
-            if "Label::Copepod" in attrs:
-                return [
-                    _LabeledLoc(2, "e-shared", "Larvacean"),
-                    _LabeledLoc(3, "e3", "Copepod"),
-                ]
-            return []
+            return [
+                _LabeledLoc(1, "e1", "Larvacean"),
+                _LabeledLoc(2, "e-shared", "Larvacean"),
+                _LabeledLoc(3, "e3", "Copepod"),
+            ]
 
     fake_api = _LabelLocApi()
     monkeypatch.setattr(
@@ -457,19 +457,16 @@ def test_fetch_and_save_localizations_multiple_labels_are_unioned(
         include_classes=["Larvacean", "Copepod"],
     )
 
-    assert [kw.get("attribute") for kw in fake_api.get_localization_count_calls] == [
-        ["verified::true", "Label::Larvacean"],
-        ["verified::true", "Label::Copepod"],
-    ]
-    listed = [
-        kw.get("attribute")
-        for kw in fake_api.get_localization_list_calls
-        if kw.get("after") is None
-    ]
-    assert listed == [
-        ["verified::true", "Label::Larvacean"],
-        ["verified::true", "Label::Copepod"],
-    ]
+    assert len(fake_api.get_localization_count_calls) == 1
+    count_kw = fake_api.get_localization_count_calls[0]
+    assert count_kw["attribute"] == ["verified::true"]
+    assert _decode_search(count_kw["encoded_search"]) == {
+        "method": "or",
+        "operations": [
+            {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
+            {"attribute": "Label", "operation": "eq", "value": "Copepod"},
+        ],
+    }
     with open(out_path) as f:
         rows = [json.loads(line) for line in f if line.strip()]
     assert [row["id"] for row in rows] == [1, 2, 3]
