@@ -152,6 +152,40 @@ def localization_fetch_kwargs(
     return kw
 
 
+def localization_id_query(
+    *,
+    query: str | None = None,
+    include_classes: list[str] | None = None,
+    media_ids: list[int] | None = None,
+) -> tuple[dict | None, str | None]:
+    """LocalizationIdQuery body for a label-scoped localization list/count.
+
+    Returns (body, leftover_query). The Label AttributeOperationSpec goes in the
+    PUT body as `object_search`, so a long label list never lengthens the URL
+    (nginx caps the request line near 4 KB). A decodable encoded_search query is
+    ANDed into the same object_search; an undecodable one is returned as
+    leftover_query for the encoded_search query param. media_ids also travel in
+    the body, so they need no request-line batching. body is None when there is
+    no label filter.
+    """
+    label_spec = label_attribute_search(include_classes)
+    if not label_spec:
+        return None, (query or "").strip() or None
+    q = (query or "").strip()
+    leftover: str | None = None
+    spec = label_spec
+    if q:
+        existing = _decode_object_search(q)
+        if existing is None:
+            leftover = q
+        else:
+            spec = {"method": "and", "operations": [existing, label_spec]}
+    body: dict = {"object_search": spec}
+    if media_ids:
+        body["media_ids"] = list(media_ids)
+    return body, leftover
+
+
 def media_fetch_kwargs(
     *,
     version_id: int | None = None,

@@ -5,6 +5,7 @@
 from src.app.sync_filters import (
     filter_slug,
     localization_fetch_kwargs,
+    localization_id_query,
     media_fetch_kwargs,
     scoped_data_dir,
 )
@@ -147,3 +148,36 @@ def test_scoped_data_dir_includes_filter_slug(tmp_path):
     assert path == str(
         tmp_path / "data" / "1" / "v10" / filter_slug(section_id=3, query="q")
     )
+
+
+def test_localization_id_query_none_without_labels():
+    assert localization_id_query(query="abc") == (None, "abc")
+    assert localization_id_query() == (None, None)
+
+
+def test_localization_id_query_ands_decodable_query_into_body():
+    from src.app.sync_filters import encode_object_search
+
+    existing = {"attribute": "$frame", "operation": "gt", "value": 10}
+    body, leftover = localization_id_query(
+        query=encode_object_search(existing),
+        include_classes=["Larvacean"],
+        media_ids=[4, 5],
+    )
+    assert leftover is None
+    assert body == {
+        "object_search": {
+            "method": "and",
+            "operations": [
+                existing,
+                {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
+            ],
+        },
+        "media_ids": [4, 5],
+    }
+
+
+def test_localization_id_query_keeps_undecodable_query_as_param():
+    body, leftover = localization_id_query(query="%%%", include_classes=["A"])
+    assert leftover == "%%%"
+    assert body == {"object_search": {"attribute": "Label", "operation": "eq", "value": "A"}}

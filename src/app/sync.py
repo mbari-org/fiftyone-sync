@@ -42,6 +42,7 @@ from src.app.database_manager import (
 from src.app.sync_filters import (
     filter_slug as _filter_slug,
     localization_fetch_kwargs as _localization_fetch_kwargs,
+    localization_id_query as _localization_id_query,
     media_fetch_kwargs as _media_fetch_kwargs,
     parse_include_classes,
     scoped_data_dir,
@@ -1498,6 +1499,89 @@ def save_media_to_tmp(
     return out_dir
 
 
+def _fetch_and_save_label_localizations(
+    api: Any,
+    project_id: int,
+    out_path: str,
+    loc_batch: int,
+    *,
+    version_id: int | None,
+    media_ids: list[int] | None,
+    section_id: int | None,
+    query: str | None,
+    localization_type_id: int | None,
+    verified_only: bool,
+    include_classes: list[str],
+) -> str:
+    """Write label-scoped localizations to out_path via LocalizationList PUT.
+
+    The Label search (and any decodable encoded_search query) is sent as the
+    LocalizationIdQuery `object_search` body, and media_ids, if any, go in the
+    same body. One paged query replaces the media pre-fetch and the
+    150-id media_id batches, and long label lists cannot overflow the URL.
+    """
+    body, leftover_query = _localization_id_query(
+        query=query, include_classes=include_classes, media_ids=media_ids
+    )
+    filter_kw = _localization_fetch_kwargs(
+        version_id=version_id,
+        section_id=section_id,
+        query=leftover_query,
+        localization_type_id=localization_type_id,
+        verified_only=verified_only,
+    )
+    try:
+        loc_count = api.get_localization_count_by_id(
+            project_id, localization_id_query=body, **filter_kw
+        )
+        logger.info(
+            "get_localization_count_by_id(project_id=%s, version=%s, section_id=%s, "
+            "media_ids=%s, include_classes=%s) = %s",
+            project_id,
+            version_id,
+            section_id,
+            len(media_ids or []),
+            include_classes,
+            loc_count,
+        )
+    except Exception:
+        logger.exception("get_localization_count_by_id failed (will still try list)")
+
+    fetched = 0
+    after_id = None
+    with open(out_path, "w") as f:
+        while True:
+            kw = {**filter_kw, "stop": loc_batch}
+            if after_id is not None:
+                kw["after"] = after_id
+            try:
+                locs = api.get_localization_list_by_id(
+                    project_id, localization_id_query=body, **kw
+                )
+            except Exception as e:
+                logger.info(f"get_localization_list_by_id failed: {e}")
+                break
+            locs = list(locs or [])
+            if not locs:
+                break
+            for loc in locs:
+                try:
+                    obj = loc.to_dict() if hasattr(loc, "to_dict") else loc
+                    f.write(json.dumps(obj, default=_json_serial) + "\n")
+                except Exception as e:
+                    logger.info(f"Skip localization serialization: {e}")
+            fetched += len(locs)
+            after_id = locs[-1].id
+            logger.info(
+                f"Label localizations batch: count={len(locs)} total_so_far={fetched} "
+                f"last_id={after_id}"
+            )
+            if len(locs) < loc_batch:
+                break
+    logger.info(f"Fetched {fetched} label-scoped localizations -> {out_path}")
+    return out_path
+
+
 def fetch_and_save_localizations(
     api: Any,
     project_id: int,
@@ -1521,9 +1605,10 @@ def fetch_and_save_localizations(
     If localization_type_id is provided, only localizations of that box type are fetched.
     If verified_only is set, only localizations whose own `verified` attribute is true are
     fetched (attribute=verified::true), so unverified localizations are never downloaded.
-    If include_classes is set, labels are an encoded_search AttributeOperationSpec
-    on the localization's own Label attribute (`eq`, or `or` of `eq`). Combined
-    with verified_only when both are set.
+    If include_classes is set, the Label AttributeOperationSpec (`eq`, or `or` of
+    `eq`) is sent as the LocalizationIdQuery object_search body of a
+    LocalizationList PUT, with media_ids in the same body (no id batching).
+    Combined with verified_only when both are set.
 
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
     414 Request-URI Too Large errors from nginx when the project has many media.
@@ -1552,6 +1637,21 @@ def fetch_and_save_localizations(
     if effective_mid_batch < mid_batch:
         logger.info(
             f"Media ID batch size capped to {effective_mid_batch} (request line limit)"
+        )
+
+    if include_class_list:
+        return _fetch_and_save_label_localizations(
+            api,
+            project_id,
+            out_path,
+            loc_batch,
+            version_id=version_id,
+            media_ids=media_ids,
+            section_id=section_id,
+            query=query,
+            localization_type_id=localization_type_id,
+            verified_only=verified_only,
+            include_classes=include_class_list,
         )
 
     media_id_batches: list[list[int] | None] = (
@@ -2580,11 +2680,12 @@ def _resolve_localizations_jsonl(
 
     When verified_only is True, media and localization fetches are scoped
     server-side to verified::true so unverified data is never downloaded.
-    When include_classes is set, media ids are queried with encoded_related_search
-    against related localization Label attributes, and localization fetches use
-    the same label set as encoded_search. An encoded_search
-    query still skips the media pre-fetch, because that filter applies to
-    localizations directly.
+    When include_classes is set, the media pre-fetch is skipped: localizations
+    are selected directly by a Label object_search (LocalizationIdQuery body), and
+    media ids are taken from the resulting JSONL, so only media that hold a
+    matching localization are ever listed or downloaded. An encoded_search query
+    also skips the media pre-fetch, because that filter applies to localizations
+    directly.
     When max_images is set, a previously sampled JSONL whose line count equals
     that cap is treated as a valid cache even if the Tator localization count
     is larger.
@@ -2652,8 +2753,7 @@ def _resolve_localizations_jsonl(
 
     if not use_cached_jsonl:
         loc_media_ids: list[int] | None = None
-        skip_loc_fetch = False
-        if not has_query:
+        if not has_query and not has_label_filter:
             logger.info(
                 "Fetching media IDs... host=%s project_id=%s api_url=%s "
                 "verified_only=%s include_classes=%s",
@@ -2672,43 +2772,31 @@ def _resolve_localizations_jsonl(
                 verified_only=verified_only,
                 include_classes=include_class_list or None,
             )
-            if has_label_filter and not media_ids_list:
-                # An empty id list means "no media filter" to the localization
-                # fetch. Write an empty JSONL instead of scanning the project.
-                logger.info(
-                    "No media match include_classes=%s; writing empty localization JSONL",
-                    include_class_list,
-                )
-                with open(jsonl_path, "w"):
-                    pass
-                localizations_path = jsonl_path
-                skip_loc_fetch = True
-            else:
-                loc_media_ids = media_ids_list or None
+            loc_media_ids = media_ids_list or None
         else:
             logger.info(
-                "Skipping media pre-fetch: encoded_search query filters "
-                "localizations directly"
+                "Skipping media pre-fetch: %s filters localizations directly; "
+                "media ids come from the localizations",
+                "include_classes" if has_label_filter else "encoded_search query",
             )
-        if not skip_loc_fetch:
-            logger.info("Fetching localizations...")
-            localizations_path = fetch_and_save_localizations(
-                api,
-                project_id,
-                version_id=version_id,
-                media_ids=loc_media_ids,
-                localization_batch_size=localization_batch_size,
-                media_id_batch_size=media_id_batch_size,
-                section_id=section_id,
-                query=query,
-                localization_type_id=localization_type_id,
-                verified_only=verified_only,
-                include_classes=include_class_list or None,
+        logger.info("Fetching localizations...")
+        localizations_path = fetch_and_save_localizations(
+            api,
+            project_id,
+            version_id=version_id,
+            media_ids=loc_media_ids,
+            localization_batch_size=localization_batch_size,
+            media_id_batch_size=media_id_batch_size,
+            section_id=section_id,
+            query=query,
+            localization_type_id=localization_type_id,
+            verified_only=verified_only,
+            include_classes=include_class_list or None,
+        )
+        if (has_query or has_label_filter) and localizations_path:
+            _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
+                localizations_path
             )
-            if (has_query or has_label_filter) and localizations_path:
-                _, media_ids_list = _localizations_jsonl_line_count_and_media_ids(
-                    localizations_path
-                )
     return (localizations_path, media_ids_list, use_cached_jsonl)
 
 

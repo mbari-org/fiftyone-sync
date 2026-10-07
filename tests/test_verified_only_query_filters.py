@@ -41,6 +41,20 @@ class _FakeApi:
             return []
         return list(self.localizations)
 
+    def get_localization_count_by_id(self, project_id, localization_id_query, **kwargs):
+        self.get_localization_count_calls.append(
+            {**kwargs, "localization_id_query": localization_id_query}
+        )
+        return len(self.localizations)
+
+    def get_localization_list_by_id(self, project_id, localization_id_query, **kwargs):
+        self.get_localization_list_calls.append(
+            {**kwargs, "localization_id_query": localization_id_query}
+        )
+        if kwargs.get("after") is not None:
+            return []
+        return list(self.localizations)
+
 
 def test_fetch_project_media_ids_verified_only_sets_related_attribute(monkeypatch):
     fake_api = _FakeApi(media_ids=[1, 2])
@@ -257,19 +271,21 @@ def test_fetch_project_media_ids_label_respects_media_id_filter(monkeypatch):
     assert _decode_search(call["encoded_related_search"])["value"] == "Larvacean"
 
 
-def test_resolve_localizations_jsonl_scopes_media_to_include_classes(
-    monkeypatch, tmp_path
-):
+def test_resolve_include_classes_skips_media_prefetch(monkeypatch, tmp_path):
     captured = {}
 
     def _fake_fetch_project_media_ids(*_args, **kwargs):
-        captured["media_kwargs"] = kwargs
-        return [11, 12]
+        raise AssertionError("label filter should not page media ids")
 
     def _fake_fetch_and_save_localizations(*_args, **kwargs):
         captured["loc_kwargs"] = kwargs
         path = tmp_path / "localizations.jsonl"
-        path.write_text(json.dumps({"elemental_id": "e", "media": 11}) + "\n")
+        path.write_text(
+            json.dumps({"elemental_id": "a", "media": 11})
+            + "\n"
+            + json.dumps({"elemental_id": "b", "media": 12})
+            + "\n"
+        )
         return str(path)
 
     monkeypatch.setattr(
@@ -284,61 +300,24 @@ def test_resolve_localizations_jsonl_scopes_media_to_include_classes(
         lambda *_a, **_k: str(tmp_path / "does_not_exist.jsonl"),
     )
 
-    _path, media_ids, _cached = sync._resolve_localizations_jsonl(
+    _path, media_ids, cached = sync._resolve_localizations_jsonl(
         object(),
         project_id=7,
-        version_id=None,
+        version_id=3,
         api_url="http://tator.example",
         token="tok",
         force_sync=True,
         media_id_batch_size=100,
         localization_batch_size=100,
+        verified_only=True,
         include_classes=["Larvacean"],
     )
 
-    assert captured["media_kwargs"].get("include_classes") == ["Larvacean"]
-    assert captured["loc_kwargs"].get("media_ids") == [11, 12]
+    assert captured["loc_kwargs"].get("media_ids") is None
     assert captured["loc_kwargs"].get("include_classes") == ["Larvacean"]
-    assert media_ids == [11]
-
-
-def test_resolve_writes_empty_jsonl_when_no_media_match_labels(
-    monkeypatch, tmp_path
-):
-    jsonl_path = tmp_path / "localizations.jsonl"
-
-    def _fake_fetch_project_media_ids(*_args, **kwargs):
-        return []
-
-    def _fake_fetch_and_save_localizations(*_args, **kwargs):
-        raise AssertionError("localization fetch should be skipped")
-
-    monkeypatch.setattr(
-        sync, "fetch_project_media_ids", _fake_fetch_project_media_ids
-    )
-    monkeypatch.setattr(
-        sync, "fetch_and_save_localizations", _fake_fetch_and_save_localizations
-    )
-    monkeypatch.setattr(
-        sync, "_localizations_jsonl_path", lambda *_a, **_k: str(jsonl_path)
-    )
-
-    path, media_ids, cached = sync._resolve_localizations_jsonl(
-        object(),
-        project_id=7,
-        version_id=None,
-        api_url="http://tator.example",
-        token="tok",
-        force_sync=True,
-        media_id_batch_size=100,
-        localization_batch_size=100,
-        include_classes=["Nope"],
-    )
-
-    assert path == str(jsonl_path)
-    assert media_ids == []
+    assert captured["loc_kwargs"].get("verified_only") is True
+    assert media_ids == [11, 12]
     assert cached is False
-    assert jsonl_path.read_text() == ""
 
 
 def test_resolve_query_skips_label_media_prefetch(monkeypatch, tmp_path):
@@ -380,8 +359,7 @@ def test_resolve_query_skips_label_media_prefetch(monkeypatch, tmp_path):
 
     assert captured["media_ids"] is None
 
-
-def test_fetch_and_save_localizations_include_classes_sets_label_filter(
+def test_fetch_and_save_localizations_include_classes_puts_label_in_body(
     monkeypatch, tmp_path
 ):
     fake_api = _FakeApi(localizations=[_FakeLoc(1, "eid-larv", True)])
@@ -392,58 +370,42 @@ def test_fetch_and_save_localizations_include_classes_sets_label_filter(
     )
 
     sync.fetch_and_save_localizations(
-        fake_api, project_id=7, include_classes=["Larvacean"]
+        fake_api,
+        project_id=7,
+        version_id=3,
+        media_ids=list(range(1, 501)),
+        include_classes=["Larvacean"],
     )
 
-    listed = [
-        kw
-        for kw in fake_api.get_localization_list_calls
-        if kw.get("after") is None
-    ]
-    assert listed
-    assert all("Label::" not in " ".join(kw.get("attribute") or []) for kw in listed)
-    assert all(
-        _decode_search(kw["encoded_search"])
-        == {"attribute": "Label", "operation": "eq", "value": "Larvacean"}
-        for kw in listed
-    )
+    # One paged PUT query, not one per 150-id media batch.
+    assert len(fake_api.get_localization_count_calls) == 1
+    assert len(fake_api.get_localization_list_calls) == 1
+    for kw in fake_api.get_localization_count_calls + fake_api.get_localization_list_calls:
+        assert "encoded_search" not in kw
+        assert "media_id" not in kw
+        assert kw["version"] == [3]
+        body = kw["localization_id_query"]
+        assert body["object_search"] == {
+            "attribute": "Label",
+            "operation": "eq",
+            "value": "Larvacean",
+        }
+        assert body["media_ids"] == list(range(1, 501))
 
 
-def test_fetch_and_save_localizations_multiple_labels_are_unioned(
+def test_fetch_and_save_localizations_multiple_labels_or_in_body(
     monkeypatch, tmp_path
 ):
     class _LabeledLoc:
-        def __init__(self, loc_id, elemental_id, label):
+        def __init__(self, loc_id, label):
             self.id = loc_id
-            self._data = {
-                "id": loc_id,
-                "elemental_id": elemental_id,
-                "attributes": {"Label": label},
-            }
+            self._data = {"id": loc_id, "attributes": {"Label": label}}
 
         def to_dict(self):
             return self._data
 
-    class _LabelLocApi:
-        def __init__(self):
-            self.get_localization_count_calls: list[dict] = []
-            self.get_localization_list_calls: list[dict] = []
-
-        def get_localization_count(self, project_id, **kwargs):
-            self.get_localization_count_calls.append(kwargs)
-            return 1
-
-        def get_localization_list(self, project_id, **kwargs):
-            self.get_localization_list_calls.append(kwargs)
-            if kwargs.get("after") is not None:
-                return []
-            return [
-                _LabeledLoc(1, "e1", "Larvacean"),
-                _LabeledLoc(2, "e-shared", "Larvacean"),
-                _LabeledLoc(3, "e3", "Copepod"),
-            ]
-
-    fake_api = _LabelLocApi()
+    page = [_LabeledLoc(1, "Larvacean"), _LabeledLoc(2, "Copepod")]
+    fake_api = _FakeApi(localizations=page)
     monkeypatch.setattr(
         sync,
         "_localizations_jsonl_path",
@@ -453,20 +415,24 @@ def test_fetch_and_save_localizations_multiple_labels_are_unioned(
     out_path = sync.fetch_and_save_localizations(
         fake_api,
         project_id=7,
+        localization_batch_size=2,
         verified_only=True,
         include_classes=["Larvacean", "Copepod"],
     )
 
-    assert len(fake_api.get_localization_count_calls) == 1
     count_kw = fake_api.get_localization_count_calls[0]
     assert count_kw["attribute"] == ["verified::true"]
-    assert _decode_search(count_kw["encoded_search"]) == {
+    assert "media_ids" not in count_kw["localization_id_query"]
+    assert count_kw["localization_id_query"]["object_search"] == {
         "method": "or",
         "operations": [
             {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
             {"attribute": "Label", "operation": "eq", "value": "Copepod"},
         ],
     }
+    # A full page triggers a second page request with `after`.
+    afters = [kw.get("after") for kw in fake_api.get_localization_list_calls]
+    assert afters == [None, 2]
     with open(out_path) as f:
         rows = [json.loads(line) for line in f if line.strip()]
-    assert [row["id"] for row in rows] == [1, 2, 3]
+    assert [row["id"] for row in rows] == [1, 2]
