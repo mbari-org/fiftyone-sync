@@ -191,6 +191,30 @@ max_samples: 500                         # optional: random subsample if the exp
 
 The FiftyOne dataset name defaults to `project_name_v{version_id}_{port}` and cannot be set in the config file. Override it with the `dataset_name` query param or the applet **Dataset name** field.
 
+### Mounted image storage
+
+When image media are served by an nginx host whose files are also mounted on the sync
+host/container, add a global `mounts` list so they are read in place instead of
+downloaded:
+
+```yaml
+mounts:
+  - name: "image"                         # label used in logs
+    path: "/mnt/DeepSea-AI"               # local mount point
+    host: "https://cortex.shore.mbari.org" # URL host to match (scheme/default port ignored)
+    nginx_root: "/DeepSea-AI"             # URL path prefix that maps onto `path`
+```
+
+For each image media, the source URL (Tator `media_files.image[].path`, or a `source_url`
+attribute) is matched against each mount: `https://cortex.shore.mbari.org/DeepSea-AI/a/b.png`
+resolves to `/mnt/DeepSea-AI/a/b.png`. If that file exists it is cropped directly from the
+mount — nothing is downloaded or copied into the download directory. Otherwise the media
+falls back to the normal Tator download. Query strings (e.g. presign signatures) are ignored,
+URL-encoded characters are decoded, and paths that would escape the mount are rejected.
+Only images are resolved; videos always download. Remember to mount `path` into the
+container (e.g. `-v /mnt/DeepSea-AI:/mnt/DeepSea-AI:ro`). Each batch logs how many images
+were read from mounts.
+
 ### Near-duplicate and low-quality sample removal (CleanVision)
 
 Datasets built from Tator crops often contain near duplicates (successive video frames,

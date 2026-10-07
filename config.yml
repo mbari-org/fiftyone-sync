@@ -7,6 +7,17 @@ localization_batch_size: 10000
 # The FiftyOne app URL is always taken directly from FIFTYONE_APP_PUBLIC_BASE_URL (no port suffix).
 is_enterprise: true
 
+# Locally mounted image storage. Image media whose source URL (Tator media_files.image
+# path) is served from `host` under `nginx_root` are read in place from `path` instead of
+# being downloaded, e.g. https://cortex.shore.mbari.org/DeepSea-AI/a/b.png ->
+# /mnt/DeepSea-AI/a/b.png. If the file is not found there, the normal download is used.
+# Images only; videos always download. The container must have `path` mounted.
+mounts:
+  - name: "image"
+    path: "/mnt/DeepSea-AI"
+    host: "https://cortex.shore.mbari.org"
+    nginx_root: "/DeepSea-AI"
+
 embeddings:
   embeddings_field: "embeddings"
   # base brain key; UMAP is stored under `${brain_key}_umap`

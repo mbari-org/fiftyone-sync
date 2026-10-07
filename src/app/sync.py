@@ -31,6 +31,7 @@ import tator
 import yaml
 from PIL import Image
 from src.app.database_uri_config import database_name_from_uri
+from src.app.media_mounts import resolve_media_local_path
 from src.app.database_manager import (
     get_database_entry_or_enterprise_default,
     get_database_name,
@@ -1787,6 +1788,7 @@ def crop_localizations_parallel(
     max_workers: int | None = None,
     locs_to_crop: list[dict] | None = None,
     media_objects: list[Any] | None = None,
+    local_image_paths: dict[int, str] | None = None,
 ) -> tuple[int, int]:
     """
     Crop localizations from their media in parallel using PIL.
@@ -1802,6 +1804,9 @@ def crop_localizations_parallel(
     When locs_to_crop is provided, only those localizations are cropped (cache-miss
     optimization). Otherwise falls back to reading all localizations from the JSONL.
     media_objects: Tator Media list for cache-miss media; used for stems/fps metadata.
+    local_image_paths: media_id -> absolute image path on a configured mount (see
+    media_mounts). Read in place, never copied; the crop stem still follows the
+    ``{media_id}_{Media.name}`` convention so cached crops stay valid.
 
     Returns (num_cropped, num_failed).
     """
@@ -1869,6 +1874,12 @@ def crop_localizations_parallel(
                 local_video_misses += 1
         elif mid in media_id_to_image_path:
             media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+
+    for mid, local in (local_image_paths or {}).items():
+        mid = int(mid)
+        media_id_to_image_path[mid] = Path(local)
+        name = getattr(media_id_to_media.get(mid), "name", "") or Path(local).name
+        media_id_to_stem[mid] = Path(f"{mid}_{name}").stem
 
     if local_video_misses:
         logger.info(
@@ -2083,13 +2094,34 @@ def _download_and_crop_one_media(
     crops_dir: str,
     dl_dir: str,
     size: int,
+    mounted_ids: list[int] | None = None,
 ) -> tuple[int, Any | None, int, int]:
     """Download (if resolved), crop, and immediately delete a single media's
     downloaded file to reclaim disk space.
 
+    When the image's source URL maps onto a configured mount (config ``mounts``)
+    and the file exists there, it is cropped in place: nothing is downloaded or
+    copied into the download dir. Otherwise falls back to the Tator download.
+    mounted_ids, when given, collects the ids served from a mount (for logging).
+
     Runs on a worker thread from the image download pool in
     _download_and_crop_media_sequentially. Returns (mid, media_obj, num_ok, num_fail).
     """
+    local_path = resolve_media_local_path(media_obj) if media_obj is not None else None
+    if local_path:
+        logger.debug("Media id=%s read from mount: %s", mid, local_path)
+        if mounted_ids is not None:
+            mounted_ids.append(mid)
+        ok, fail = crop_localizations_parallel(
+            dl_dir,
+            localizations_path,
+            crops_dir,
+            size=size,
+            locs_to_crop=locs_for_media,
+            media_objects=[media_obj],
+            local_image_paths={mid: local_path},
+        )
+        return mid, media_obj, ok, fail
     if media_obj is not None:
         save_media_to_tmp(api, project_id, [media_obj], media_ids_filter={mid})
     ok, fail = crop_localizations_parallel(
@@ -2184,12 +2216,13 @@ def _download_and_crop_media_sequentially(
         )
         completed = 0
         log_interval = max(1, len(image_work) // 10)
+        mounted_ids: list[int] = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
                 ex.submit(
                     _download_and_crop_one_media,
                     api, project_id, mid, media_obj, locs_for_media,
-                    localizations_path, crops_dir, dl_dir, size,
+                    localizations_path, crops_dir, dl_dir, size, mounted_ids,
                 ): mid
                 for mid, media_obj, locs_for_media in image_work
             }
@@ -2211,6 +2244,11 @@ def _download_and_crop_media_sequentially(
                     logger.info(
                         "Image download/crop progress: %s/%s", completed, len(image_work)
                     )
+        if mounted_ids:
+            logger.info(
+                "%s/%s image media read in place from configured mounts (not downloaded)",
+                len(mounted_ids), len(image_work),
+            )
 
     if video_work:
         logger.info(
