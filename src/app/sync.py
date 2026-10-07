@@ -1535,9 +1535,10 @@ def fetch_and_save_localizations(
     If localization_type_id is provided, only localizations of that box type are fetched.
     If verified_only is set, only localizations whose own `verified` attribute is true are
     fetched (attribute=verified::true), so unverified localizations are never downloaded.
-    If include_classes is set, localizations are restricted to those labels.
-    A single label is applied as Tator `attribute=Label::{name}`; multiple labels
-    are filtered after fetch. Combined with verified_only when both are set.
+    If include_classes is set, each label is queried as Tator
+    `attribute=Label::{name}`. Tator ANDs attribute filters, so labels are
+    requested separately and the rows are unioned by localization id. Combined
+    with verified_only when both are set.
 
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
     414 Request-URI Too Large errors from nginx when the project has many media.
@@ -1580,27 +1581,33 @@ def fetch_and_save_localizations(
         f"Media ID batches: {len(media_id_batches)} batch(es) of up to {effective_mid_batch}"
     )
 
-    # Tator attribute filters AND, so only a single Label can be pushed server-side.
-    include_class = include_class_list[0] if len(include_class_list) == 1 else None
-    filter_kw = _localization_fetch_kwargs(
-        version_id=version_id,
-        section_id=section_id,
-        query=query,
-        localization_type_id=localization_type_id,
-        verified_only=verified_only,
-        include_class=include_class,
-    )
+    # Tator attribute filters AND, so each label is its own query. None means
+    # one unfiltered (aside from version/section/verified/query) request.
+    labels: list[str | None] = include_class_list or [None]
+
+    def _kw_for(label: str | None) -> dict:
+        return _localization_fetch_kwargs(
+            version_id=version_id,
+            section_id=section_id,
+            query=query,
+            localization_type_id=localization_type_id,
+            verified_only=verified_only,
+            include_class=label,
+        )
 
     try:
         loc_count = 0
-        for mid_batch in media_id_batches:
-            kw = dict(filter_kw)
-            if mid_batch:
-                kw["media_id"] = mid_batch
-            loc_count += api.get_localization_count(project_id, **kw)
+        for label in labels:
+            filter_kw = _kw_for(label)
+            for mid_batch in media_id_batches:
+                kw = dict(filter_kw)
+                if mid_batch:
+                    kw["media_id"] = mid_batch
+                loc_count += api.get_localization_count(project_id, **kw)
         logger.info(
             f"get_localization_count(project_id={project_id}, media_ids={bool(media_ids)}, "
-            f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}) = {loc_count}"
+            f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}, "
+            f"include_classes={include_class_list or 'all'}) = {loc_count}"
         )
         if loc_count == 0 and version_id is not None and not include_class_list:
             count_no_ver = 0
@@ -1621,11 +1628,12 @@ def fetch_and_save_localizations(
         logger.exception(f"get_localization_count failed (will still try list): {e}")
 
     total = 0
+    seen_ids: set[int] = set()
     with open(out_path, "w") as f:
 
-        def _fetch_all_locs() -> int:
-            """Fetch localizations across all media_id batches, paginating each. Returns count."""
-            fetched = 0
+        def _fetch_label(filter_kw: dict) -> int:
+            """Fetch one label (or the unfiltered set) across media batches. Returns rows written."""
+            written = 0
             for bidx, mid_batch in enumerate(media_id_batches):
                 after_id = None
                 while True:
@@ -1639,7 +1647,7 @@ def fetch_and_save_localizations(
                         locs = api.get_localization_list(project_id, **kw)
                     except Exception as e:
                         logger.info(f"get_localization_list failed: {e}")
-                        return fetched
+                        return written
                     if not locs:
                         logger.info(
                             f"Localizations batch empty (media_batch={bidx + 1}, after={after_id}), moving on"
@@ -1648,22 +1656,34 @@ def fetch_and_save_localizations(
                     for loc in locs:
                         try:
                             obj = loc.to_dict() if hasattr(loc, "to_dict") else loc
+                            loc_id = obj.get("id") if isinstance(obj, dict) else None
+                            if loc_id is not None:
+                                loc_id = int(loc_id)
+                                if loc_id in seen_ids:
+                                    continue
                             f.write(json.dumps(obj, default=_json_serial) + "\n")
+                            if loc_id is not None:
+                                seen_ids.add(loc_id)
+                            written += 1
                         except Exception as e:
                             logger.info(f"Skip localization serialization: {e}")
-                    fetched += len(locs)
                     after_id = locs[-1].id if locs else None
                     logger.info(
-                        f"Localizations batch: count={len(locs)} total_so_far={fetched} last_id={after_id}"
+                        f"Localizations batch: count={len(locs)} total_so_far={total + written} last_id={after_id}"
                     )
                     if len(locs) < loc_batch:
                         break
-            return fetched
+            return written
 
-        total = _fetch_all_locs()
-
-    if len(include_class_list) > 1:
-        total = _filter_jsonl_include_classes(out_path, include_class_list)
+        for label in labels:
+            written = _fetch_label(_kw_for(label))
+            total += written
+            if len(labels) > 1:
+                logger.info(
+                    "fetch_and_save_localizations: label=%s union_count=%s",
+                    label,
+                    total,
+                )
 
     logger.info(f"Fetched {total} localizations -> {out_path}")
     return out_path

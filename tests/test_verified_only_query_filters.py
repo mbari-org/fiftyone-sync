@@ -400,3 +400,76 @@ def test_fetch_and_save_localizations_include_classes_sets_label_filter(
         "Label::Larvacean" in (kw.get("attribute") or [])
         for kw in fake_api.get_localization_list_calls
     )
+
+
+def test_fetch_and_save_localizations_multiple_labels_are_unioned(
+    monkeypatch, tmp_path
+):
+    class _LabeledLoc:
+        def __init__(self, loc_id, elemental_id, label):
+            self.id = loc_id
+            self._data = {
+                "id": loc_id,
+                "elemental_id": elemental_id,
+                "attributes": {"Label": label},
+            }
+
+        def to_dict(self):
+            return self._data
+
+    class _LabelLocApi:
+        def __init__(self):
+            self.get_localization_count_calls: list[dict] = []
+            self.get_localization_list_calls: list[dict] = []
+
+        def get_localization_count(self, project_id, **kwargs):
+            self.get_localization_count_calls.append(kwargs)
+            return 1
+
+        def get_localization_list(self, project_id, **kwargs):
+            self.get_localization_list_calls.append(kwargs)
+            if kwargs.get("after") is not None:
+                return []
+            attrs = kwargs.get("attribute") or []
+            if "Label::Larvacean" in attrs:
+                return [
+                    _LabeledLoc(1, "e1", "Larvacean"),
+                    _LabeledLoc(2, "e-shared", "Larvacean"),
+                ]
+            if "Label::Copepod" in attrs:
+                return [
+                    _LabeledLoc(2, "e-shared", "Larvacean"),
+                    _LabeledLoc(3, "e3", "Copepod"),
+                ]
+            return []
+
+    fake_api = _LabelLocApi()
+    monkeypatch.setattr(
+        sync,
+        "_localizations_jsonl_path",
+        lambda *_a, **_k: str(tmp_path / "localizations.jsonl"),
+    )
+
+    out_path = sync.fetch_and_save_localizations(
+        fake_api,
+        project_id=7,
+        verified_only=True,
+        include_classes=["Larvacean", "Copepod"],
+    )
+
+    assert [kw.get("attribute") for kw in fake_api.get_localization_count_calls] == [
+        ["verified::true", "Label::Larvacean"],
+        ["verified::true", "Label::Copepod"],
+    ]
+    listed = [
+        kw.get("attribute")
+        for kw in fake_api.get_localization_list_calls
+        if kw.get("after") is None
+    ]
+    assert listed == [
+        ["verified::true", "Label::Larvacean"],
+        ["verified::true", "Label::Copepod"],
+    ]
+    with open(out_path) as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    assert [row["id"] for row in rows] == [1, 2, 3]
