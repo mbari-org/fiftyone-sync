@@ -504,7 +504,12 @@ def _list_media_ids(
             media_ids.extend(m.id for m in api.get_media_list(project_id, **kw))
         return media_ids
 
-    media_ids = []
+    return [m.id for m in _list_media(api, project_id, kwargs)]
+
+
+def _list_media(api: Any, project_id: int, kwargs: dict) -> list[Any]:
+    """Page one Tator media-list query by id and return the Media objects."""
+    media: list[Any] = []
     after_id = None
     while True:
         kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
@@ -513,12 +518,12 @@ def _list_media_ids(
         page = api.get_media_list(project_id, **kw)
         if not page:
             break
-        media_ids.extend(m.id for m in page)
+        media.extend(page)
         after_id = page[-1].id
         if len(page) < _MEDIA_LIST_PAGE_SIZE:
             break
-        logger.info(f"fetch_project_media_ids: {len(media_ids)} ids so far")
-    return media_ids
+        logger.info(f"media list: {len(media)} media so far")
+    return media
 
 
 def fetch_project_media_ids(
@@ -851,6 +856,9 @@ def _append_classification_localizations_to_jsonl(
     localizations_path: str,
     media_id_batch_size: int,
     section_id: int | None = None,
+    version_id: int | None = None,
+    verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> int:
     """
     Append synthetic full-frame localizations for labeled Image media to the JSONL.
@@ -858,18 +866,38 @@ def _append_classification_localizations_to_jsonl(
     Detection localizations are written first (by _resolve_localizations_jsonl);
     this adds one whole-image classification sample per labeled Image media, so a
     project that is both classification and detection yields both kinds of
-    samples, each identified by its own elemental_id. Media labels are not
-    versioned, so all project (section-scoped) media are considered. Returns the
+    samples, each identified by its own elemental_id.
+
+    Media are selected server-side by Image type, section, version (related
+    $version), the media's own verified attribute, and the media's own Label
+    (include_classes), so only matching media are listed. The listed Media
+    objects are used directly instead of being fetched again by id. Returns the
     number of classification localizations appended.
     """
-    media_ids = fetch_project_media_ids(
-        api_url, token, project_id, section_id=section_id
+    image_type_id, _ = _get_image_media_type_and_attr_names(api, project_id)
+    kwargs = _media_fetch_kwargs(
+        version_id=version_id,
+        section_id=section_id,
+        verified_only=verified_only,
+        include_classes=parse_include_classes(include_classes) or None,
+        media_labels=True,
     )
-    if not media_ids:
+    if image_type_id is not None:
+        kwargs["type"] = image_type_id
+    logger.info(
+        "Classification media query: project_id=%s version_id=%s section_id=%s "
+        "verified_only=%s include_classes=%s type=%s",
+        project_id,
+        version_id,
+        section_id,
+        verified_only,
+        include_classes or "all",
+        image_type_id,
+    )
+    media_objects = _list_media(api, project_id, kwargs)
+    logger.info("Classification media matched: %s", len(media_objects))
+    if not media_objects:
         return 0
-    media_objects = get_media_chunked(
-        api, project_id, media_ids, media_id_batch_size=media_id_batch_size
-    )
     return fetch_and_save_classification_localizations(
         api,
         project_id,
@@ -2974,6 +3002,9 @@ def _run_crop_pipeline(
                 localizations_path=localizations_path,
                 media_id_batch_size=media_id_batch_size,
                 section_id=section_id,
+                version_id=version_id,
+                verified_only=verified_only,
+                include_classes=include_class_list or None,
             )
             if added:
                 # The combined JSONL now differs from the detection-only file, so

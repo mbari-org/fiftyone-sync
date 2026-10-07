@@ -237,6 +237,7 @@ def test_run_crop_pipeline_appends_classification_for_labeled_project(
 
     def _fake_append(*_a, **kwargs):
         appended["path"] = kwargs.get("localizations_path")
+        appended["version_id"] = kwargs.get("version_id")
         return 3
 
     monkeypatch.setattr(
@@ -273,3 +274,56 @@ def test_run_crop_pipeline_appends_classification_for_labeled_project(
     )
     assert out["status"] == "ok"
     assert appended.get("path") == str(localizations)
+    assert appended.get("version_id") == 42
+
+
+def test_append_classification_scopes_media_query(monkeypatch, tmp_path):
+    import base64
+
+    calls = []
+
+    class _Api:
+        def get_media_list(self, project_id, **kwargs):
+            calls.append(kwargs)
+            return [SimpleNamespace(id=5)]
+
+    written = {}
+
+    def _fake_write(_api, _pid, media_objects, **kwargs):
+        written["ids"] = [m.id for m in media_objects]
+        return len(media_objects)
+
+    monkeypatch.setattr(
+        sync, "_get_image_media_type_and_attr_names", lambda _a, _p: (55, ["Label"])
+    )
+    monkeypatch.setattr(sync, "fetch_and_save_classification_localizations", _fake_write)
+    monkeypatch.setattr(
+        sync,
+        "get_media_chunked",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no refetch by id")),
+    )
+
+    added = sync._append_classification_localizations_to_jsonl(
+        _Api(),
+        project_id=12,
+        api_url="http://t",
+        token="x",
+        localizations_path=str(tmp_path / "l.jsonl"),
+        media_id_batch_size=100,
+        section_id=542,
+        version_id=128,
+        include_classes=["acantharia"],
+    )
+
+    assert added == 1
+    assert written["ids"] == [5]
+    kw = calls[0]
+    assert kw["related_attribute"] == ["$version::128"]
+    assert kw["section"] == 542
+    assert kw["type"] == 55
+    assert "encoded_related_search" not in kw
+    assert json.loads(base64.b64decode(kw["encoded_search"])) == {
+        "attribute": "Label",
+        "operation": "eq",
+        "value": "acantharia",
+    }

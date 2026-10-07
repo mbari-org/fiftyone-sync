@@ -192,8 +192,13 @@ def media_fetch_kwargs(
     section_id: int | None = None,
     verified_only: bool = False,
     include_classes: list[str] | None = None,
+    media_labels: bool = False,
 ) -> dict:
     """Tator kwargs for media list (version via related_attribute, section).
+
+    media_labels=True is for classification media, whose Label and verified are
+    the media's own attributes: labels go in encoded_search and verified in
+    `attribute`, while version still filters on related metadata.
 
     When verified_only is True, adds `verified::true` to the `related_attribute`
     filter so Tator only returns media with at least one verified localization,
@@ -210,12 +215,16 @@ def media_fetch_kwargs(
     if version_id is not None:
         related_attribute.append(f"$version::{version_id}")
     if verified_only:
-        related_attribute.append("verified::true")
+        if media_labels:
+            kw["attribute"] = ["verified::true"]
+        else:
+            related_attribute.append("verified::true")
     if related_attribute:
         kw["related_attribute"] = related_attribute
     label_spec = label_attribute_search(include_classes)
     if label_spec:
-        kw["encoded_related_search"] = encode_object_search(label_spec)
+        key = "encoded_search" if media_labels else "encoded_related_search"
+        kw[key] = encode_object_search(label_spec)
     if section_id is not None:
         kw["section"] = section_id
     return kw

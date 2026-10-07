@@ -181,3 +181,16 @@ def test_localization_id_query_keeps_undecodable_query_as_param():
     body, leftover = localization_id_query(query="%%%", include_classes=["A"])
     assert leftover == "%%%"
     assert body == {"object_search": {"attribute": "Label", "operation": "eq", "value": "A"}}
+
+
+def test_media_fetch_kwargs_media_labels_use_own_attributes():
+    import base64
+    import json
+
+    kw = media_fetch_kwargs(
+        version_id=128, verified_only=True, include_classes=["A"], media_labels=True
+    )
+    assert kw["related_attribute"] == ["$version::128"]
+    assert kw["attribute"] == ["verified::true"]
+    assert "encoded_related_search" not in kw
+    assert json.loads(base64.b64decode(kw["encoded_search"]))["value"] == "A"
