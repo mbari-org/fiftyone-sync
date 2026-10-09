@@ -31,6 +31,7 @@ import tator
 import yaml
 from PIL import Image
 from src.app.database_uri_config import database_name_from_uri
+from src.app.media_mounts import resolve_media_local_path
 from src.app.database_manager import (
     get_database_entry_or_enterprise_default,
     get_database_name,
@@ -42,6 +43,7 @@ from src.app.database_manager import (
 from src.app.sync_filters import (
     filter_slug as _filter_slug,
     localization_fetch_kwargs as _localization_fetch_kwargs,
+    localization_id_query as _localization_id_query,
     media_fetch_kwargs as _media_fetch_kwargs,
     parse_include_classes,
     scoped_data_dir,
@@ -483,6 +485,48 @@ def _get_localization_count_from_api(
         return None
 
 
+def _list_media_ids(
+    api: Any,
+    project_id: int,
+    kwargs: dict,
+    media_ids_filter: list[int] | None = None,
+) -> list[int]:
+    """Return media ids for one Tator media-list query.
+
+    An explicit id filter is chunked to stay under the nginx request-line limit.
+    Otherwise the list is paged by id so large projects are never returned in
+    one response. Only ids are kept.
+    """
+    if media_ids_filter:
+        chunk = _MAX_SAFE_MEDIA_ID_BATCH_SIZE
+        media_ids: list[int] = []
+        for i in range(0, len(media_ids_filter), chunk):
+            kw = {**kwargs, "media_id": media_ids_filter[i : i + chunk]}
+            media_ids.extend(m.id for m in api.get_media_list(project_id, **kw))
+        return media_ids
+
+    return [m.id for m in _list_media(api, project_id, kwargs)]
+
+
+def _list_media(api: Any, project_id: int, kwargs: dict) -> list[Any]:
+    """Page one Tator media-list query by id and return the Media objects."""
+    media: list[Any] = []
+    after_id = None
+    while True:
+        kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
+        if after_id is not None:
+            kw["after"] = after_id
+        page = api.get_media_list(project_id, **kw)
+        if not page:
+            break
+        media.extend(page)
+        after_id = page[-1].id
+        if len(page) < _MEDIA_LIST_PAGE_SIZE:
+            break
+        logger.info(f"media list: {len(media)} media so far")
+    return media
+
+
 def fetch_project_media_ids(
     api_url: str,
     token: str,
@@ -491,6 +535,7 @@ def fetch_project_media_ids(
     version_id: int | None = None,
     section_id: int | None = None,
     verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> list[int]:
     """
     Fetch all media in the project. Returns list of media ids.
@@ -500,41 +545,25 @@ def fetch_project_media_ids(
     If verified_only is set, filters media to those with at least one verified
     localization (related_attribute=verified::true) so unverified-only media are
     never fetched or downloaded.
+    If include_classes is set, media are limited with encoded_related_search
+    against related localization Label attributes. Several labels are an `or`
+    inside that one search.
     """
+    include_class_list = parse_include_classes(include_classes)
     logger.info(
         f"fetch_project_media_ids: project_id={project_id} filter={media_ids_filter} "
-        f"version_id={version_id} section_id={section_id} verified_only={verified_only}"
+        f"version_id={version_id} section_id={section_id} verified_only={verified_only} "
+        f"include_classes={include_class_list or 'all'}"
     )
     host = api_url.rstrip("/")
     api = tator.get_api(host, token)
     kwargs = _media_fetch_kwargs(
-        version_id=version_id, section_id=section_id, verified_only=verified_only
+        version_id=version_id,
+        section_id=section_id,
+        verified_only=verified_only,
+        include_classes=include_class_list or None,
     )
-    if media_ids_filter:
-        # Chunk filter to avoid "Request Line is too large" from nginx (e.g. 4094 bytes).
-        chunk = _MAX_SAFE_MEDIA_ID_BATCH_SIZE
-        media_list = []
-        for i in range(0, len(media_ids_filter), chunk):
-            kw = {**kwargs, "media_id": media_ids_filter[i : i + chunk]}
-            media_list.extend(api.get_media_list(project_id, **kw))
-        media_ids = [m.id for m in media_list]
-    else:
-        # Page by id so projects with millions of media are never listed in one
-        # response; only ids are kept, not the Media objects.
-        media_ids = []
-        after_id = None
-        while True:
-            kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
-            if after_id is not None:
-                kw["after"] = after_id
-            page = api.get_media_list(project_id, **kw)
-            if not page:
-                break
-            media_ids.extend(m.id for m in page)
-            after_id = page[-1].id
-            if len(page) < _MEDIA_LIST_PAGE_SIZE:
-                break
-            logger.info(f"fetch_project_media_ids: {len(media_ids)} ids so far")
+    media_ids = _list_media_ids(api, project_id, kwargs, media_ids_filter)
     logger.info(f"Project {project_id} media count: {len(media_ids)}")
     return media_ids
 
@@ -828,6 +857,9 @@ def _append_classification_localizations_to_jsonl(
     localizations_path: str,
     media_id_batch_size: int,
     section_id: int | None = None,
+    version_id: int | None = None,
+    verified_only: bool = False,
+    include_classes: list[str] | None = None,
 ) -> int:
     """
     Append synthetic full-frame localizations for labeled Image media to the JSONL.
@@ -835,18 +867,38 @@ def _append_classification_localizations_to_jsonl(
     Detection localizations are written first (by _resolve_localizations_jsonl);
     this adds one whole-image classification sample per labeled Image media, so a
     project that is both classification and detection yields both kinds of
-    samples, each identified by its own elemental_id. Media labels are not
-    versioned, so all project (section-scoped) media are considered. Returns the
+    samples, each identified by its own elemental_id.
+
+    Media are selected server-side by Image type, section, version (related
+    $version), the media's own verified attribute, and the media's own Label
+    (include_classes), so only matching media are listed. The listed Media
+    objects are used directly instead of being fetched again by id. Returns the
     number of classification localizations appended.
     """
-    media_ids = fetch_project_media_ids(
-        api_url, token, project_id, section_id=section_id
+    image_type_id, _ = _get_image_media_type_and_attr_names(api, project_id)
+    kwargs = _media_fetch_kwargs(
+        version_id=version_id,
+        section_id=section_id,
+        verified_only=verified_only,
+        include_classes=parse_include_classes(include_classes) or None,
+        media_labels=True,
     )
-    if not media_ids:
+    if image_type_id is not None:
+        kwargs["type"] = image_type_id
+    logger.info(
+        "Classification media query: project_id=%s version_id=%s section_id=%s "
+        "verified_only=%s include_classes=%s type=%s",
+        project_id,
+        version_id,
+        section_id,
+        verified_only,
+        include_classes or "all",
+        image_type_id,
+    )
+    media_objects = _list_media(api, project_id, kwargs)
+    logger.info("Classification media matched: %s", len(media_objects))
+    if not media_objects:
         return 0
-    media_objects = get_media_chunked(
-        api, project_id, media_ids, media_id_batch_size=media_id_batch_size
-    )
     return fetch_and_save_classification_localizations(
         api,
         project_id,
@@ -1476,6 +1528,89 @@ def save_media_to_tmp(
     return out_dir
 
 
+def _fetch_and_save_label_localizations(
+    api: Any,
+    project_id: int,
+    out_path: str,
+    loc_batch: int,
+    *,
+    version_id: int | None,
+    media_ids: list[int] | None,
+    section_id: int | None,
+    query: str | None,
+    localization_type_id: int | None,
+    verified_only: bool,
+    include_classes: list[str],
+) -> str:
+    """Write label-scoped localizations to out_path via LocalizationList PUT.
+
+    The Label search (and any decodable encoded_search query) is sent as the
+    LocalizationIdQuery `object_search` body, and media_ids, if any, go in the
+    same body. One paged query replaces the media pre-fetch and the
+    150-id media_id batches, and long label lists cannot overflow the URL.
+    """
+    body, leftover_query = _localization_id_query(
+        query=query, include_classes=include_classes, media_ids=media_ids
+    )
+    filter_kw = _localization_fetch_kwargs(
+        version_id=version_id,
+        section_id=section_id,
+        query=leftover_query,
+        localization_type_id=localization_type_id,
+        verified_only=verified_only,
+    )
+    try:
+        loc_count = api.get_localization_count_by_id(
+            project_id, localization_id_query=body, **filter_kw
+        )
+        logger.info(
+            "get_localization_count_by_id(project_id=%s, version=%s, section_id=%s, "
+            "media_ids=%s, include_classes=%s) = %s",
+            project_id,
+            version_id,
+            section_id,
+            len(media_ids or []),
+            include_classes,
+            loc_count,
+        )
+    except Exception:
+        logger.exception("get_localization_count_by_id failed (will still try list)")
+
+    fetched = 0
+    after_id = None
+    with open(out_path, "w") as f:
+        while True:
+            kw = {**filter_kw, "stop": loc_batch}
+            if after_id is not None:
+                kw["after"] = after_id
+            try:
+                locs = api.get_localization_list_by_id(
+                    project_id, localization_id_query=body, **kw
+                )
+            except Exception as e:
+                logger.info(f"get_localization_list_by_id failed: {e}")
+                break
+            locs = list(locs or [])
+            if not locs:
+                break
+            for loc in locs:
+                try:
+                    obj = loc.to_dict() if hasattr(loc, "to_dict") else loc
+                    f.write(json.dumps(obj, default=_json_serial) + "\n")
+                except Exception as e:
+                    logger.info(f"Skip localization serialization: {e}")
+            fetched += len(locs)
+            after_id = locs[-1].id
+            logger.info(
+                f"Label localizations batch: count={len(locs)} total_so_far={fetched} "
+                f"last_id={after_id}"
+            )
+            if len(locs) < loc_batch:
+                break
+    logger.info(f"Fetched {fetched} label-scoped localizations -> {out_path}")
+    return out_path
+
+
 def fetch_and_save_localizations(
     api: Any,
     project_id: int,
@@ -1499,9 +1634,10 @@ def fetch_and_save_localizations(
     If localization_type_id is provided, only localizations of that box type are fetched.
     If verified_only is set, only localizations whose own `verified` attribute is true are
     fetched (attribute=verified::true), so unverified localizations are never downloaded.
-    If include_classes is set, localizations are restricted to those labels.
-    A single label is applied as Tator `attribute=Label::{name}`; multiple labels
-    are filtered after fetch. Combined with verified_only when both are set.
+    If include_classes is set, the Label AttributeOperationSpec (`eq`, or `or` of
+    `eq`) is sent as the LocalizationIdQuery object_search body of a
+    LocalizationList PUT, with media_ids in the same body (no id batching).
+    Combined with verified_only when both are set.
 
     Batch sizes are from config (media_id_batch_size, localization_batch_size) or fallbacks to avoid
     414 Request-URI Too Large errors from nginx when the project has many media.
@@ -1532,6 +1668,21 @@ def fetch_and_save_localizations(
             f"Media ID batch size capped to {effective_mid_batch} (request line limit)"
         )
 
+    if include_class_list:
+        return _fetch_and_save_label_localizations(
+            api,
+            project_id,
+            out_path,
+            loc_batch,
+            version_id=version_id,
+            media_ids=media_ids,
+            section_id=section_id,
+            query=query,
+            localization_type_id=localization_type_id,
+            verified_only=verified_only,
+            include_classes=include_class_list,
+        )
+
     media_id_batches: list[list[int] | None] = (
         [
             media_ids[i : i + effective_mid_batch]
@@ -1544,15 +1695,13 @@ def fetch_and_save_localizations(
         f"Media ID batches: {len(media_id_batches)} batch(es) of up to {effective_mid_batch}"
     )
 
-    # Tator attribute filters AND, so only a single Label can be pushed server-side.
-    include_class = include_class_list[0] if len(include_class_list) == 1 else None
     filter_kw = _localization_fetch_kwargs(
         version_id=version_id,
         section_id=section_id,
         query=query,
         localization_type_id=localization_type_id,
         verified_only=verified_only,
-        include_class=include_class,
+        include_classes=include_class_list or None,
     )
 
     try:
@@ -1564,7 +1713,8 @@ def fetch_and_save_localizations(
             loc_count += api.get_localization_count(project_id, **kw)
         logger.info(
             f"get_localization_count(project_id={project_id}, media_ids={bool(media_ids)}, "
-            f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}) = {loc_count}"
+            f"version={version_id}, section_id={section_id}, query={'set' if (query or '').strip() else 'none'}, "
+            f"include_classes={include_class_list or 'all'}) = {loc_count}"
         )
         if loc_count == 0 and version_id is not None and not include_class_list:
             count_no_ver = 0
@@ -1626,9 +1776,6 @@ def fetch_and_save_localizations(
 
         total = _fetch_all_locs()
 
-    if len(include_class_list) > 1:
-        total = _filter_jsonl_include_classes(out_path, include_class_list)
-
     logger.info(f"Fetched {total} localizations -> {out_path}")
     return out_path
 
@@ -1641,6 +1788,7 @@ def crop_localizations_parallel(
     max_workers: int | None = None,
     locs_to_crop: list[dict] | None = None,
     media_objects: list[Any] | None = None,
+    local_image_paths: dict[int, str] | None = None,
 ) -> tuple[int, int]:
     """
     Crop localizations from their media in parallel using PIL.
@@ -1656,6 +1804,9 @@ def crop_localizations_parallel(
     When locs_to_crop is provided, only those localizations are cropped (cache-miss
     optimization). Otherwise falls back to reading all localizations from the JSONL.
     media_objects: Tator Media list for cache-miss media; used for stems/fps metadata.
+    local_image_paths: media_id -> absolute image path on a configured mount (see
+    media_mounts). Read in place, never copied; the crop stem still follows the
+    ``{media_id}_{Media.name}`` convention so cached crops stay valid.
 
     Returns (num_cropped, num_failed).
     """
@@ -1723,6 +1874,12 @@ def crop_localizations_parallel(
                 local_video_misses += 1
         elif mid in media_id_to_image_path:
             media_id_to_stem[mid] = media_id_to_image_path[mid].stem
+
+    for mid, local in (local_image_paths or {}).items():
+        mid = int(mid)
+        media_id_to_image_path[mid] = Path(local)
+        name = getattr(media_id_to_media.get(mid), "name", "") or Path(local).name
+        media_id_to_stem[mid] = Path(f"{mid}_{name}").stem
 
     if local_video_misses:
         logger.info(
@@ -1937,13 +2094,34 @@ def _download_and_crop_one_media(
     crops_dir: str,
     dl_dir: str,
     size: int,
+    mounted_ids: list[int] | None = None,
 ) -> tuple[int, Any | None, int, int]:
     """Download (if resolved), crop, and immediately delete a single media's
     downloaded file to reclaim disk space.
 
+    When the image's source URL maps onto a configured mount (config ``mounts``)
+    and the file exists there, it is cropped in place: nothing is downloaded or
+    copied into the download dir. Otherwise falls back to the Tator download.
+    mounted_ids, when given, collects the ids served from a mount (for logging).
+
     Runs on a worker thread from the image download pool in
     _download_and_crop_media_sequentially. Returns (mid, media_obj, num_ok, num_fail).
     """
+    local_path = resolve_media_local_path(media_obj) if media_obj is not None else None
+    if local_path:
+        logger.debug("Media id=%s read from mount: %s", mid, local_path)
+        if mounted_ids is not None:
+            mounted_ids.append(mid)
+        ok, fail = crop_localizations_parallel(
+            dl_dir,
+            localizations_path,
+            crops_dir,
+            size=size,
+            locs_to_crop=locs_for_media,
+            media_objects=[media_obj],
+            local_image_paths={mid: local_path},
+        )
+        return mid, media_obj, ok, fail
     if media_obj is not None:
         save_media_to_tmp(api, project_id, [media_obj], media_ids_filter={mid})
     ok, fail = crop_localizations_parallel(
@@ -2038,12 +2216,13 @@ def _download_and_crop_media_sequentially(
         )
         completed = 0
         log_interval = max(1, len(image_work) // 10)
+        mounted_ids: list[int] = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
                 ex.submit(
                     _download_and_crop_one_media,
                     api, project_id, mid, media_obj, locs_for_media,
-                    localizations_path, crops_dir, dl_dir, size,
+                    localizations_path, crops_dir, dl_dir, size, mounted_ids,
                 ): mid
                 for mid, media_obj, locs_for_media in image_work
             }
@@ -2065,6 +2244,11 @@ def _download_and_crop_media_sequentially(
                     logger.info(
                         "Image download/crop progress: %s/%s", completed, len(image_work)
                     )
+        if mounted_ids:
+            logger.info(
+                "%s/%s image media read in place from configured mounts (not downloaded)",
+                len(mounted_ids), len(image_work),
+            )
 
     if video_work:
         logger.info(
@@ -2562,8 +2746,12 @@ def _resolve_localizations_jsonl(
 
     When verified_only is True, media and localization fetches are scoped
     server-side to verified::true so unverified data is never downloaded.
-    When include_classes is set, localization fetches are scoped to those labels
-    and media pre-fetch is skipped so only media that have matching labels are downloaded.
+    When include_classes is set, the media pre-fetch is skipped: localizations
+    are selected directly by a Label object_search (LocalizationIdQuery body), and
+    media ids are taken from the resulting JSONL, so only media that hold a
+    matching localization are ever listed or downloaded. An encoded_search query
+    also skips the media pre-fetch, because that filter applies to localizations
+    directly.
     When max_images is set, a previously sampled JSONL whose line count equals
     that cap is treated as a valid cache even if the Tator localization count
     is larger.
@@ -2633,11 +2821,13 @@ def _resolve_localizations_jsonl(
         loc_media_ids: list[int] | None = None
         if not has_query and not has_label_filter:
             logger.info(
-                "Fetching media IDs... host=%s project_id=%s api_url=%s verified_only=%s",
+                "Fetching media IDs... host=%s project_id=%s api_url=%s "
+                "verified_only=%s include_classes=%s",
                 api_url.rstrip("/"),
                 project_id,
                 api_url,
                 verified_only,
+                include_class_list or "all",
             )
             media_ids_list = fetch_project_media_ids(
                 api_url,
@@ -2646,15 +2836,15 @@ def _resolve_localizations_jsonl(
                 version_id=version_id,
                 section_id=section_id,
                 verified_only=verified_only,
+                include_classes=include_class_list or None,
             )
             loc_media_ids = media_ids_list or None
         else:
-            skip_reason = (
-                "include_classes filters localizations by Label"
-                if has_label_filter
-                else "encoded_search query filters localizations directly"
+            logger.info(
+                "Skipping media pre-fetch: %s filters localizations directly; "
+                "media ids come from the localizations",
+                "include_classes" if has_label_filter else "encoded_search query",
             )
-            logger.info("Skipping media pre-fetch: %s", skip_reason)
         logger.info("Fetching localizations...")
         localizations_path = fetch_and_save_localizations(
             api,
@@ -2787,7 +2977,9 @@ def _run_crop_pipeline(
     This function is shared by full sync and crop-recompute jobs. When
     verified_only is True, media/localization fetches are scoped server-side
     to verified::true, so unverified media/localizations are never downloaded
-    or cropped. When include_classes is set, only those labels are fetched and cropped.
+    or cropped. When include_classes is set, media ids are limited with
+    encoded_related_search on related localization labels, and only those labels
+    are fetched and cropped.
     When max_images is set and the localization JSONL exceeds that count, a
     random subset is kept so crop/dataset work cannot balloon past the cap.
     """
@@ -2848,6 +3040,9 @@ def _run_crop_pipeline(
                 localizations_path=localizations_path,
                 media_id_batch_size=media_id_batch_size,
                 section_id=section_id,
+                version_id=version_id,
+                verified_only=verified_only,
+                include_classes=include_class_list or None,
             )
             if added:
                 # The combined JSONL now differs from the detection-only file, so
