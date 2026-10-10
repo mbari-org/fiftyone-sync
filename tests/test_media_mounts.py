@@ -125,3 +125,17 @@ def test_unmounted_image_falls_back_to_download(tmp_path, monkeypatch):
     media = _media(8, "x.png", "https://elsewhere.org/x.png")
     sync._download_and_crop_one_media(None, 1, 8, media, [{"elemental_id": "e"}], "", "c", str(tmp_path), 32)
     assert calls == [1]
+
+
+def test_image_locs_with_frame_zero_not_logged_as_video_skips(tmp_path, caplog):
+    dl = tmp_path / "downloads"
+    dl.mkdir()
+    Image.new("RGB", (50, 50)).save(dl / "5_img.jpg")
+    loc = {"elemental_id": "e5", "media": 5, "frame": 0,
+           "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+    with caplog.at_level("INFO", logger="src.app.sync"):
+        ok, fail = sync.crop_localizations_parallel(
+            str(dl), "", str(tmp_path / "crops"), size=32, locs_to_crop=[loc]
+        )
+    assert (ok, fail) == (1, 0)
+    assert "Skipping video crops" not in caplog.text

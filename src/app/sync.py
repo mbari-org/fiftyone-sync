@@ -1933,8 +1933,13 @@ def crop_localizations_parallel(
     skipped_video_media = 0
     for mid, locs in locs_by_media.items():
         if mid not in media_id_to_video_path:
-            # Only log/track skips for media that look like video (frame present)
-            if any(loc.get("frame") is not None for loc in locs):
+            # Only count genuine video misses: image localizations also carry
+            # frame=0, so skip media handled as images or known not to be video.
+            media = media_id_to_media.get(mid)
+            known_image = mid in media_id_to_image_path or (
+                media is not None and not _is_video_name(getattr(media, "name", "") or "")
+            )
+            if not known_image and any(loc.get("frame") is not None for loc in locs):
                 skipped_video_media += 1
             continue
         video_path = media_id_to_video_path[mid]
