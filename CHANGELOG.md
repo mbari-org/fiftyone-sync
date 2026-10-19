@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.17.0 (2026-10-19)
+
+### Features
+
+- **app**: Read mounted images in place and scope syncs by label (#45)
+  ([#45](https://github.com/mbari-org/fiftyone-sync/pull/45),
+  [`5c6e32e`](https://github.com/mbari-org/fiftyone-sync/commit/5c6e32ed14b0978d4d54cc69ba93eeaf17d38fe3))
+
+
 ## v0.16.0 (2026-10-06)
 
 ### Features
