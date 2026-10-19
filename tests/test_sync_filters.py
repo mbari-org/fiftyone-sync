@@ -5,6 +5,7 @@
 from src.app.sync_filters import (
     filter_slug,
     localization_fetch_kwargs,
+    localization_id_query,
     media_fetch_kwargs,
     scoped_data_dir,
 )
@@ -63,13 +64,16 @@ def test_filter_slug_include_classes():
 
 
 def test_localization_fetch_kwargs_include_class():
+    import base64
+    import json
+
     kw = localization_fetch_kwargs(
-        version_id=3, verified_only=True, include_class="Larvacean"
+        version_id=3, verified_only=True, include_classes=["Larvacean"]
     )
-    assert kw == {
-        "version": [3],
-        "attribute": ["verified::true", "Label::Larvacean"],
-    }
+    assert kw["version"] == [3]
+    assert kw["attribute"] == ["verified::true"]
+    spec = json.loads(base64.b64decode(kw["encoded_search"]))
+    assert spec == {"attribute": "Label", "operation": "eq", "value": "Larvacean"}
 
 
 def test_localization_fetch_kwargs_version_section_query():
@@ -115,6 +119,28 @@ def test_media_fetch_kwargs_version_and_verified_only_combine():
     }
 
 
+def test_media_fetch_kwargs_include_classes_uses_related_search():
+    import base64
+    import json
+
+    kw = media_fetch_kwargs(
+        version_id=5, verified_only=True, include_classes=["Larvacean", "Copepod"]
+    )
+    assert kw["related_attribute"] == ["$version::5", "verified::true"]
+    spec = json.loads(base64.b64decode(kw["encoded_related_search"]))
+    assert spec == {
+        "method": "or",
+        "operations": [
+            {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
+            {"attribute": "Label", "operation": "eq", "value": "Copepod"},
+        ],
+    }
+
+
+def test_media_fetch_kwargs_blank_include_classes_is_omitted():
+    assert media_fetch_kwargs(include_classes=["  "]) == {}
+
+
 def test_scoped_data_dir_includes_filter_slug(tmp_path):
     path = scoped_data_dir(
         str(tmp_path), 1, 10, section_id=3, query="q"
@@ -122,3 +148,49 @@ def test_scoped_data_dir_includes_filter_slug(tmp_path):
     assert path == str(
         tmp_path / "data" / "1" / "v10" / filter_slug(section_id=3, query="q")
     )
+
+
+def test_localization_id_query_none_without_labels():
+    assert localization_id_query(query="abc") == (None, "abc")
+    assert localization_id_query() == (None, None)
+
+
+def test_localization_id_query_ands_decodable_query_into_body():
+    from src.app.sync_filters import encode_object_search
+
+    existing = {"attribute": "$frame", "operation": "gt", "value": 10}
+    body, leftover = localization_id_query(
+        query=encode_object_search(existing),
+        include_classes=["Larvacean"],
+        media_ids=[4, 5],
+    )
+    assert leftover is None
+    assert body == {
+        "object_search": {
+            "method": "and",
+            "operations": [
+                existing,
+                {"attribute": "Label", "operation": "eq", "value": "Larvacean"},
+            ],
+        },
+        "media_ids": [4, 5],
+    }
+
+
+def test_localization_id_query_keeps_undecodable_query_as_param():
+    body, leftover = localization_id_query(query="%%%", include_classes=["A"])
+    assert leftover == "%%%"
+    assert body == {"object_search": {"attribute": "Label", "operation": "eq", "value": "A"}}
+
+
+def test_media_fetch_kwargs_media_labels_use_own_attributes():
+    import base64
+    import json
+
+    kw = media_fetch_kwargs(
+        version_id=128, verified_only=True, include_classes=["A"], media_labels=True
+    )
+    assert kw["related_attribute"] == ["$version::128"]
+    assert kw["attribute"] == ["verified::true"]
+    assert "encoded_related_search" not in kw
+    assert json.loads(base64.b64decode(kw["encoded_search"]))["value"] == "A"

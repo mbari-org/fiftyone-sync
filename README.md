@@ -100,6 +100,7 @@ flowchart TD
 
 - **Resumable, batched media loading**: Re-running an interrupted sync skips media whose crops are already on disk and adds only the samples missing from a partially loaded dataset. Media download and dataset inserts run in batches (`FIFTYONE_SYNC_MEDIA_DOWNLOAD_BATCH`, `FIFTYONE_SYNC_DATASET_ADD_BATCH`) so syncs with millions of media stay memory-bounded. See [docs/USAGE.md](docs/USAGE.md#data-layout).
 
+- **Mounted image storage**: A global `mounts` list in `config.yml` maps image URLs (`host` + `nginx_root`) onto a local path (e.g. `/mnt/DeepSea-AI`). Matching images are cropped in place — no download and no copy into the download folder — with automatic fallback to the Tator download when the file is not on the mount. See [docs/USAGE.md](docs/USAGE.md#mounted-image-storage).
 - **Sync size cap**: Set `FIFTYONE_SYNC_MAX_IMAGES` (or config `max_samples`) to randomly subsample oversized Tator exports before cropping and dataset build, avoiding OOM on huge versions. See [docs/USAGE.md](docs/USAGE.md#sync-and-fiftyone-dataset).
 
 - **Sync queue (Redis)**: Background worker: `python -m src.app.sync_worker`. Env: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_USE_SSL`, or `REDIS_URL`.

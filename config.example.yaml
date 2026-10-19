@@ -38,3 +38,12 @@ projects:
 #     near_duplicates:
 #       hash_size: 8
 #       hash_type: phash
+#
+# Optional: read image media in place from a local mount instead of downloading.
+# A media URL https://cortex.shore.mbari.org/DeepSea-AI/a/b.png resolves to
+# /mnt/DeepSea-AI/a/b.png; falls back to download when the file is missing.
+# mounts:
+#   - name: "image"
+#     path: "/mnt/DeepSea-AI"
+#     host: "https://cortex.shore.mbari.org"
+#     nginx_root: "/DeepSea-AI"
