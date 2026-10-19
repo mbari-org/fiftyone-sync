@@ -2471,13 +2471,12 @@ def _s3_crops_prefix(
     return f"{base}/{path}" if base else path
 
 
-def _sync_local_dir_with_s3(
+def _push_local_dir_to_s3(
     local_dir: str, bucket: str, prefix: str | None = None
 ) -> None:
     """
-    Two-way sync between a local directory and S3. Ensures the bucket exists.
-    First pulls from S3 to local, then pushes from local to S3 (both via `aws s3 sync`
-    when available, otherwise boto3 for upload and list_objects_v2 + download for pull).
+    Push a local directory to S3 (one-way, local -> S3). Ensures the bucket exists.
+    Uses `aws s3 sync` when available, otherwise boto3 uploads.
     """
     prefix = (prefix or "").strip().rstrip("/")
     s3_uri = f"s3://{bucket}/{prefix}/" if prefix else f"s3://{bucket}/"
@@ -2487,16 +2486,6 @@ def _sync_local_dir_with_s3(
     os.makedirs(local_dir, exist_ok=True)
 
     try:
-        # 1. Pull: S3 -> local (so local has any files that exist only on S3)
-        logger.info(f"Running aws s3 sync (pull): {s3_uri} -> {local_dir}...")
-        subprocess.run(
-            ["aws", "s3", "sync", s3_uri, local_dir, "--only-show-errors"],
-            check=True,
-            capture_output=True,
-            timeout=3600,
-        )
-        logger.info(f"S3 pull completed: {s3_uri} -> {local_dir}")
-        # 2. Push: local -> S3
         logger.info(f"Running aws s3 sync (push): {local_dir} -> {s3_uri}...")
         subprocess.run(
             ["aws", "s3", "sync", local_dir, s3_uri, "--only-show-errors"],
@@ -2506,29 +2495,11 @@ def _sync_local_dir_with_s3(
         )
         logger.info(f"S3 push completed: {local_dir} -> {s3_uri}")
     except FileNotFoundError:
-        logger.info("aws CLI not found; using boto3 for two-way S3 sync")
+        logger.info("aws CLI not found; using boto3 for S3 upload")
         try:
             import boto3
 
             client = boto3.client("s3")
-            # 1. Pull: list and download from S3 into local_dir
-            paginator = client.get_paginator("list_objects_v2")
-            prefix_slash = f"{prefix}/" if prefix else ""
-            downloaded = 0
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix_slash):
-                for obj in page.get("Contents") or []:
-                    key = obj["Key"]
-                    if key.endswith("/"):
-                        continue
-                    rel = key[len(prefix_slash) :] if prefix_slash else key
-                    local_path = os.path.join(local_dir, rel.replace("/", os.sep))
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    client.download_file(bucket, key, local_path)
-                    downloaded += 1
-            logger.info(
-                f"S3 pull completed via boto3: {downloaded} file(s) {s3_uri} -> {local_dir}"
-            )
-            # 2. Push: upload local files to S3
             uploaded = 0
             for root, _dirs, files in os.walk(local_dir):
                 for f in files:
@@ -2542,7 +2513,7 @@ def _sync_local_dir_with_s3(
                 f"S3 push completed via boto3: {uploaded} file(s) {local_dir} -> {s3_uri}"
             )
         except Exception as e:
-            logger.exception(f"S3 sync failed: {e}")
+            logger.exception(f"S3 upload failed: {e}")
             raise
     except subprocess.CalledProcessError as e:
         logger.exception(f"aws s3 sync failed: {e}")
@@ -3214,7 +3185,7 @@ def _run_crop_pipeline(
         )
 
         if s3_bucket and os.path.isdir(crops):
-            _sync_local_dir_with_s3(crops, s3_bucket, s3_crops_prefix)
+            _push_local_dir_to_s3(crops, s3_bucket, s3_crops_prefix)
 
         _cleanup_download_dir(project_id)
         return {
