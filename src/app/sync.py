@@ -494,7 +494,7 @@ def _list_media_ids(
     """Return media ids for one Tator media-list query.
 
     An explicit id filter is chunked to stay under the nginx request-line limit.
-    Otherwise the list is paged by id so large projects are never returned in
+    Otherwise the list is paged by offset so large projects are never returned in
     one response. Only ids are kept.
     """
     if media_ids_filter:
@@ -509,18 +509,31 @@ def _list_media_ids(
 
 
 def _list_media(api: Any, project_id: int, kwargs: dict) -> list[Any]:
-    """Page one Tator media-list query by id and return the Media objects."""
+    """Page one Tator media-list query by offset and return the Media objects.
+
+    Pages use start/stop offsets over the query's own result order. The `after`
+    id cursor must not be used here: Tator returns media sorted by name, not
+    id, so `after=<last id on the page>` (an id > X filter) silently drops every
+    remaining media whose id is lower than that last one. Single-page queries
+    were unaffected, which is why small (e.g. verified-only) syncs were complete
+    while large unfiltered ones lost most of their media and localizations.
+    Ids are de-duplicated in case the order shifts between pages.
+    """
     media: list[Any] = []
-    after_id = None
+    seen_ids: set[int] = set()
+    start = 0
     while True:
-        kw = {**kwargs, "stop": _MEDIA_LIST_PAGE_SIZE}
-        if after_id is not None:
-            kw["after"] = after_id
+        kw = {**kwargs, "stop": start + _MEDIA_LIST_PAGE_SIZE}
+        if start:
+            kw["start"] = start
         page = api.get_media_list(project_id, **kw)
         if not page:
             break
-        media.extend(page)
-        after_id = page[-1].id
+        for m in page:
+            if m.id not in seen_ids:
+                seen_ids.add(m.id)
+                media.append(m)
+        start += len(page)
         if len(page) < _MEDIA_LIST_PAGE_SIZE:
             break
         logger.info(f"media list: {len(media)} media so far")
