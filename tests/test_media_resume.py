@@ -20,13 +20,16 @@ class _PagedMediaApi:
         self.calls: list[dict] = []
 
     def get_media_list(self, project_id, **kwargs):
+        # Mirrors Tator: results keep the server's order (by name, not id),
+        # `after` is an id > X filter, and start/stop are absolute offsets.
         self.calls.append(kwargs)
         after = kwargs.get("after")
         remaining = [i for i in self.ids if after is None or i > after]
-        return [SimpleNamespace(id=i) for i in remaining[: kwargs["stop"]]]
+        start = kwargs.get("start", 0)
+        return [SimpleNamespace(id=i) for i in remaining[start : kwargs["stop"]]]
 
 
-def test_fetch_project_media_ids_paginates_with_after(monkeypatch):
+def test_fetch_project_media_ids_paginates_by_offset(monkeypatch):
     api = _PagedMediaApi(list(range(1, 6)))
     monkeypatch.setattr(sync.tator, "get_api", lambda *_a, **_k: api)
     monkeypatch.setattr(sync, "_MEDIA_LIST_PAGE_SIZE", 2)
@@ -34,7 +37,23 @@ def test_fetch_project_media_ids_paginates_with_after(monkeypatch):
     ids = sync.fetch_project_media_ids("http://tator.example", "tok", project_id=7)
 
     assert ids == [1, 2, 3, 4, 5]
-    assert [c.get("after") for c in api.calls] == [None, 2, 4]
+    assert [(c.get("start"), c["stop"]) for c in api.calls] == [
+        (None, 2),
+        (2, 4),
+        (4, 6),
+    ]
+    assert all("after" not in c for c in api.calls)
+
+
+def test_fetch_project_media_ids_keeps_media_when_not_sorted_by_id(monkeypatch):
+    # Name order != id order: an `after=<last id>` cursor would drop 2 and 3.
+    api = _PagedMediaApi([10, 2, 7, 3, 5])
+    monkeypatch.setattr(sync.tator, "get_api", lambda *_a, **_k: api)
+    monkeypatch.setattr(sync, "_MEDIA_LIST_PAGE_SIZE", 2)
+
+    ids = sync.fetch_project_media_ids("http://tator.example", "tok", project_id=7)
+
+    assert sorted(ids) == [2, 3, 5, 7, 10]
 
 
 def test_save_png_atomic_leaves_no_partial_file(tmp_path, monkeypatch):
