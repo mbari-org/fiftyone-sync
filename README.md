@@ -33,19 +33,24 @@ flowchart TD
         API["FastAPI\nmain.py"]
         Launcher["Launcher Template\nlauncher_template.py"]
         EmbedSvc["Embedding Service\nembedding_service.py"]
-        DBMgr["Database Manager\ndatabase_manager.py"]
+        DBMgr["Database Manager\ndatabase_manager.py\ndatabase_uri_config.py"]
         SyncQueue["Sync Queue\nsync_queue.py"]
-        SyncWorker["Sync Worker\nsync_worker.py"]
-        SyncLogic["Sync Logic\nsync.py"]
+        SyncLock["Sync Lock\nsync_lock.py"]
+        SyncWorker["Sync Worker (RQ)\nsync_worker.py"]
+        SyncLogic["Sync Logic\nsync.py + sync_filters.py"]
+        Mounts["Media Mounts\nmedia_mounts.py"]
+        EmbViz["Embeddings / UMAP\nembeddings_viz.py"]
+        CleanVision["CleanVision Filter\ncleanvision_filter.py"]
     end
 
     subgraph ExternalServices["External Services"]
         Tator["Tator REST API"]
-        FastVSS["Fast-VSS\n(Embedding Service)\nport 8000"]
-        Redis["Redis\n(Job Queue)"]
-        MongoDB["MongoDB\n(FiftyOne DB)"]
-        FOApp["FiftyOne App\n(port 515x per project)"]
-        S3["AWS S3\n(optional crop storage)"]
+        FastVSS["Fast-VSS\n(Embedding Service)"]
+        Redis["Redis\n(Job Queue + Locks)"]
+        MongoDB["MongoDB\n(FiftyOne DB per project)"]
+        FOApp["FiftyOne App\n(FIFTYONE_APP_PUBLIC_BASE_URL)"]
+        MountFS["Mounted Media Storage\n(read in place)"]
+        S3["AWS S3\n(optional crop push)"]
     end
 
     %% Tator fetches the launcher template
@@ -53,31 +58,43 @@ flowchart TD
     API --> Launcher
 
     %% User interactions
-    UI -->|"GET /launch\nGET /versions\nPOST /sync\nPOST /sync-to-tator"| API
+    UI -->|"POST /sync\nPOST /sync-to-tator\nPOST /dimreduce\nPOST /recompute-crops"| API
+    UI -->|"GET /versions /sections\n/localization-types /datasets\n/vss-projects /vss-embedding"| API
+    UI -->|"GET .../status/{job_id}\nGET .../logs/{job_id}"| API
     UI -->|"Open FiftyOne"| FOTab
-    FOTab -->|"HTTP port 515x"| FOApp
+    FOTab --> FOApp
+    FOApp -->|"read datasets"| MongoDB
 
-    %% Sync flow
+    %% Job flow
     API -->|"enqueue job"| SyncQueue
     SyncQueue -->|"job"| Redis
+    API -->|"poll job status / logs"| Redis
     Redis -->|"dequeue job"| SyncWorker
     SyncWorker --> SyncLogic
-    SyncLogic -->|"fetch media\n& localizations"| Tator
-    SyncLogic -->|"write dataset"| MongoDB
-    SyncLogic -->|"launch app"| FOApp
-    SyncLogic -->|"upload crops (optional)"| S3
+    SyncLogic --> SyncLock
+    SyncLock -->|"one sync per version"| Redis
 
-    %% Embeddings flow
-    API -->|"POST /embed\nGET /embed/{uuid}"| EmbedSvc
+    %% Sync: Tator -> FiftyOne
+    SyncLogic -->|"page media (offset)\n& localizations"| Tator
+    SyncLogic --> Mounts
+    Mounts -->|"resolve media URL\nto local path"| MountFS
+    SyncLogic -->|"download media\n(unmounted / video)"| Tator
+    SyncLogic -->|"write dataset"| MongoDB
+    SyncLogic -->|"push crops (optional)"| S3
+    SyncLogic --> CleanVision
+    SyncLogic --> EmbViz
+    EmbViz -->|"embed crops"| FastVSS
+
+    %% Sync-to-Tator: FiftyOne edits -> Tator
+    SyncLogic -->|"sync-to-tator:\nupdate localizations"| Tator
+
+    %% Embeddings API
+    API -->|"POST /embed\nGET /embed/{job_id}"| EmbedSvc
     EmbedSvc -->|"POST /embeddings/{project}/\nWS /ws/predict/job/{id}/{project}"| FastVSS
 
     %% Database / config
     API --> DBMgr
-    DBMgr -->|"URI / port lookup"| MongoDB
-
-    %% Status polling
-    UI -->|"GET /sync/status/{job_id}"| API
-    API -->|"poll job status"| Redis
+    DBMgr -->|"URI / database lookup"| MongoDB
 ```
 
 ## Features
@@ -87,12 +104,13 @@ flowchart TD
   - `GET /embed/{uuid}` - Poll for results (job status from Fast-VSS via WebSocket `/ws/predict/job/{job_id}/{project}`)
   - Set `FASTVSS_API_URL` env var to override Fast-VSS base URL
 
-- **Port isolation**: One FiftyOne App instance per Tator project (one port per project)
-  - Port = 5151 + (project_id - 1)
+- **FiftyOne App**: Served separately at `FIFTYONE_APP_PUBLIC_BASE_URL` and reads the same MongoDB; this service builds datasets but does not start App instances.
 
-- **MongoDB isolation**: One MongoDB (`containers/fiftyone-sync`); per-project DB `fiftyone_project_{id}` (override via `FIFTYONE_DATABASE_NAME` or `database_name` query param on `/launch` and `/sync`).
+- **Per-project port key**: Every launcher request carries a `port` (first configured port for the project, else 5151 + (project_id - 1)). Together with the project name it selects the project's database entry in `config.yml` and is appended to default dataset names.
 
-- **Launcher** (HostedTemplate): `/render` (Open FiftyOne + Sync from Tator), `/launch`, `/sync` + `/sync/status/{job_id}`, `/recompute-crops` (+ status/logs), `/sync-to-tator`, `/versions`. Token entered in applet via **Verify Token**; FiftyOne opens in a new tab (`iframe_host` = app host).
+- **MongoDB isolation**: One MongoDB (`containers/fiftyone-sync`); each project uses the database from its `config.yml` `databases` entry, else `{FIFTYONE_DATABASE_DEFAULT}_{project_id}` (default `fiftyone_project_{id}`).
+
+- **Launcher** (HostedTemplate): `/render` (Open FiftyOne + Sync from Tator), `/versions`, `/sections`, `/localization-types`, `/vss-projects`, `/database-info`, plus queued jobs `/sync`, `/sync-to-tator`, `/dimreduce` and `/recompute-crops`, each with `/status/{job_id}` and `/logs/{job_id}`. Token entered in applet via **Verify Token**; FiftyOne opens in a new tab (`iframe_host` = app host).
 
 - **Dataset management**: `/datasets` (list), `/dataset-exists`, `/delete-dataset`, `/rename-dataset`. Datasets are named `project_v{version}[_s{section}]_{port}` by default for traceability; override at create time with `POST /sync?dataset_name=...` (applet **Dataset name** field). `POST /rename-dataset?new_name=...` optionally takes `dataset_name` as the current dataset to rename (otherwise the default version/section dataset is renamed). Names are sanitized to safe characters, max **60** characters. These four endpoints accept the Tator API token either via `Authorization: Token <token>` (or `Bearer <token>`) header, or as a `token` query parameter (the convention used by `/sync`, `/sync-to-tator`, `/recompute-crops`, `/dimreduce`).
 

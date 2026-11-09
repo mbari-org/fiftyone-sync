@@ -135,15 +135,14 @@ Hosted Template **URL** is fetched by gunicorn (must be reachable from Tator’s
 
 ## Database and port allocation
 
-Single MongoDB (launched via `containers/fiftyone-sync`); each Tator project gets its own database for isolation. One port per project: project 1 → 5151, project 2 → 5152, etc.
+Single MongoDB (launched via `containers/fiftyone-sync`); each Tator project gets its own database for isolation. Each request carries a per-project `port` (first configured port for the project, else project 1 → 5151, project 2 → 5152, etc.); with the project name it selects the database entry in `config.yml`. The port is a lookup key and dataset-name suffix only; the FiftyOne App is served separately at `FIFTYONE_APP_PUBLIC_BASE_URL`.
 
 | Env var | Purpose |
 |--------|---------|
 | `FIFTYONE_DATABASE_URI` | MongoDB connection URI (default `mongodb://localhost:27017`). Override for remote/alternative MongoDB. |
 | `FIFTYONE_DATABASE_DEFAULT` | Prefix for per-project database names. Default `fiftyone_project` → `fiftyone_project_1`, `fiftyone_project_2`, etc. |
-| `FIFTYONE_DATABASE_NAME` | Override: use this single database name for all projects (ignores default pattern). |
 
-Optional query param **`database_name`** on `GET /launch` and `POST /sync` overrides the database for that project.
+To point a project at a different database, set the `uri` (including the database name) in its `databases` entry in `config.yml`.
 
 ## Sync and FiftyOne Dataset
 
@@ -164,9 +163,11 @@ Optional query param **`database_name`** on `GET /launch` and `POST /sync` overr
 | `remove_near_duplicates` | no | Remove CleanVision-flagged near-duplicate, dark, and low-information samples from the built dataset (default: false). Exposed as the **Remove near duplicates** checkbox in the launcher applet. See [Near-duplicate and low-quality sample removal](#near-duplicate-and-low-quality-sample-removal-cleanvision). |
 | `include_classes` | no | Optional comma-separated label names (e.g. `Larvacean,Copepod`). Only those labels are exported to Voxel51. Exposed as the **Labels** field in the launcher applet. When set, media IDs are queried with Tator `encoded_related_search`: an AttributeOperationSpec on the related localization `Label` attribute (`eq`, or `or` of `eq`). Localization fetches use the same spec as `encoded_search` on the localization's own attributes. Combined with `verified_only` when both are set. An `encoded_search` `query` still filters localizations directly and skips this media-id query. |
 | `dataset_name` | no | Optional FiftyOne dataset name. Default is `project_name_v{version_id}[_s{section_id}]_{port}` (e.g. `MyProject_v66_5151`). Sanitized to safe characters; max 60 characters. Exposed as the **Dataset name** field in the launcher applet. Use a distinct name to create a separate dataset (for example one export per label). |
-| `database_name` | no | Override MongoDB database name |
-| `config_path` | no | Path to YAML/JSON config file for dataset build |
-| `launch_app` | no | Launch FiftyOne app after sync (default: true) |
+| `port` | yes | Per-project port key; selects the project's database entry in `config.yml` and suffixes the default dataset name |
+| `force_sync` | no | Bypass the cached JSONL and re-fetch media/localizations (default: false) |
+| `vss_project_key` | no | VSS project key for projects with several `vss_projects`; also supplies that entry's S3 settings when `s3_bucket` is not set |
+| `s3_bucket` | no | S3 bucket to push crop images to (created if missing) |
+| `s3_prefix` | no | Key prefix under `s3_bucket` for pushed crops |
 
 **Sync-from-Tator flow (dashboard):** The launcher template calls `POST /sync`, then opens the FiftyOne app in a new tab. The "Open Voxel51" link always points to the base URL from `FIFTYONE_APP_PUBLIC_BASE_URL` (e.g. `https://cortex.shore.mbari.org/fiftyone/`) — no port or dataset path is appended. The default dataset name is `project_name + "_v" + version_id + "_" + port` (e.g. `MyProject_v66_5151`). Override it with the applet **Dataset name** field or the `dataset_name` query param.
 
