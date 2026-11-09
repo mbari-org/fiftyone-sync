@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.17.1 (2026-11-09)
+
+### Bug Fixes
+
+- **app**: Page Tator media list by offset, not id cursor (#46)
+  ([#46](https://github.com/mbari-org/fiftyone-sync/pull/46),
+  [`02cf9d9`](https://github.com/mbari-org/fiftyone-sync/commit/02cf9d9e0e96f34da8cb5b763fff89716dc49237))
+
+
 ## v0.17.0 (2026-10-19)
 
 ### Features
