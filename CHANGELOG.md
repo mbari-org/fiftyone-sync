@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.17.2 (2026-11-10)
+
+### Bug Fixes
+
+- A miss is always a missing crop
+  ([`521e502`](https://github.com/mbari-org/fiftyone-sync/commit/521e502f1f5c12d7276dcb37fc71917199b6eb4d))
+
+### Documentation
+
+- Update architecture diagram and stale launcher docs
+  ([`3f3490a`](https://github.com/mbari-org/fiftyone-sync/commit/3f3490ad8d073c1e4fe25400dc9db1e6de9e88f1))
+
+
 ## v0.17.1 (2026-11-09)
 
 ### Bug Fixes
