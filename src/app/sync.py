@@ -2622,21 +2622,8 @@ def _find_crop_cache_misses(
             old_entry = manifest.get(eid)
             crop_rel = Path(media_stem) / f"{eid}.png"
             crop_file = crops_path / crop_rel
-            crop_exists = (
-                crop_file.exists() or (removed_crops_path / crop_rel).exists()
-            )
 
-            # A crop file already on disk is direct proof that localization was
-            # already cropped, even when the manifest has no record of it (e.g. the
-            # manifest was reset/lost, or these crops predate the manifest). Only
-            # force a re-crop when we have a prior record AND it disagrees with the
-            # current modified_at (the localization changed since it was cropped).
-            # Without this, a missing/stale manifest alone would mark every
-            # localization a "miss" and re-download/re-crop videos that are already
-            # fully cropped on disk.
-            is_miss = not crop_exists or (
-                old_entry is not None and old_entry.get("modified_at") != modified_at
-            )
+            is_miss = not crop_file.exists()
             if is_miss:
                 media_ids_needed.add(mid)
                 locs_to_crop.append(loc)
